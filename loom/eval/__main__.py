@@ -21,6 +21,14 @@ from loom.eval import EvalProtocol
 from loom.eval.runner import bench_module, n_devices, run_eval
 from loom.eval.table import render_report
 
+#: Which PLAN 8 row the numbers fill. `--row-label` overrides; when it is left
+#: at the default, the bench picks (R0-A is the LIBERO row, R0-B the RoboTwin
+#: one, and pasting a RoboTwin number into the LIBERO row would be worse than
+#: no number at all).
+ROW_LABEL_DEFAULT = "**LOOM · R0-A**"
+DEFAULT_ROW_LABEL = {"libero": "**LOOM · R0-A**", "robotwin": "**LOOM · R0-B**",
+                     "libero_plus": "**LOOM · R2**"}
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -43,8 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
     r = p.add_argument_group("execution")
     r.add_argument("--workers", type=int, default=None,
                    help="default: one per visible GPU, 1 on CPU")
-    r.add_argument("--backend", default=None, choices=["libero", "fake"],
+    r.add_argument("--backend", default=None,
+                   choices=["libero", "robotwin", "fake"],
                    help="default: real env when importable, fake otherwise")
+    r.add_argument("--embodiment", default=None,
+                   help="body to evaluate; default follows the bench "
+                        "(libero -> libero_franka, robotwin -> robotwin_aloha)")
     r.add_argument("--no-resume", action="store_true",
                    help="ignore an existing --out instead of continuing it")
     r.add_argument("--require-real", action="store_true",
@@ -55,8 +67,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="record which operator `argmax pi_c` selected at every "
                         "replan into EpisodeResult.extra. Diagnostic only — it "
                         "does not change the action the policy takes.")
-    r.add_argument("--row-label", default="**LOOM · R0-A**",
-                   help="which PLAN 8 LOOM row these numbers fill")
+    r.add_argument("--row-label", default=ROW_LABEL_DEFAULT,
+                   help="which PLAN 8 LOOM row these numbers fill; defaults per "
+                        "bench (libero -> R0-A, robotwin -> R0-B)")
     r.add_argument("--quiet", action="store_true")
     return p
 
@@ -81,12 +94,25 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     protocol = protocol_from_args(args)
 
+    # Absolute before anything runs: the RoboTwin backend `chdir`s into the
+    # simulator's checkout (its configs store relative asset paths), so a
+    # relative --out/--md/--ckpt would resolve somewhere nobody typed.
+    args.out = str(Path(args.out).resolve())
+    if args.md:
+        args.md = str(Path(args.md).resolve())
+    if args.ckpt:
+        args.ckpt = str(Path(args.ckpt).resolve())
+    if args.row_label == ROW_LABEL_DEFAULT:
+        args.row_label = DEFAULT_ROW_LABEL.get(args.bench, args.row_label)
+
     if not args.quiet:
         print(f"[loom.eval] {protocol.bench}: {protocol.describe()}", file=sys.stderr)
         print(f"[loom.eval] workers={args.workers or n_devices()} "
               f"out={args.out}", file=sys.stderr)
 
     policy_kw: dict = {}
+    if args.embodiment:
+        policy_kw["embodiment"] = args.embodiment
     if args.require_real:
         policy_kw["allow_stub"] = False
     if args.op_stats:

@@ -27,7 +27,8 @@ __all__ = [
     "LIBERO_COLUMNS", "ROBOTWIN_COLUMNS", "LIBERO_PLUS_COLUMNS",
     "geo_avg", "fmt",
     "libero_table", "robotwin_table", "libero_plus_table",
-    "libero_row_from_results", "render_report",
+    "libero_row_from_results", "robotwin_row_from_results",
+    "ROBOTWIN_TASK_COLUMNS", "render_report",
 ]
 
 
@@ -187,15 +188,46 @@ def libero_row_from_results(results: Mapping[str, Any]) -> dict[str, Any]:
 #  TABLE 2  —  ROBOTWIN 2.0
 # ═══════════════════════════════════════════════════════════════════════════
 
+ROBOTWIN_TASK_COLUMNS = ("hanging mug", "turn switch", "place can basket",
+                         "handover block")
+
+
 def robotwin_table(measured: Mapping[str, Mapping[str, Any]] | None = None) -> str:
     measured = measured or {}
-    keys = ("clean", "rand", "hanging mug", "turn switch",
-            "place can basket", "handover block")
+    keys = ("clean", "rand", *ROBOTWIN_TASK_COLUMNS)
     rows: list[Sequence[str]] = [list(r) for r in ROBOTWIN_BASELINES]
     for label in ROBOTWIN_LOOM_ROWS:
         m = measured.get(label) or measured.get(label.strip("*"))
         rows.append([label, *[_measured(m, k) for k in keys]])
     return _rows_to_md(ROBOTWIN_COLUMNS, rows)
+
+
+def robotwin_row_from_results(results: Mapping[str, Any]) -> dict[str, Any]:
+    """Results JSON -> one RoboTwin row, in PLAN 8 column order.
+
+    `clean` and `rand` are the suite aggregates (mean over the four tasks of the
+    per-task rate, as `runner.aggregate` computes it); the four per-task columns
+    come from the **clean** suite, because that is the setting the baseline
+    appendix's per-task numbers were produced in and mixing the two would put
+    randomized per-task cells next to a clean aggregate.
+
+    Cells the run did not measure stay empty. `fmt` never invents a number and
+    neither does this: a partial run emits a partial row rather than a plausible
+    one.
+    """
+    summary = results.get("summary", {})
+    per_suite = summary.get("per_suite", {})
+    per_task = summary.get("per_task", {})
+
+    row: dict[str, Any] = {
+        "clean": per_suite.get("clean", {}).get("success_rate"),
+        "rand": per_suite.get("randomized", {}).get("success_rate"),
+    }
+    tasks = per_task.get("clean") or {}
+    for i, col in enumerate(ROBOTWIN_TASK_COLUMNS):
+        d = tasks.get(str(i))
+        row[col] = d["success_rate"] if d else None
+    return row
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -233,7 +265,13 @@ def protocol_block(protocol: EvalProtocol, results: Mapping[str, Any] | None = N
     if results is not None:
         s = results.get("summary", {})
         meta = results.get("meta", {})
-        env = "real LIBERO" if meta.get("libero_available") else "FakeLiberoEnv (no LIBERO installed)"
+        real = {"libero": "real LIBERO", "robotwin": "real RoboTwin 2.0"}.get(
+            protocol.bench, f"real {protocol.bench}")
+        fake = {"libero": "FakeLiberoEnv (no LIBERO installed)",
+                "robotwin": "FakeRobotwinEnv (no RoboTwin/SAPIEN GPU)"}.get(
+            protocol.bench, "fake env")
+        available = meta.get("env_available", meta.get("libero_available"))
+        env = real if available else fake
         lines.append(
             f"<sub>Ran {s.get('n_episodes', 0)}/{s.get('n_expected', 0)} episodes, "
             f"{s.get('n_errors', 0)} crashed, {s.get('n_hit_step_cap', 0)} hit the "
@@ -270,8 +308,9 @@ def render_report(results: Mapping[str, Any], *, row_label: str = "**LOOM · R0-
         ]
     elif bench == "robotwin":
         parts += [
-            f"**RoboTwin 2.0** (baselines source: {ROBOTWIN_SOURCE})",
-            robotwin_table(),
+            f"**RoboTwin 2.0** (baselines source: {ROBOTWIN_SOURCE} — carried "
+            f"verbatim, never re-run)",
+            robotwin_table({row_label: robotwin_row_from_results(results)}),
         ]
     else:
         parts += [

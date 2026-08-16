@@ -369,8 +369,13 @@ FORBIDDEN_ROOTS = ("loom.model", "loom.heads", "loom.losses", "loom.train",
 #: `tower` imports `transformers` lazily inside its loader — and so are safe in
 #: the separate LIBERO interpreter. Nothing else from `loom.data` (loader,
 #: cache, the HDF5 reader) may be imported by eval.
+#: `adapters.robotwin` is here for the same two reasons as `adapters.libero`:
+#: it owns `orient_env_image` (the identity for RoboTwin, a flip for LIBERO —
+#: which is exactly why eval must not decide it), and it owns `EVAL_VIEW_KEYS`,
+#: the V-axis camera order the feature cache was built in. It also registers
+#: `robotwin_aloha` in `contracts.EMBODIMENTS`.
 ALLOWED_DATA_IMPORTS = {"loom.data.canonical", "loom.data.adapters.libero",
-                        "loom.data.tower"}
+                        "loom.data.adapters.robotwin", "loom.data.tower"}
 
 
 def _module_scope_imports(path: Path) -> list[str]:
@@ -975,8 +980,111 @@ def test_phase_1b_modules_have_the_same_seam(mod):
     for name in ("make_env", "task_name", "task_instruction", "n_tasks",
                  "run_episode", "run_episode_safe", "SUITES"):
         assert hasattr(mod, name), f"{mod.__name__} is missing {name}"
+
+
+def test_libero_plus_make_env_is_still_a_stub():
     with pytest.raises(NotImplementedError):
-        mod.make_env(mod.SUITES[0], 0, 0)
+        libero_plus.make_env(libero_plus.SUITES[0], 0, 0)
+
+
+# ── RoboTwin 2.0 · the R0-B seam ──────────────────────────────────────────
+#
+# The real simulator needs a GPU (curobo allocates a CUDA tensor at import), so
+# everything below runs against `FakeRobotwinEnv`, which validates dof, dtype,
+# finiteness and bounds of what the policy sends it. The real-env checks live in
+# `logs/teamf_robotwin_seam.py`, which runs on a GPU node.
+
+def test_robotwin_make_env_builds_the_fake_backend_on_cpu():
+    env = robotwin.make_env("clean", 1, 0, backend="fake")
+    raw = env.reset()
+    obs = robotwin.extract_obs(raw)
+    assert set(robotwin.VIEW_KEYS) <= set(obs)
+    assert obs["state"].shape == (14,)
+    for key in robotwin.VIEW_KEYS:
+        assert obs[key].shape == (240, 320, 3)
+    env.close()
+
+
+def test_robotwin_view_keys_are_the_adapters_four_in_cache_order():
+    """The V axis eval feeds the estimator must be the V axis training encoded."""
+    from loom.data.adapters import robotwin as adapter
+
+    assert robotwin.VIEW_KEYS == adapter.EVAL_VIEW_KEYS
+    assert len(robotwin.VIEW_KEYS) == C.EMBODIMENTS["robotwin_aloha"].n_views == 4
+    assert pol.view_keys_for(C.EMBODIMENTS["robotwin_aloha"]) == robotwin.VIEW_KEYS
+    # ... and the LIBERO pair must NOT be what a 4-view body silently gets.
+    assert pol.view_keys_for(C.EMBODIMENTS["libero_franka"]) == ("full_image",
+                                                                "wrist_image")
+
+
+def test_robotwin_env_fps_is_250_over_15_and_the_clock_is_fractional():
+    """The whole score depends on 16.6667, not the HDF5's `frequency: 15`."""
+    fps = C.EMBODIMENTS["robotwin_aloha"].env_fps
+    assert fps == pytest.approx(250 / 15)
+    assert robotwin.MEASURED_CONTROL_FREQ == fps
+    n = C.env_steps_per_segment(fps)
+    assert n == pytest.approx(4.4444, abs=1e-4)
+    assert not float(n).is_integer()
+    # the 11%-too-slow trap
+    assert C.env_steps_per_segment(15.0) == 4.0
+
+    clock = pol.SegmentClock(fps)
+    lens = [clock.next_segment_len() for _ in range(200)]
+    assert set(lens) == {4, 5}
+    for k in range(1, len(lens) + 1):
+        assert abs(sum(lens[:k]) - k * n) <= 1.0
+    assert abs(clock.drift) <= 1.0
+
+
+def test_robotwin_black_frames_raise_instead_of_scoring_zero():
+    """A headless Vulkan failure returns correctly-shaped BLACK frames."""
+    black = {"observation": {k: {"rgb": np.zeros((240, 320, 3), np.uint8)}
+                             for k in robotwin.VIEW_KEYS},
+             "joint_action": {"vector": np.zeros(14, np.float32)}}
+    with pytest.raises(robotwin.BlackFrameError):
+        robotwin.check_not_black(robotwin.extract_obs(black), "test")
+    stats = robotwin.frame_stats(robotwin.extract_obs(black))
+    assert stats["head_camera"]["var"] == 0.0
+
+
+def test_robotwin_protocol_is_robotwins_own_and_is_stated():
+    p = robotwin.DEFAULT_PROTOCOL
+    assert p.bench == "robotwin"
+    assert p.episodes_per_task == 100          # RoboTwin's own test_num default
+    assert p.n_tasks == 4
+    assert p.max_steps == 900                  # max of _eval_step_limit.yml
+    assert "expert" in p.notes.lower() and "100 episodes/task" in p.notes
+    assert p.describe() in table.protocol_block(p)
+    assert robotwin.max_steps_for(1) == 400    # turn_switch
+    assert robotwin.max_steps_for(0) == 900    # hanging_mug
+
+
+def test_robotwin_env_seed_follows_robotwins_st_seed_convention():
+    seed_fn = runner.seed_fn_for("robotwin")
+    assert seed_fn is robotwin.episode_seed
+    assert seed_fn(0, "robotwin", "clean", 0, 0) == 100000
+    assert seed_fn(1, "robotwin", "clean", 0, 0) == 200000
+    # disjoint search windows, so the expert-check walk parallelises
+    a = seed_fn(0, "robotwin", "clean", 0, 0)
+    b = seed_fn(0, "robotwin", "clean", 0, 1)
+    assert b - a == robotwin.SEED_STRIDE >= robotwin.SEED_ATTEMPTS
+    # LIBERO is untouched by this
+    assert runner.seed_fn_for("libero") is episode_seed
+
+
+def test_robotwin_end_to_end_on_stubs_emits_the_plan_8_table():
+    p = EvalProtocol(bench="robotwin", episodes_per_task=2, n_tasks=2,
+                     suites=("clean",), seeds=(0,), max_steps=6,
+                     notes=robotwin.PROTOCOL_NOTE)
+    res = runner.run_eval(p, bench="robotwin", backend="fake",
+                          policy=S.StubPolicy("robotwin_aloha"), out=None)
+    assert res["summary"]["n_episodes"] == 4
+    assert res["summary"]["n_errors"] == 0
+    md = table.render_report(res, row_label="**LOOM · R0-B**")
+    assert table.ROBOTWIN_HEADER in md
+    assert "hanging mug" in md
+    row = [ln for ln in md.splitlines() if ln.startswith("| **LOOM · R0-B**")][0]
+    assert row.count("|") == len(table.ROBOTWIN_COLUMNS) + 1
 
 
 def test_phase_1b_columns_line_up_with_the_tables():

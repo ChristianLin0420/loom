@@ -37,8 +37,8 @@ import torch
 from loom.eval import EpisodeResult, EvalProtocol, episode_seed
 
 __all__ = [
-    "WorkItem", "iter_work", "shard", "n_devices",
-    "ResultStore", "aggregate", "run_eval", "bench_module",
+    "WorkItem", "iter_work", "shard", "n_devices", "seed_fn_for",
+    "ResultStore", "aggregate", "run_eval", "bench_module", "ensure_runtime",
 ]
 
 RESULTS_VERSION = 1
@@ -68,6 +68,22 @@ class WorkItem:
                     max_steps=self.max_steps)
 
 
+def seed_fn_for(bench: str):
+    """The bench's own env-seed rule, or the SHA-256 default.
+
+    LIBERO has no seed convention of its own, so `episode_seed`'s hash of the
+    tuple is as good as any. RoboTwin does: its eval script starts at
+    `st_seed = 100000 * (1 + seed)` and walks forward, and a released `seed.txt`
+    is the list of seeds that survived that walk — so reproducing the origin is
+    part of reproducing the protocol. A bench module that defines `episode_seed`
+    gets to say.
+    """
+    try:
+        return getattr(bench_module(bench), "episode_seed", episode_seed)
+    except Exception:                                    # noqa: BLE001
+        return episode_seed
+
+
 def iter_work(protocol: EvalProtocol) -> list[WorkItem]:
     """Every (suite, task, episode, seed) the protocol asks for, in a fixed order.
 
@@ -75,6 +91,7 @@ def iter_work(protocol: EvalProtocol) -> list[WorkItem]:
     object, which is also what gets written into the results JSON.
     """
     items: list[WorkItem] = []
+    env_seed_of = seed_fn_for(protocol.bench)
     for seed in protocol.seeds:
         for suite in protocol.suites:
             for task_id in range(protocol.n_tasks):
@@ -85,7 +102,7 @@ def iter_work(protocol: EvalProtocol) -> list[WorkItem]:
                         task_id=task_id,
                         episode=ep,
                         seed=seed,
-                        env_seed=episode_seed(seed, protocol.bench, suite, task_id, ep),
+                        env_seed=env_seed_of(seed, protocol.bench, suite, task_id, ep),
                         max_steps=protocol.max_steps,
                     ))
     return items
@@ -117,6 +134,43 @@ def bench_module(bench: str):
     return importlib.import_module(f"loom.eval.{bench}")
 
 
+#: Per-bench one-time process setup, run before any env is built. LIBERO needs
+#: the headless render vars and the `torch.load` shim for its init states;
+#: RoboTwin needs the Vulkan ICD, the chdir into its checkout and the SAPIEN
+#: render-device pin. Both are idempotent and both report a status string, which
+#: `_run_item` carries into a failed episode's record so a run that died at
+#: reset says why instead of leaving 1200 identical tracebacks.
+_RUNTIME_SETUP = ("ensure_libero_runtime", "ensure_robotwin_runtime")
+_RUNTIME_STATUS = ("LIBERO_RUNTIME_STATUS", "ROBOTWIN_RUNTIME_STATUS")
+
+
+def ensure_runtime(mod: Any) -> str | None:
+    for name in _RUNTIME_SETUP:
+        fn = getattr(mod, name, None)
+        if callable(fn):
+            return fn()
+    return None
+
+
+def runtime_status(mod: Any) -> str | None:
+    for name in _RUNTIME_STATUS:
+        if hasattr(mod, name):
+            return getattr(mod, name)
+    return None
+
+
+def env_available(mod: Any) -> bool:
+    """Did the bench's REAL simulator import? Never raises."""
+    for name in ("libero_available", "robotwin_available"):
+        fn = getattr(mod, name, None)
+        if callable(fn):
+            try:
+                return bool(fn())
+            except Exception:                            # noqa: BLE001
+                return False
+    return False
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  RESULT STORE  —  incremental, atomic, resumable
 # ═══════════════════════════════════════════════════════════════════════════
@@ -137,7 +191,11 @@ class ResultStore:
         resume: bool = True,
         meta: dict[str, Any] | None = None,
     ) -> None:
-        self.path = Path(path) if path is not None else None
+        # Absolute, always. RoboTwin's env setup `chdir`s into its own checkout
+        # (its configs store relative asset paths), and a single-worker run does
+        # that in *this* process — so a relative `--out` would land inside the
+        # simulator's source tree halfway through the run.
+        self.path = Path(path).resolve() if path is not None else None
         self.protocol = protocol
         self.meta = dict(meta or {})
         self.records: dict[tuple, EpisodeResult] = {}
@@ -306,10 +364,11 @@ def _run_item(
     rec.wall_s = time.time() - t0
     if rec.error is not None:
         # The overwhelmingly likely cause of a failure at reset is a missing
-        # torch.load shim (torch >= 2.6 refuses LIBERO's .pruned_init files), so
-        # carry the runtime status alongside the traceback rather than making
-        # someone reconstruct it from a run of 1200 identical failures.
-        rec.extra["runtime_status"] = getattr(mod, "LIBERO_RUNTIME_STATUS", None)
+        # torch.load shim (torch >= 2.6 refuses LIBERO's .pruned_init files) or,
+        # on RoboTwin, an unpinned Vulkan ICD, so carry the runtime status
+        # alongside the traceback rather than making someone reconstruct it from
+        # a run of 1200 identical failures.
+        rec.extra["runtime_status"] = runtime_status(mod)
     return rec
 
 
@@ -340,11 +399,10 @@ def _init_worker(device_queue, bench: str, ckpt: str | None,
     from loom.eval.policy import make_policy, policy_provenance  # noqa: PLC0415
 
     mod = bench_module(bench)
-    # once per worker process, before any env is built: headless render vars and
-    # the torch.load shim LIBERO's init states need
-    setup = getattr(mod, "ensure_libero_runtime", None)
-    if callable(setup) and backend != "fake":
-        setup()
+    # once per worker process, before any env is built: the bench's own headless
+    # render setup (see `ensure_runtime`)
+    if backend != "fake":
+        ensure_runtime(mod)
     _WORKER["mod"] = mod
     _WORKER["policy"] = make_policy(ckpt, device=device, **(policy_kw or {}))
     _WORKER["backend"] = backend
@@ -401,11 +459,26 @@ def run_eval(
     if protocol.bench != bench:
         protocol = protocol.replace(bench=bench)
 
+    # The body under evaluation follows the bench unless the caller says
+    # otherwise. `load_policy`'s default is `libero_franka`, and inheriting it
+    # for RoboTwin builds a 7-dof decoder for a 14-dof arm — every episode then
+    # dies on the first action with a shape error, which is loud but wastes a
+    # whole GPU allocation to discover.
+    body = getattr(mod, "EMBODIMENT", None)
+    if body is not None:
+        policy_kw = dict(policy_kw or {})
+        policy_kw.setdefault("embodiment", body)
+
     items = iter_work(protocol)
     store = ResultStore(out, protocol, resume=resume, meta={
         "ckpt": str(ckpt) if ckpt else None,
         "bench": bench,
         "backend": backend or ("auto"),
+        # Whether the REAL simulator was importable. A fake-env run and a real
+        # one produce identically shaped tables; this is the only field that
+        # distinguishes them, so it is recorded per bench rather than only for
+        # LIBERO (`libero_available` is kept for older results files).
+        "env_available": env_available(mod),
         "libero_available": bool(getattr(mod, "libero_available", lambda: False)()),
         "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
     })

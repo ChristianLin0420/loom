@@ -88,6 +88,7 @@ from loom.data.canonical import to_env_rate
 # by `encode_to_cache` on the training side and by `default_featurizer` here, so
 # train and eval cannot preprocess differently.
 from loom.data.tower import (
+    EVAL_VIEW_KEYS as TOWER_EVAL_VIEW_KEYS,
     FEAT_DIM,
     IMAGE_SIZE,
     LANG_LEN,
@@ -103,6 +104,8 @@ __all__ = [
     "LoomPolicy",
     "load_policy",
     "make_policy",
+    "VIEW_KEY_SOURCES",
+    "view_keys_for",
     "default_featurizer",
     "zeros_featurizer",
     "feats_to",
@@ -201,6 +204,55 @@ class SegmentClock:
 #  MODULE BUNDLE
 # ═══════════════════════════════════════════════════════════════════════════
 
+#: Where each embodiment's **eval-side** observation keys come from, in V order.
+#:
+#: `tower.obs_featurizer`'s own default is LIBERO's `("full_image",
+#: "wrist_image")`, and that default silently applied to every body: calling
+#: `default_featurizer(EMBODIMENTS["robotwin_aloha"])` asked a 4-view body for
+#: two views and died with `n_views=4 but view_keys=('full_image',
+#: 'wrist_image')`. The keys are owned by the adapter that also produced the
+#: cache — one place, so the V axis eval feeds the estimator is by construction
+#: the V axis training encoded. `None` means "the tower default", which is
+#: LIBERO's pair and is correct *only* for LIBERO.
+VIEW_KEY_SOURCES: dict[str, tuple[str, str] | None] = {
+    "libero_franka": None,                       # tower.EVAL_VIEW_KEYS
+    "robotwin_aloha": ("loom.data.adapters.robotwin", "EVAL_VIEW_KEYS"),
+}
+
+
+def view_keys_for(spec: EmbodimentSpec | str) -> tuple[str, ...]:
+    """The observation keys `spec`'s featuriser reads, in the cache's V order.
+
+    Never guesses. An unregistered embodiment whose `n_views` happens to match
+    LIBERO's is allowed through on the tower default (the keys are then the only
+    plausible ones); anything else raises, because the alternative is a featuriser
+    reading the wrong cameras in the wrong order and a score that looks like a bad
+    policy.
+    """
+    if isinstance(spec, str):
+        spec = EMBODIMENTS[spec]
+    src = VIEW_KEY_SOURCES.get(spec.name, ...)
+    if src is not None and src is not ...:
+        import importlib                                  # noqa: PLC0415
+
+        module, attr = src
+        keys = tuple(getattr(importlib.import_module(module), attr))
+    else:
+        keys = tuple(TOWER_EVAL_VIEW_KEYS)
+        if src is ... and len(keys) != spec.n_views:
+            raise KeyError(
+                f"no eval view keys registered for embodiment {spec.name!r} "
+                f"(n_views={spec.n_views}); add it to "
+                f"loom.eval.policy.VIEW_KEY_SOURCES. The tower default "
+                f"{keys} is LIBERO's and must not be applied to another body."
+            )
+    if len(keys) != spec.n_views:
+        raise ValueError(
+            f"{spec.name} has n_views={spec.n_views} but view_keys={keys}"
+        )
+    return keys
+
+
 def default_featurizer(
     spec: EmbodimentSpec, *, device: str = "cpu", **kw: Any
 ) -> Callable[[dict, str], ObsFeats]:
@@ -210,11 +262,16 @@ def default_featurizer(
     the cache builder encodes with. Two featurisers would be two preprocessing
     pipelines, and the second one is always the one that is subtly wrong.
 
+    **`view_keys` is resolved per embodiment** (`view_keys_for`) rather than left
+    to the tower's LIBERO default. It used not to be, and the consequence was
+    that no RoboTwin policy could be constructed at all.
+
     Raises `tower.TowerUnavailable` when the checkpoint or `transformers` is
     missing. That is deliberate: a real evaluation must never silently fall back
     to zero features and report a chance-level score as a result. `load_policy`
     catches it and degrades to the explicitly-marked stub path instead.
     """
+    kw.setdefault("view_keys", view_keys_for(spec))
     return obs_featurizer(spec, device=device, **kw)
 
 
@@ -667,6 +724,7 @@ def _try_real_modules(
             meta={"ckpt": str(ckpt), "tower": TOWER_MODEL_ID,
                   "tower_image_size": IMAGE_SIZE,
                   "featurizer": "loom.data.tower.obs_featurizer",
+                  "view_keys": list(view_keys_for(EMBODIMENTS[embodiment])),
                   "ckpt_global_step": (payload.get("global_step")
                                        if isinstance(payload, dict) else None),
                   "state_dict": loaded},
