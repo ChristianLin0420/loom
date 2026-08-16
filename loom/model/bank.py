@@ -32,6 +32,7 @@ M=K=128, D=768 — the 25 M row of the budget table.
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 from torch import Tensor, nn
@@ -40,7 +41,79 @@ from contracts import B_MAX, D, K, M, RHO
 
 from loom.model.rollout import rollout as _rollout
 
-__all__ = ["OperatorBank"]
+__all__ = ["OperatorBank", "fusion_status"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  THE AFFINE STEP KERNEL
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _apply_affine(a: Tensor, b: Tensor, bias: Tensor, z: Tensor,
+                  n_blocks: int, d: int) -> Tensor:
+    """`A(c) z + b(c)` given the already-mixed `(a, b, bias)`.
+
+    The 2x2 block product as four real elementwise ops. `z` is reshaped to
+    `(..., D//2, 2)` so adjacent channels pair up; nothing is viewed as complex.
+    """
+    zr = z.reshape(*z.shape[:-1], n_blocks, 2)
+    x, y = zr[..., 0], zr[..., 1]
+    out = torch.stack([a * x - b * y, b * x + a * y], dim=-1)   # 4 real ops
+    # `out.shape`, not `z.shape`: z may be a size-1 broadcast against c.
+    return out.reshape(*out.shape[:-2], d) + bias
+
+
+#  Eager PyTorch runs the six multiplies, the interleave and the bias add as
+#  eight separate kernels, each round-tripping a (N, K, D/2) or (N, K, D) tensor
+#  through HBM. Measured on an A100-SXM4-80GB at N=1000, DEPTH=4: 12.223 ms, of
+#  which torch.profiler attributes 78% to those elementwise kernels and only
+#  18.5% to the bf16 GEMMs. The arithmetic is trivial; the traffic is not.
+#  Fusing them into one kernel is the whole optimisation.
+#
+#  This is opt-in and self-disabling: if inductor is unavailable or fails on a
+#  node, we warn once and fall back to eager, which is slower but identical. A
+#  run that dies at step 0 on a bad node is worse than one that is 3x slower.
+#
+#  NOTE: needs a writable, node-compatible Triton cache. A stale
+#  `~/.triton/cache` built against a newer glibc makes every compile fail with
+#  `GLIBC_2.34 not found` on the compute nodes. Export
+#  `TRITON_CACHE_DIR=$PWD/.triton_cache` (see CLAUDE.md).
+
+_COMPILED_APPLY = None
+_COMPILE_DISABLED = False
+
+
+def _compiled_apply():
+    """Lazily compile `_apply_affine`; `None` if compilation is unavailable."""
+    global _COMPILED_APPLY, _COMPILE_DISABLED
+    if _COMPILE_DISABLED:
+        return None
+    if _COMPILED_APPLY is None:
+        try:
+            _COMPILED_APPLY = torch.compile(_apply_affine, dynamic=False)
+        except Exception as exc:                                # noqa: BLE001
+            _COMPILE_DISABLED = True
+            warnings.warn(f"OperatorBank: torch.compile unavailable ({exc!r}); "
+                          f"falling back to eager. Results are unchanged, the "
+                          f"N-candidate rollout is ~3x slower.", RuntimeWarning)
+            return None
+    return _COMPILED_APPLY
+
+
+def _disable_fusion(exc: BaseException) -> None:
+    global _COMPILE_DISABLED
+    _COMPILE_DISABLED = True
+    warnings.warn(f"OperatorBank: fused step failed ({exc!r}); falling back to "
+                  f"eager for the rest of the process. Results are unchanged, "
+                  f"the N-candidate rollout is ~3x slower. If this is "
+                  f"`GLIBC_2.34 not found`, set TRITON_CACHE_DIR to a fresh "
+                  f"project-local directory.", RuntimeWarning)
+
+
+def fusion_status() -> str:
+    """`'active' | 'unused' | 'disabled'`. For run logs and perf assertions."""
+    if _COMPILE_DISABLED:
+        return "disabled"
+    return "active" if _COMPILED_APPLY is not None else "unused"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -102,6 +175,7 @@ class OperatorBank(nn.Module):
         tau_max: float = TAU_MAX,
         log_r_jitter: float = LOG_R_JITTER,
         bias_init_norm: float = BIAS_INIT_NORM,
+        fuse: bool = True,
     ) -> None:
         super().__init__()
         if d % 2 != 0:
@@ -120,6 +194,9 @@ class OperatorBank(nn.Module):
         self.m, self.k, self.d = m, k, d
         self.n_blocks = d // 2
         self.rho, self.b_max = float(rho), float(b_max)
+        self.fuse = bool(fuse)
+        self._cache_key: tuple | None = None
+        self._cache: tuple[Tensor, Tensor, Tensor] | None = None
 
         self.log_r = nn.Parameter(torch.empty(m, k, self.n_blocks))
         self.omega = nn.Parameter(torch.empty(m, k, self.n_blocks))
@@ -234,6 +311,33 @@ class OperatorBank(nn.Module):
         n = self.b_raw.flatten(1).norm(dim=1).clamp(min=self.b_max).view(self.m, 1, 1)
         return self.b_max * self.b_raw / n
 
+    def _cached(self, which: str):
+        """`lam_bank()` / `bias_bank()`, reused across the steps of a rollout.
+
+        Both are pure functions of the parameters, but `step` is called DEPTH
+        times per rollout and recomputed them every time: measured 0.47 ms of
+        `lam_bank` plus 0.53 ms of `bias_bank` inside a 12.2 ms A100 rollout.
+        Hoisting them is worth 0.7 ms of the fused 4.2 ms.
+
+        Cached only when grad is disabled. In training the parameters move every
+        optimizer step and a stale bank would be a silent wrong-weights bug; the
+        version counters below would catch it, but not caching at all is the
+        cheaper guarantee. The slots fill lazily so that `mix` never pays for the
+        bias bank, nor `bias` for the lambdas.
+        """
+        if torch.is_grad_enabled():
+            return self.lam_bank() if which == "lam" else self.bias_bank()
+
+        key = (self.log_r._version, self.omega._version, self.b_raw._version,
+               id(self.log_r), id(self.omega), id(self.b_raw),
+               self.log_r.dtype, self.log_r.device)
+        if self._cache_key != key or self._cache is None:
+            self._cache_key, self._cache = key, {}
+        if which not in self._cache:
+            self._cache[which] = (self.lam_bank() if which == "lam"
+                                  else self.bias_bank())
+        return self._cache[which]
+
     # ── contracts.Bank ────────────────────────────────────────────────────
     #
     #  Why a dense contraction over all M=128 and not a top-4 gather.
@@ -254,34 +358,34 @@ class OperatorBank(nn.Module):
     #
     #  Peak memory is the same either way, because both schemes materialise the
     #  same mixed `(N, K, D//2)` tensor and *that* is what costs, not the bank.
-    #  One rollout step at N=1000 holds ~790 MB of transient bf16 activations
-    #  (a, b, the stacked product, the mixed bias, z); the DEPTH steps are
-    #  sequential so the peak does not compound. This is inference-only memory —
-    #  PLAN.md 5 runs the rollout inside the search with no autograd tape, and
-    #  L_dyn rolls out at N=1.
+    #  Measured peak transient on an A100 at N=1000: 0.99 GB eager, 0.84 GB
+    #  fused. The DEPTH steps are sequential so it does not compound, and this is
+    #  inference-only memory — PLAN.md 5 runs the rollout inside the search with
+    #  no autograd tape, and L_dyn rolls out at N=1.
     #
-    #  If a larger N ever makes that uncomfortable, the lever is to chunk the N
-    #  axis in `rollout` — peak falls linearly in the chunk size, total work is
-    #  unchanged, and L2 reuse of the bank improves. Not a gather.
+    #  Chunking the N axis is a *memory* lever and a speed anti-lever: measured
+    #  0.49 GB at chunk 125 but 0.86x the throughput, because each chunk re-reads
+    #  the whole bank and the GEMMs get too skinny to fill the machine. Do not
+    #  reach for it unless memory is the actual constraint.
 
     def mix(self, c: Tensor) -> tuple[Tensor, Tensor]:
         """`(..., M)` on the simplex -> `(a, b)`, each `(..., K, D//2)`."""
-        a_bank, b_bank = self.lam_bank()
+        a_bank, b_bank = self._cached("lam")
         c = c.to(a_bank.dtype)
         return (torch.einsum('...m,mkj->...kj', c, a_bank),
                 torch.einsum('...m,mkj->...kj', c, b_bank))
 
     def bias(self, c: Tensor) -> Tensor:
         """`(..., M)` on the simplex -> `(..., K, D)` with norm `<= B_MAX`."""
-        bank = self.bias_bank()
+        bank = self._cached("bias")
         return torch.einsum('...m,mkd->...kd', c.to(bank.dtype), bank)
 
     def step(self, c: Tensor, z: Tensor) -> Tensor:
         """ONE affine step: `A(c) z + b(c)`.
 
-        The 2x2 block product written out as four real elementwise ops. `z` is
-        reshaped to `(..., D//2, 2)` so that adjacent channels pair up; nothing is
-        ever viewed as complex.
+        Mixes through `mix`/`bias` — the contract API — then applies the 2x2
+        block product. The apply is fused into one kernel when possible; the
+        eager path is the definition and is always available.
         """
         a, b = self.mix(c)
         if a.ndim != z.ndim:
@@ -290,11 +394,19 @@ class OperatorBank(nn.Module):
                 f"against z {tuple(z.shape)}. Right-aligned broadcasting between "
                 f"(B, K, D//2) and (B, N, K, D//2) would silently misalign the batch."
             )
-        zr = z.reshape(*z.shape[:-1], self.n_blocks, 2)
-        x, y = zr[..., 0], zr[..., 1]
-        out = torch.stack([a * x - b * y, b * x + a * y], dim=-1)   # 4 real ops
-        # `out.shape`, not `z.shape`: z may be a size-1 broadcast against c.
-        return out.reshape(*out.shape[:-2], self.d) + self.bias(c)
+        bias = self.bias(c)
+
+        # Fuse only on CUDA and only under no_grad: this budget is the R3 search
+        # path, and leaving the training graph in plain eager keeps inductor out
+        # of Team D's FSDP + activation-checkpointing setup.
+        if self.fuse and z.is_cuda and not torch.is_grad_enabled():
+            fn = _compiled_apply()
+            if fn is not None:
+                try:
+                    return fn(a, b, bias, z, self.n_blocks, self.d)
+                except Exception as exc:                        # noqa: BLE001
+                    _disable_fusion(exc)
+        return _apply_affine(a, b, bias, z, self.n_blocks, self.d)
 
     def rollout(self, c_seq: Tensor, z: Tensor) -> Tensor:
         """`(B, N, DEPTH, M)`, `(B, K, D)` -> `(B, N, K, D)`. Sequential over DEPTH."""

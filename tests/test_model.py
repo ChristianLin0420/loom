@@ -16,7 +16,12 @@ Covers `loom/model/{bank,rollout,estimator}.py`:
  11  parameter budgets: bank ~25 M, estimator ~150 M
  12  `view_as_complex` appears nowhere in loom/model/
 
-GPU items are budgets, not correctness; they skip on a CPU box.
+GPU items are budgets, not correctness; they skip on a CPU box. Run them with
+
+    TRITON_CACHE_DIR=$PWD/.triton_cache pytest tests/test_model.py -s
+
+on a GPU node. Without a node-compatible Triton cache the fused step silently
+falls back to eager and item 4 measures ~12.2 ms instead of ~4.2 ms.
 """
 
 from __future__ import annotations
@@ -32,7 +37,7 @@ import torch
 
 import contracts as C
 import stubs as S
-from loom.model.bank import OperatorBank
+from loom.model.bank import OperatorBank, fusion_status
 from loom.model.estimator import Estimator
 from loom.model.rollout import rollout
 
@@ -53,6 +58,18 @@ def bank() -> OperatorBank:
 def bank_bf16() -> OperatorBank:
     torch.manual_seed(0)
     return OperatorBank().to(torch.bfloat16)
+
+
+#: Every estimator forward below names its embodiment explicitly.
+#
+#  `Estimator.forward` can infer the body from `proprio.shape[-1]`, but that is a
+#  convenience and it is only valid while no two *registered* bodies share a dof.
+#  Other teams register 7-dof synthetic bodies at module scope in their own test
+#  files, so in a full-suite run dof 7 is genuinely ambiguous and the estimator
+#  correctly refuses to guess — silently picking the wrong proprio projection is
+#  the kind of bug that trains fine and scores near zero. The production path
+#  names the body too: `TransitionWindow` carries `embodiment` (contracts.py).
+BODY = "libero_franka"
 
 
 def _small_estimator(**kw) -> Estimator:
@@ -138,6 +155,66 @@ def test_bias_cap_is_not_vacuous():
         per_op = b.bias_bank().flatten(1).norm(dim=1)
     assert torch.allclose(per_op, torch.full_like(per_op, C.B_MAX), atol=1e-4)
     C.assert_bias_bounded(b, n=512)
+
+
+def test_bank_cache_invalidates_when_parameters_move():
+    """The no-grad bank cache must not survive an optimizer step.
+
+    `lam_bank`/`bias_bank` are hoisted out of the DEPTH loop by caching them
+    under no_grad. If the cache key missed an in-place parameter update, eval
+    would silently keep using pre-update operators — a stale-weights bug that
+    looks like a bad checkpoint.
+    """
+    torch.manual_seed(28)
+    b = OperatorBank()
+    c, z = S.sparse_simplex(2), torch.randn(2, C.K, C.D)
+    with torch.no_grad():
+        before = b.step(c, z).clone()
+        assert b._cache is not None, "no-grad path should have populated the cache"
+        b.log_r.add_(1.0)                      # exactly what opt.step() does
+        after = b.step(c, z)
+    assert not torch.allclose(before, after), "stale bank tensors were reused"
+
+
+def test_bank_does_not_cache_while_training():
+    """Grad enabled -> no cache at all. Cheapest possible correctness guarantee."""
+    torch.manual_seed(29)
+    b = OperatorBank()
+    b.step(S.sparse_simplex(1), torch.randn(1, C.K, C.D)).sum().backward()
+    assert b._cache is None
+    assert b.b_raw.grad is not None
+
+
+def test_cached_and_uncached_agree(bank):
+    """The cache is a pure hoist; it must not change a single value."""
+    torch.manual_seed(30)
+    c, z = S.sparse_simplex(2, 3), torch.randn(2, 3, C.K, C.D)
+    with torch.no_grad():
+        cached = bank.step(c, z)
+        a_bank, b_bank = bank.lam_bank()
+        bias_bank = bank.bias_bank()
+        cf = c.to(a_bank.dtype)
+        a = torch.einsum('...m,mkj->...kj', cf, a_bank)
+        bb = torch.einsum('...m,mkj->...kj', cf, b_bank)
+        zr = z.reshape(2, 3, C.K, C.D // 2, 2)
+        x, y = zr[..., 0], zr[..., 1]
+        fresh = torch.stack([a * x - bb * y, bb * x + a * y], dim=-1) \
+            .reshape(2, 3, C.K, C.D) + torch.einsum('...m,mkd->...kd', cf, bias_bank)
+    assert torch.equal(cached, fresh)
+
+
+def test_fusion_falls_back_to_eager_on_cpu(bank):
+    """No CUDA, no fusion — and the answer is the same. `fuse` is a perf flag."""
+    torch.manual_seed(31)
+    c, z = S.sparse_simplex(2), torch.randn(2, C.K, C.D)
+    with torch.no_grad():
+        bank.fuse = True
+        on = bank.step(c, z)
+        bank.fuse = False
+        off = bank.step(c, z)
+        bank.fuse = True
+    assert torch.equal(on, off)
+    assert fusion_status() in {"active", "unused", "disabled"}
 
 
 def test_bounds_hold_off_the_init(bank):
@@ -255,6 +332,26 @@ def test_bank_exposes_no_compose(bank):
     assert not hasattr(bank, "compose"), "there is NO compose(); see PLAN.md 4.B"
 
 
+def test_step_equals_mix_then_bias(bank):
+    """`step` must stay the composition of the contract API, not drift from it.
+
+    `step` is the optimised path (fused apply, cached bank tensors); `mix` and
+    `bias` are what `contracts.Bank` promises and what `assert_contractive` /
+    `assert_bias_bounded` check. If an optimisation ever makes them disagree,
+    the bounds tests stop covering the code that actually runs.
+    """
+    torch.manual_seed(26)
+    c = S.sparse_simplex(3)
+    z = torch.randn(3, C.K, C.D)
+    with torch.no_grad():
+        a, b = bank.mix(c)
+        zr = z.reshape(3, C.K, C.D // 2, 2)
+        x, y = zr[..., 0], zr[..., 1]
+        manual = torch.stack([a * x - b * y, b * x + a * y], dim=-1) \
+            .reshape(3, C.K, C.D) + bank.bias(c)
+        assert torch.allclose(bank.step(c, z), manual, atol=1e-6)
+
+
 def test_rollout_depth_order_matters(bank):
     """Sequential composition is non-commutative; a reversed plan differs."""
     torch.manual_seed(11)
@@ -302,11 +399,62 @@ def test_rollout_under_5ms_on_a100():
         ms = 1000.0 * (time.perf_counter() - t0) / reps
         peak_gb = (torch.cuda.max_memory_allocated() - base) / 1e9
 
+    print(f"\n[bench] rollout N=1000 DEPTH=4: {ms:.3f} ms "
+          f"(budget 5 ms), peak {peak_gb:.2f} GB, fusion {fusion_status()}")
     assert ms < 5.0, (
         f"rollout N=1000 DEPTH=4 took {ms:.3f} ms (budget 5 ms); "
-        f"peak transient {peak_gb:.2f} GB"
+        f"peak transient {peak_gb:.2f} GB; fusion {fusion_status()}. "
+        f"Eager is ~12.2 ms on an A100-SXM4-80GB — if fusion is 'disabled', set "
+        f"TRITON_CACHE_DIR to a fresh project-local dir and re-run."
     )
     assert peak_gb < 4.0, f"rollout peak transient {peak_gb:.2f} GB at N=1000"
+
+
+@pytest.mark.gpu
+def test_fused_step_is_not_less_accurate_than_eager():
+    """The fused kernel must not cost accuracy.
+
+    It does not match eager bit-for-bit: Triton accumulates the block product in
+    fp32 and rounds once, where eager rounds to bf16 after every one of the eight
+    ops. So the two differ by a few bf16 ulp — and the fused one is the *closer*
+    of the two to the fp32 answer. Asserting bit-equality would be asserting that
+    we reproduce eager's rounding error, so assert the thing that matters instead.
+    """
+    pytest.importorskip("torch.cuda")
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+
+    torch.manual_seed(27)
+    dev = torch.device("cuda")
+    b = OperatorBank().to(dev).eval()
+    z32 = torch.randn(1, C.K, C.D, device=dev)
+    c32 = S.sparse_simplex(1, 64, C.DEPTH, device=dev)
+
+    with torch.no_grad():
+        exact = b.rollout(c32, z32).double()          # fp32 params -> reference
+        b16 = OperatorBank().to(dev).eval()
+        b16.load_state_dict(b.state_dict())
+        b16 = b16.to(torch.bfloat16)
+        z16, c16 = z32.to(torch.bfloat16), c32.to(torch.bfloat16)
+
+        b16.fuse = False
+        eager = b16.rollout(c16, z16).double()
+        b16.fuse = True
+        fused = b16.rollout(c16, z16).double()
+
+    ulp = float(exact.abs().max()) * 2 ** -8
+    e_err = float((eager - exact).abs().max()) / ulp
+    f_err = float((fused - exact).abs().max()) / ulp
+    d = float((fused - eager).abs().max()) / ulp
+
+    print(f"\n[bench] vs fp32 reference: eager {e_err:.2f} ulp, fused {f_err:.2f} ulp, "
+          f"fused-vs-eager {d:.2f} ulp")
+    assert f_err <= e_err + 0.5, (
+        f"fused is less accurate than eager: {f_err:.2f} vs {e_err:.2f} bf16 ulp "
+        f"from the fp32 reference"
+    )
+    assert d < 16.0, f"fused and eager differ by {d:.2f} bf16 ulp — too far apart"
+    C.assert_belief(fused.float())
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -331,16 +479,17 @@ def test_estimator_at_least_30hz_with_7_streams():
 
     with torch.no_grad():
         for _ in range(5):
-            est(feats, z_prev)
+            est(feats, z_prev, embodiment=BODY)
         torch.cuda.synchronize()
         reps = 20
         t0 = time.perf_counter()
         for _ in range(reps):
-            est(feats, z_prev)
+            est(feats, z_prev, embodiment=BODY)
         torch.cuda.synchronize()
         ms = 1000.0 * (time.perf_counter() - t0) / reps
 
     hz = 1000.0 / ms
+    print(f"\n[bench] estimator b=1 V=7 bf16: {hz:.1f} Hz ({ms:.2f} ms), budget 30 Hz")
     assert hz >= 30.0, f"estimator ran at {hz:.1f} Hz ({ms:.2f} ms), budget 30 Hz"
 
 
@@ -379,7 +528,7 @@ def test_estimator_bf16_no_promotion():
     feats = {k: v.to(torch.bfloat16) for k, v in _small_feats(b=1).items()}
     z_prev = torch.randn(1, C.K, C.D, dtype=torch.bfloat16)
     with torch.no_grad():
-        z = est(feats, z_prev)
+        z = est(feats, z_prev, embodiment=BODY)
     assert z.dtype == torch.bfloat16, f"estimator promoted to {z.dtype}"
     assert not z.is_complex()
     C.assert_belief(z)
@@ -431,7 +580,7 @@ def test_rollout_shape(bank):
 def test_estimator_shapes():
     est = _small_estimator()
     with torch.no_grad():
-        z = est(_small_feats(b=3), None)
+        z = est(_small_feats(b=3), None, embodiment=BODY)
     assert z.shape == (3, C.K, C.D)
     C.assert_belief(z)
 
@@ -441,10 +590,10 @@ def test_estimator_variable_stream_count():
     est = _small_estimator()
     with torch.no_grad():
         for v in (1, 2, 7):
-            z = est(_small_feats(b=1, v=v), None)
+            z = est(_small_feats(b=1, v=v), None, embodiment=BODY)
             C.assert_belief(z)
     with pytest.raises(ValueError):
-        est(_small_feats(b=1, v=9), None)
+        est(_small_feats(b=1, v=9), None, embodiment=BODY)
 
 
 @pytest.fixture
@@ -469,7 +618,10 @@ def test_estimator_per_embodiment_proprio_dispatch(second_body):
     with torch.no_grad():
         z7 = est(_small_feats(b=2, dof=7), None, embodiment="libero_franka")
         z14 = est(_small_feats(b=2, dof=14), None, embodiment=second_body)
-        z7_inferred = est(_small_feats(b=2, dof=7), None)     # inferred from dof
+        # Inference is resolved against *this estimator's* bodies, not the global
+        # registry, and 7 vs 14 is unambiguous here — so this stays valid however
+        # many 7-dof bodies other test modules register at import time.
+        z7_inferred = est(_small_feats(b=2, dof=7), None)
     for z in (z7, z14, z7_inferred):
         C.assert_belief(z)
     with pytest.raises(KeyError):
@@ -478,10 +630,27 @@ def test_estimator_per_embodiment_proprio_dispatch(second_body):
         est(_small_feats(b=1, dof=99), None)
 
 
+def test_estimator_refuses_to_guess_an_ambiguous_dof(second_body):
+    """Two bodies with the same dof must raise, never pick one.
+
+    Guessing here would wire the wrong proprio projection: it trains fine, the
+    loss goes down, and the policy scores near zero. Callers name the body;
+    `TransitionWindow.embodiment` carries it on the production path.
+    """
+    twin = "loom_test_twin7"
+    C.register_embodiment(C.EmbodimentSpec(twin, 7, 30.0, 2, (-1.0,) * 7, (1.0,) * 7))
+    est = _small_estimator(embodiments=("libero_franka", twin, second_body))
+    with pytest.raises(KeyError, match="ambiguous"):
+        est(_small_feats(b=1, dof=7), None)
+    with torch.no_grad():                     # naming it is always unambiguous
+        C.assert_belief(est(_small_feats(b=1, dof=7), None, embodiment=BODY))
+        C.assert_belief(est(_small_feats(b=1, dof=7), None, embodiment=twin))
+
+
 def test_estimator_rejects_wrong_feat_dim():
     est = _small_estimator()
     with pytest.raises(ValueError):
-        est(S.make_obs_feats(b=1, v=2, p=4, f=128, dof=7, l=4), None)
+        est(S.make_obs_feats(b=1, v=2, p=4, f=128, dof=7, l=4), None, embodiment=BODY)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -608,9 +777,9 @@ def test_estimator_z_prev_changes_output():
     est = _small_estimator().eval()
     feats = _small_feats(b=2)
     with torch.no_grad():
-        z_none = est(feats, None)
-        z_a = est(feats, torch.randn(2, C.K, C.D))
-        z_b = est(feats, torch.randn(2, C.K, C.D))
+        z_none = est(feats, None, embodiment=BODY)
+        z_a = est(feats, torch.randn(2, C.K, C.D), embodiment=BODY)
+        z_b = est(feats, torch.randn(2, C.K, C.D), embodiment=BODY)
 
     for name, other in (("z_prev=None vs z_prev=a", z_none), ("a vs b", z_b)):
         rel = float((z_a - other).norm() / z_a.norm())
@@ -622,7 +791,7 @@ def test_estimator_z_prev_receives_gradient():
     torch.manual_seed(23)
     est = _small_estimator()
     z_prev = torch.randn(1, C.K, C.D, requires_grad=True)
-    est(_small_feats(b=1), z_prev).sum().backward()
+    est(_small_feats(b=1), z_prev, embodiment=BODY).sum().backward()
     assert z_prev.grad is not None
     assert float(z_prev.grad.abs().max()) > 0.0
 
@@ -633,8 +802,8 @@ def test_estimator_observation_still_matters():
     est = _small_estimator().eval()
     z_prev = torch.randn(2, C.K, C.D)
     with torch.no_grad():
-        z1 = est(_small_feats(b=2), z_prev)
-        z2 = est(_small_feats(b=2), z_prev)
+        z1 = est(_small_feats(b=2), z_prev, embodiment=BODY)
+        z2 = est(_small_feats(b=2), z_prev, embodiment=BODY)
     assert float((z1 - z2).norm() / z1.norm()) > 1e-2
 
 
@@ -650,15 +819,26 @@ def test_estimator_grad_checkpointing_matches():
     feats = _small_feats(b=2)
     z_prev = torch.randn(2, C.K, C.D)
 
-    plain(feats, z_prev).pow(2).sum().backward()
-    ckpt(feats, z_prev).pow(2).sum().backward()
+    plain(feats, z_prev, embodiment=BODY).pow(2).sum().backward()
+    ckpt(feats, z_prev, embodiment=BODY).pow(2).sum().backward()
 
     num = den = 0.0
+    scored = 0
     for (n1, p1), (n2, p2) in zip(plain.named_parameters(), ckpt.named_parameters()):
         assert n1 == n2
-        assert p1.grad is not None and p2.grad is not None, n1
+        # The proprio heads of *other* embodiments are legitimately untouched:
+        # batches are embodiment-homogeneous, so one forward trains one head and
+        # the rest get grad=None. What must match is *which* parameters moved.
+        assert (p1.grad is None) == (p2.grad is None), n1
+        if p1.grad is None:
+            assert n1.startswith("proprio_proj."), f"{n1} unexpectedly got no gradient"
+            assert not n1.startswith(f"proprio_proj.{BODY}."), n1
+            continue
         num += float((p1.grad - p2.grad).pow(2).sum())
         den += float(p1.grad.pow(2).sum())
+        scored += 1
+
+    assert scored > 20, f"only {scored} parameters carried gradient; test is vacuous"
     rel = math.sqrt(num / den)
     assert rel < 1e-5, f"checkpointed gradients differ by {rel:.2e} relative"
 
@@ -689,7 +869,8 @@ def test_estimator_feat_dim_is_configurable():
     est = Estimator(feat_dim=768, depth=1)
     assert est.view_proj.in_features == 768
     with torch.no_grad():
-        C.assert_belief(est(S.make_obs_feats(b=1, v=2, p=4, f=768, dof=7, l=4), None))
+        C.assert_belief(est(S.make_obs_feats(b=1, v=2, p=4, f=768, dof=7, l=4), None,
+                            embodiment=BODY))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
