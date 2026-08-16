@@ -102,6 +102,11 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
   honoured, so every link lands on one id and `wandb sync` merges them server-side.
   Continuity is carried by the id plus a monotone `global_step`, not by `resume=allow`.
 - `WANDB_DIR="$RUN_DIR"`, not `$RUN_DIR/wandb` — wandb appends `wandb/` itself.
+- Syncing **while a link is still running** ends with
+  `ERROR Internal error: transactionlog: error reading: unexpected EOF`. Cosmetic: it is
+  the live tail of a `.wandb` file still being appended. Measured — a first sync uploaded
+  `history steps 0-23`, a second `24-53`. It resumes at the right offset, does not restart
+  or duplicate, and converges once the link exits. Safe to run repeatedly mid-chain.
 - `torch.load(map_location="cuda")` drags saved RNG ByteTensors onto the GPU and
   `set_rng_state` requires CPU. GPU resume breaks while CPU tests stay green.
 - Rank plumbing is `RANK=$SLURM_PROCID`, not torchrun. Without it every task reads rank 0
