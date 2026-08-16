@@ -7,7 +7,11 @@
 # Stop:  touch runs/r1/STOP        # NEVER scancel
 #
 #SBATCH --account=edgeai_tao-ptm_image-foundation-model-clip
-#SBATCH --partition=polar4,polar3,polar,grizzly,batch_singlenode
+# batch_singlenode carries QOS 128_nodes_per_user_1_node_per_job (max 8 GPUs,
+# 1970G per job). Listing it here made sbatch reject every multi-node stage
+# outright with QOSMaxMemoryPerJob -- not fall through to a partition that fits.
+# Do not add it back to a --nodes>1 job.
+#SBATCH --partition=polar4,polar3,polar,grizzly
 #SBATCH --qos=normal
 #SBATCH --time=04:00:00
 #SBATCH --requeue
