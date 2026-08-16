@@ -362,12 +362,15 @@ EVAL_DIR = Path(__file__).resolve().parents[1] / "loom" / "eval"
 FORBIDDEN_ROOTS = ("loom.model", "loom.heads", "loom.losses", "loom.train",
                    "loom.search")
 
-#: The two sanctioned cross-team imports, each because eval and training must
-#: share ONE implementation of a transform rather than two that can drift:
-#: rate conversion and image orientation. Both are numpy-level and safe in the
-#: separate LIBERO interpreter. Nothing else from `loom.data` (loader, cache,
-#: the HDF5 reader) may be imported by eval.
-ALLOWED_DATA_IMPORTS = {"loom.data.canonical", "loom.data.adapters.libero"}
+#: The sanctioned cross-team imports, each because eval and training must share
+#: ONE implementation of a transform rather than two that can drift: rate
+#: conversion, image orientation, and (Team I) the frozen tower's image
+#: preprocessing and encoder. All three are numpy/torch-level at module scope —
+#: `tower` imports `transformers` lazily inside its loader — and so are safe in
+#: the separate LIBERO interpreter. Nothing else from `loom.data` (loader,
+#: cache, the HDF5 reader) may be imported by eval.
+ALLOWED_DATA_IMPORTS = {"loom.data.canonical", "loom.data.adapters.libero",
+                        "loom.data.tower"}
 
 
 def _module_scope_imports(path: Path) -> list[str]:
@@ -409,7 +412,7 @@ def test_eval_does_not_import_model_at_module_scope():
 
 
 def test_only_the_shared_transforms_are_imported_from_loom_data():
-    """`loom.data` is not open season — exactly two modules are sanctioned."""
+    """`loom.data` is not open season — only the shared transforms are sanctioned."""
     seen = set()
     for f in sorted(EVAL_DIR.glob("*.py")):
         for mod in _module_scope_imports(f):

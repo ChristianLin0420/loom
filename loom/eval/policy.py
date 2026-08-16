@@ -37,13 +37,17 @@ actions: semantics are per dimension and registered with no default. LIBERO is
 
 `tests/test_eval.py::test_action_round_trip_*` is the guard on both.
 
-**Import discipline.** This module imports `contracts`, `numpy`, `torch` and
-`loom.data.canonical` — nothing from `loom.model` / `loom.heads` / `loom.train`,
-which carry the training stack. `canonical` is numpy-level, safe across
-interpreters, and is imported precisely so that eval and training share one
-rate-conversion code path and cannot drift apart. `load_policy` imports the real
-model modules lazily, inside the function, and falls back to `stubs` when they
-are absent, so eval stays importable while the other teams are mid-flight.
+**Import discipline.** This module imports `contracts`, `numpy`, `torch`,
+`loom.data.canonical` and `loom.data.tower` — nothing from `loom.model` /
+`loom.heads` / `loom.train`, which carry the training stack. Both `loom.data`
+imports are there for the same reason: they are the *single* implementation of a
+transform that training also applies, and a second copy on this side is how eval
+comes to disagree with training. `canonical` owns rate conversion; `tower` owns
+image preprocessing and the frozen encoder. Both are numpy/torch-level at module
+scope (`tower` imports `transformers` lazily, inside the loader), so both are
+safe in the py3.10 LIBERO interpreter. `load_policy` imports the real model
+modules lazily, inside the function, and falls back to `stubs` when they are
+absent, so eval stays importable while the other teams are mid-flight.
 
 **Interpreter discipline.** Eval will not run under the training venv: LIBERO
 needs python 3.10 + robosuite 1.4 + numpy<2 in a separate conda env, while
@@ -78,6 +82,20 @@ from contracts import (
 # one transform is exactly how train and eval come to disagree.
 from loom.data.canonical import to_env_rate
 
+# The frozen SigLIP tower (Team I). Also `loom.data`, also numpy/torch-only at
+# module scope — it imports `transformers` lazily, inside the loader — so this
+# stays importable in the py3.10 LIBERO interpreter. It is the ONE encoder, used
+# by `encode_to_cache` on the training side and by `default_featurizer` here, so
+# train and eval cannot preprocess differently.
+from loom.data.tower import (
+    FEAT_DIM,
+    IMAGE_SIZE,
+    LANG_LEN,
+    N_PATCHES,
+    TOWER_MODEL_ID,
+    obs_featurizer,
+)
+
 __all__ = [
     "to_env_rate",
     "SegmentClock",
@@ -85,22 +103,25 @@ __all__ = [
     "LoomPolicy",
     "load_policy",
     "make_policy",
+    "default_featurizer",
+    "zeros_featurizer",
+    "feats_to",
     "PLACEHOLDER_FEATURES",
 ]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  PLACEHOLDER FEATURE GEOMETRY
+#  FEATURE GEOMETRY
 #
-#  Team A owns the frozen tower and has not finalised it. Until then the
-#  default featuriser emits correctly-shaped zeros so the whole harness runs.
-#  These are the only guesses in this package and they live in one block.
+#  No longer a guess: read from `loom.data.tower`, which reads it from the
+#  checkpoint. `zeros_featurizer` uses it so the stub path has exactly the
+#  geometry the real cache has.
 # ═══════════════════════════════════════════════════════════════════════════
 
 PLACEHOLDER_FEATURES = {
-    "patches": 196,      # 14x14 ViT grid
-    "dim": 1152,         # SigLIP-so400m width
-    "lang_tokens": 16,
+    "patches": N_PATCHES,        # (IMAGE_SIZE // 14)^2
+    "dim": FEAT_DIM,             # SigLIP-so400m width, both towers
+    "lang_tokens": LANG_LEN,     # tokenizer.model_max_length
 }
 
 
@@ -173,16 +194,34 @@ class SegmentClock:
 #  MODULE BUNDLE
 # ═══════════════════════════════════════════════════════════════════════════
 
-def default_featurizer(spec: EmbodimentSpec) -> Callable[[dict, str], ObsFeats]:
-    """`obs dict -> ObsFeats` with correct shapes and zero content.
+def default_featurizer(
+    spec: EmbodimentSpec, *, device: str = "cpu", **kw: Any
+) -> Callable[[dict, str], ObsFeats]:
+    """`obs dict -> ObsFeats` through the **real frozen SigLIP tower**.
 
-    Placeholder for Team A's frozen tower. It keeps the harness runnable today;
-    `load_policy` swaps in the real encoder as soon as one exists. Proprio is
-    read from the observation when present so that the one field the policy
-    actually needs at R0 is not fabricated.
+    A thin alias for `loom.data.tower.obs_featurizer`, which is the same object
+    the cache builder encodes with. Two featurisers would be two preprocessing
+    pipelines, and the second one is always the one that is subtly wrong.
+
+    Raises `tower.TowerUnavailable` when the checkpoint or `transformers` is
+    missing. That is deliberate: a real evaluation must never silently fall back
+    to zero features and report a chance-level score as a result. `load_policy`
+    catches it and degrades to the explicitly-marked stub path instead.
+    """
+    return obs_featurizer(spec, device=device, **kw)
+
+
+def zeros_featurizer(spec: EmbodimentSpec) -> Callable[[dict, str], ObsFeats]:
+    """Correctly-shaped zeros. **Stub path only.**
+
+    A policy on this featuriser scores at chance by construction, so it is
+    reachable only through `_stub_modules`, where `PolicyModules.is_stub` is
+    True and the results JSON says so. It exists because the Phase 1A
+    deliverable is the plumbing — a runnable harness with random success rates
+    — and because the login node has no GPU to run an 878 M tower on.
     """
     p = PLACEHOLDER_FEATURES
-    # constant while the tower is a placeholder — allocated once, not per segment
+    # content-free, so allocated once rather than per segment
     views = torch.zeros(1, spec.n_views, p["patches"], p["dim"])
     lang = torch.zeros(1, p["lang_tokens"], p["dim"])
 
@@ -286,7 +325,7 @@ class LoomPolicy:
     def _plan(self, obs: dict, instruction: str) -> np.ndarray:
         m = self.modules
         feats = m.featurize(obs, instruction)
-        feats = ObsFeats(**{k: _to_device(v, self.device) for k, v in feats.items()})
+        feats = feats_to(feats, self.device, _module_dtype(m.estimator))
 
         z = _call(m.estimator, feats, self._z)                       # (1, K, D)
         self._z = z
@@ -308,6 +347,38 @@ class LoomPolicy:
 
 def _to_device(v: Any, device: str) -> Any:
     return v.to(device) if isinstance(v, Tensor) else v
+
+
+def _module_dtype(mod: Any) -> torch.dtype | None:
+    """The dtype of a module's first parameter, or None for a stub."""
+    params = getattr(mod, "parameters", None)
+    if not callable(params):
+        return None
+    for p in params():
+        return p.dtype
+    return None
+
+
+def feats_to(feats: ObsFeats, device: str, dtype: torch.dtype | None = None) -> ObsFeats:
+    """Move an `ObsFeats` onto the estimator's device **and dtype**.
+
+    The frozen tower emits bf16 (PLAN §9) and reads proprio as float32, exactly
+    as the fp16 feature cache hands them to training. Training then runs under
+    `torch.autocast("cuda", bfloat16)`, which reconciles the two silently; eval
+    has no autocast, so a float32 checkpoint meeting bf16 features is a hard
+    `mat1 and mat2 must have the same dtype`. This is where the two meet, and it
+    is the only place that should have an opinion about it. `dtype=None` (a
+    stub, which has no parameters) leaves everything alone.
+    """
+    out = {}
+    for k, v in feats.items():
+        if not isinstance(v, Tensor):
+            out[k] = v
+        elif dtype is not None and v.is_floating_point():
+            out[k] = v.to(device=device, dtype=dtype)
+        else:
+            out[k] = v.to(device)
+    return ObsFeats(**out)
 
 
 def _call(mod: Any, *args: Any) -> Tensor:
@@ -384,7 +455,9 @@ def load_policy(
             raise RuntimeError(f"real modules unavailable and allow_stub=False: {err}")
         modules = _stub_modules(embodiment, device, reason=str(err))
 
-    modules.featurize = modules.featurize or default_featurizer(spec)
+    if modules.featurize is None:
+        modules.featurize = (zeros_featurizer(spec) if modules.is_stub
+                             else default_featurizer(spec, device=device))
     return LoomPolicy(modules, n_candidates=n_candidates)
 
 
@@ -413,15 +486,21 @@ def _try_real_modules(
                 mod.load_state_dict(sd, strict=False)
             mod.eval().to(device)
 
+        # The frozen tower is part of "real modules": if the checkpoint loaded
+        # but the tower cannot, this whole path must fail and degrade to the
+        # stub rather than run a trained policy on zero features.
+        featurize = default_featurizer(EMBODIMENTS[embodiment], device=device)
+
         return PolicyModules(
             estimator=estimator,
             proposal=proposal,
             decoder=_bind_embodiment(decoder, embodiment),
-            featurize=None,                              # filled by load_policy
+            featurize=featurize,
             embodiment=embodiment,
             device=device,
             is_stub=False,
-            meta={"ckpt": str(ckpt)},
+            meta={"ckpt": str(ckpt), "tower": TOWER_MODEL_ID,
+                  "tower_image_size": IMAGE_SIZE},
         ), None
     except Exception as e:                               # noqa: BLE001 — degrade, never crash eval
         return None, e
@@ -444,7 +523,7 @@ def _stub_modules(embodiment: str, device: str, reason: str = "") -> PolicyModul
         estimator=stubs.StubEstimator(),
         proposal=stubs.StubProposal(),
         decoder=stubs.StubDecoder(embodiment),
-        featurize=default_featurizer(spec),
+        featurize=zeros_featurizer(spec),
         embodiment=embodiment,
         device=device,
         is_stub=True,
