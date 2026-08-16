@@ -528,7 +528,23 @@ def _try_real_modules(
         # `weights_only=False` and `map_location="cpu"`: eval may run under a
         # different interpreter than training, and CPU-first avoids dragging
         # saved RNG ByteTensors onto a GPU (CLAUDE.md gotcha).
-        payload = torch.load(ckpt, map_location="cpu", weights_only=False)
+        try:
+            payload = torch.load(ckpt, map_location="cpu", weights_only=False)
+        except RuntimeError as e:
+            # A raw per-rank FSDP shard. `sharded_state_dict` saves
+            # SHARDED_STATE_DICT, so ckpt_*_rank*.pt hold ShardedTensor objects
+            # that will not even unpickle without a process group -- and the
+            # bare torch message reads like a distributed-setup bug in eval.
+            if "process group" in str(e) or "ShardedTensor" in str(e):
+                raise RuntimeError(
+                    f"{ckpt} is a per-rank FSDP shard, not a whole model. "
+                    "Reassemble the run's shards first:\n"
+                    "    python -m loom.train.consolidate --run_dir <run> --pin\n"
+                    "and pass the consolidated file to --ckpt. (--pin hardlinks "
+                    "the shards out of the way of ckpt._prune, which keeps only "
+                    "the last 3 steps.)"
+                ) from e
+            raise
         state = payload.get("model", payload) if isinstance(payload, dict) else payload
 
         # Only the body under evaluation. Building every registered embodiment
