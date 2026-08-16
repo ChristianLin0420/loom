@@ -324,15 +324,30 @@ def test_eval_does_not_import_model_internals():
     ev = ROOT / "loom" / "eval"
     if not ev.exists():
         pytest.skip("eval not landed")
+    import ast
+
+    forbidden = ("loom.model", "loom.heads", "loom.train", "loom.losses", "loom.search")
     offenders = []
     for p in ev.rglob("*.py"):
-        for line in p.read_text().splitlines():
-            s = line.strip()
-            if not (s.startswith("import ") or s.startswith("from ")):
-                continue          # lazy imports inside functions are allowed
-            if "loom.model" in s or "loom.heads" in s or "loom.train" in s:
-                offenders.append(f"{p.relative_to(ROOT)}: {s}")
-    assert not offenders, "eval must couple only to contracts.Policy:\n" + "\n".join(offenders)
+        try:
+            tree = ast.parse(p.read_text())
+        except SyntaxError:
+            continue
+        # Module scope only. A lazy import inside a function is the documented
+        # way to load real modules at eval time without coupling to them, and
+        # `line.strip()` cannot tell an indented import from a top-level one.
+        for node in tree.body:
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            mods = ([a.name for a in node.names] if isinstance(node, ast.Import)
+                    else [node.module or ""])
+            for m in mods:
+                if any(m == f or m.startswith(f + ".") for f in forbidden):
+                    offenders.append(f"{p.relative_to(ROOT)}:{node.lineno}: {m}")
+    assert not offenders, (
+        "eval must couple only to contracts.Policy at module scope:\n"
+        + "\n".join(offenders)
+    )
 
 
 def test_sbatch_files_name_only_real_partitions():
