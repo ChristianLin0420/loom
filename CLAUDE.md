@@ -96,6 +96,20 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
   and eight processes train the same shard while the loss curve looks fine.
 - `scontrol` blocks indefinitely if slurmctld is unreachable from the node. Only call it
   when `SLURM_NNODES > 1`, wrapped in `timeout 30`.
+- **`torch.compile` needs `export TRITON_CACHE_DIR="$PWD/.triton_cache"`.** Login nodes run
+  glibc 2.35, compute nodes run **2.31**. The shared `~/.triton/cache` holds a
+  `cuda_utils.so` linked against glibc ≥2.34, so every compile on a compute node dies with
+  `GLIBC_2.34 not found` and reads like "inductor is unsupported here". It is not — a fresh
+  project-local cache rebuilds against the node's own glibc and compiles fine (verified on
+  an A100). **Never clear `~/.triton/cache`**; another project shares it.
+- `/dev/shm` is **64 MiB**. A DataLoader prefetch queue does not fit, and the failure is an
+  opaque worker bus error. Use `loom.data.loader.fit_workers()`.
+- Lustre punishes small strided reads: fancy-indexed `np.memmap` measured 13 MiB/s where a
+  coalesced `os.preadv` of the same bytes got 650 MiB/s.
+- `import torch` off Lustre costs ~44 s wall with ~1 s of CPU. Run test suites as one
+  pytest process, not one per test.
+- torch defaults to 32 intra-op threads on these 64-core boxes and thrashes under
+  concurrent load. `OMP_NUM_THREADS=8` took one suite from 249 s to 8 s.
 
 ## Do not build
 

@@ -229,3 +229,5 @@ checkpoints/
 *.pt
 results/
 outputs/
+data/
+.triton_cache*/
