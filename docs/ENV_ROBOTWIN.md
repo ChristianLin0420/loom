@@ -20,7 +20,7 @@ _ARM_LO = (-10.0,) * 6      # URDF revolute limits, arx5_description_isaac.urdf
 _ARM_HI = ( 10.0,) * 6
 
 register_embodiment(EmbodimentSpec(
-    name="robotwin_aloha_agilex",
+    name="robotwin_aloha",       # == configs/r0b.yaml and r3.yaml data.embodiments
     dof=14,                      # (6 arm + 1 gripper) x 2
     env_fps=250.0 / 15.0,        # = 16.6667 Hz   <-- read §4, do NOT use 15.0
     n_views=4,                   # head, front(third-view), left wrist, right wrist
@@ -286,6 +286,73 @@ gripper is a `[-1, 1]` delta. Do not share a normaliser between the two bodies.
 An `action_type="ee"` mode also exists (`take_action(..., action_type='ee')`), where the
 vector is `7 + 1 + 7 + 1 = 16` — position + quaternion + gripper per arm. LOOM uses `qpos`;
 the joint-space path is what the PLAN §8 baseline table was produced with.
+
+### All 14 channels are `ABSOLUTE` — the grippers too
+
+LIBERO's gripper is a latched ±1 and therefore `HOLD`. RoboTwin's is not. The planner emits
+`np.linspace(now_val, target_val, 200)` (`envs/robot/planner.py:426`) and advances it one
+element per physics step, so the recorded gripper channel is a **continuous normalised width
+in [0, 1]** that the data itself already interpolates linearly. `ABSOLUTE` reproduces that
+exactly; `HOLD` would staircase a ramp, and would also break the property that the whole
+14-vector is one interpolatable joint path.
+
+Registered semantics: `register_action_semantics("robotwin_aloha", (ABSOLUTE,) * 14)`.
+
+Two things checked before trusting linear interpolation:
+
+* **No 2π wraparound between adjacent frames.** Over all 2 500 episodes (549 787 frames ×
+  12 arm joints ≈ 6.6 M adjacent deltas) **zero** exceed 3.0 rad; the largest is 2.506 rad
+  (one outlier on `R_j1`) and the 99th-percentile scale is ~0.15 rad. Interpolating a pair
+  therefore never sweeps the long way round. The wrap the table in §1 warns about is
+  *between* episodes — an episode can live wholly on the `θ − 2π` branch — and is a
+  normalisation hazard, not a resampling one.
+* **`action[t] == state[t+1]` bitwise in all 2 500 episodes** (`np.array_equal`, not
+  `allclose`). `envs/utils/pkl2hdf5.py:149` writes `action = joint_target[1:]` and
+  `state = joint_target[:-1]` from one snapshot stream, and `_write_camera` slices the images
+  with the *state* rule, so `colors[t]`, `state[t]` and `action[t]` are the standard
+  (o_t, a_t) pairing with no off-by-one to correct.
+
+---
+
+## 5b. The stored JPEGs are BGR-as-RGB
+
+**Decode with `cv2.imdecode`, or with PIL followed by `[..., ::-1]`. PIL alone is wrong.**
+
+RoboTwin encodes every frame with `cv2.imencode(".jpg", rgb_image)` and says so in a comment
+(`envs/utils/pkl2hdf5.py:29`):
+
+```python
+# Keep source channel values unchanged for XPolicyLab's OpenCV decoder.
+# OpenCV intentionally interprets this RGB array as BGR while encoding.
+```
+
+OpenCV converts to YCbCr assuming its input is BGR, so the JPEG's *semantic* red plane holds
+the true blue values. `cv2.imdecode` inverts that and returns the original array;
+`PIL.Image.open(...).convert("RGB")` returns the channels **reversed**.
+
+This matters because the live simulator hands eval **true RGB** — `Cameras.get_rgb()` slices
+SAPIEN's `get_picture("Color")` directly (`envs/camera/camera.py:328`) with no OpenCV in the
+path. A cache built from a naive PIL decode would train on channel-swapped images and be
+scored on correct ones: the classic trains-fine, scores-near-zero failure.
+`adapters.robotwin.decode_frame` does the swap; `orient_env_image` is its eval-side twin and
+is the identity.
+
+Three independent confirmations that the swap is the right way round:
+
+1. The source comment above.
+2. `stack_blocks_three`, last frame, instruction *"stack blue block on green block, followed
+   by green block on red block"*: the topmost blob is channel-0-dominant in the PIL array, so
+   PIL's channel 0 is the true blue. Independently, `blocks_ranking_rgb`'s final left-to-right
+   order reads red, green, blue only after the swap (green sits in the middle either way,
+   which is the control).
+3. Direct inspection of `handover_block` and `put_bottles_dustbin` head frames: after the swap
+   the pad is blue and the block red as the instruction says, and the Coca-Cola bottle is red.
+
+**No flip.** Unlike LIBERO (whose files declare `macros_image_convention = 'opengl'`),
+RoboTwin frames are already row-0-is-top: bottles and shoes stand upright, the `AGILE X`
+decal on the arm reads left to right, and the block stack reads blue-above-green-above-red.
+`adapters.robotwin` applies no vertical or horizontal transform, and neither must the eval
+side.
 
 ---
 

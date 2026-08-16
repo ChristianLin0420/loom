@@ -815,13 +815,152 @@ def test_libero_images_are_reoriented_once():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  PHASE 1B GUARD
+#  ROBOTWIN 2.0 ADAPTER  —  R0-B (Team H).
+#
+#  These replace the Phase-1B "deliberately unimplemented" guard. Everything
+#  here runs on CPU with no demo files; the three that need the 33 GB of HDF5s
+#  are marked `needs_robotwin`.
 # ═══════════════════════════════════════════════════════════════════════════
 
-def test_robotwin_is_deliberately_unimplemented():
-    from loom.data.adapters import robotwin
-    with pytest.raises(NotImplementedError, match="Phase 1B"):
-        robotwin.discover()
+from loom.data.adapters import robotwin as RT           # noqa: E402
+
+_HAS_ROBOTWIN = RT.DATA_ROOT.is_dir() and any(
+    (RT.DATA_ROOT / RT.SUITES[0]).glob(f"*/{RT.ROBOT_DIR}/data/episode_*.hdf5")
+)
+needs_robotwin = pytest.mark.skipif(
+    _HAS_ROBOTWIN is False, reason=f"no RoboTwin demos at {RT.DATA_ROOT}"
+)
+
+
+def test_robotwin_src_fps_is_250_over_15_not_15():
+    """`/additional_info/frequency = 15` is save_freq, a 250 Hz decimation
+    factor, not hertz. Taking it as hertz makes every executed segment 11 %
+    too slow and the wrong number is the tidy-looking one."""
+    spec = C.EMBODIMENTS[RT.EMBODIMENT]
+    assert RT.SRC_FPS == spec.env_fps == pytest.approx(250.0 / 15.0)
+    assert C.env_steps_per_segment(spec.env_fps) == pytest.approx(4.44444, abs=1e-4)
+    assert C.env_steps_per_segment(15.0) == 4.0          # the trap, for contrast
+
+
+def test_robotwin_registers_absolute_semantics_for_all_14_channels():
+    """Joint-position control: `action[t] == state[t+1]` bitwise in the released
+    data. The grippers are a normalised width ramped linearly over 200 physics
+    steps, so they are ABSOLUTE too — not LIBERO's latched HOLD."""
+    spec = C.EMBODIMENTS[RT.EMBODIMENT]
+    assert spec.dof == RT.DOF == 14
+    assert spec.n_views == len(RT.VIEW_KEYS) == len(RT.EVAL_VIEW_KEYS) == 4
+    kinds = CN.action_semantics(RT.EMBODIMENT)
+    assert kinds == (CN.ABSOLUTE,) * 14
+    assert CN.HOLD not in kinds and CN.DELTA not in kinds
+    # gripper channels are the two normalised ones; the rest are radians
+    assert spec.action_low[6] == spec.action_low[13] == 0.0
+    assert spec.action_high[6] == spec.action_high[13] == 1.0
+    assert RT.WINDOW_STRIDE == C.H_OP
+
+
+def test_robotwin_absolute_resampling_is_a_plain_interpolation():
+    """A straight-line joint path upsampled 16.67 -> 30 Hz stays a straight line.
+    Under DELTA it would be integrated and differenced; under HOLD it would
+    staircase. Both are silent in the training loss."""
+    t = np.arange(40, dtype=np.float32)
+    raw = np.stack([t * 0.01] * 14, axis=1)              # (40, 14) linear ramp
+    got = CN.resample_actions(raw, RT.SRC_FPS, C.FPS_CANONICAL,
+                              CN.action_semantics(RT.EMBODIMENT))
+    n = CN.canonical_action_count(40, RT.SRC_FPS)
+    assert got.shape == (n, 14)
+    # ...and it never extrapolates: destination samples past the last source
+    # instant latch the final value rather than continuing the ramp.
+    want = np.minimum(np.arange(n) * (RT.SRC_FPS / C.FPS_CANONICAL), 39.0) * 0.01
+    np.testing.assert_allclose(got[:, 0], want, atol=1e-5)
+
+
+@needs_robotwin
+def test_robotwin_discovery_and_per_episode_instructions():
+    eps = RT.discover(tasks_=("handover_block",), max_episodes=3)
+    assert len(eps) == 3
+    assert [e.traj_id for e in eps] == [
+        f"demo_clean/handover_block/episode_{i:07d}" for i in range(3)
+    ]
+    assert all(e.n_frames > C.H_PLAN for e in eps)
+    texts = [RT.read_instruction(e) for e in eps]
+    assert all(t and t == t.strip() for t in texts)
+    assert len(set(texts)) > 1, "RoboTwin draws a different phrasing per episode"
+
+
+@needs_robotwin
+def test_robotwin_actions_are_the_next_state_exactly():
+    """The single strongest evidence that the stream is absolute, not delta."""
+    ep = RT.discover(tasks_=("turn_switch",), max_episodes=1)[0]
+    a = RT.read_actions(ep)
+    s = RT.read_proprio(ep)
+    assert a.shape == s.shape == (ep.n_frames, 14)
+    np.testing.assert_array_equal(a[:-1], s[1:])          # bitwise, not approx
+    assert not np.array_equal(a[:-1], s[:-1])
+    g = a[:, [6, 13]]
+    assert g.min() >= 0.0 and g.max() <= 1.0
+    # planner ramps the gripper as linspace(now, target, 200) advanced one
+    # element per physics step, so a saved-frame delta of 15/199 IS save_freq.
+    assert np.abs(np.diff(g, axis=0)).max() <= 15.0 / 199.0 + 1e-6
+
+
+@needs_robotwin
+def test_robotwin_frames_decode_to_true_rgb_and_are_not_black():
+    """The stored JPEGs are BGR-as-RGB (RoboTwin encodes with cv2.imencode on an
+    RGB array and says so). `decode_frame` swaps; PIL alone does not."""
+    import io
+
+    import h5py
+    from PIL import Image
+
+    ep = RT.discover(tasks_=("handover_block",), max_episodes=1)[0]
+    imgs = RT.read_images(ep, [0, 4, 9])
+    assert imgs.shape == (3, 4, 240, 320, 3)
+    assert imgs.dtype == np.uint8
+    for v in range(4):
+        assert imgs[:, v].var() > 5.0, f"{RT.VIEW_KEYS[v]} is (near) all black"
+
+    with h5py.File(ep.path, "r") as f:
+        raw = f[f"vision/{RT.VIEW_KEYS[0]}/colors"][0].tobytes()
+    pil = np.asarray(Image.open(io.BytesIO(raw)).convert("RGB"))
+    np.testing.assert_array_equal(imgs[0, 0], pil[..., ::-1])
+    assert not np.array_equal(imgs[0, 0], pil), "the channel swap is the point"
+    # the eval-side twin is the identity: SAPIEN already hands out true RGB
+    np.testing.assert_array_equal(RT.orient_env_image(imgs[0, 0]), imgs[0, 0])
+
+
+@needs_robotwin
+def test_robotwin_cache_round_trips_through_the_loader(tmp_path):
+    """Shard -> merge -> FeatureCache -> CachedWindowDataset -> collate, with a
+    fake encoder. This is the whole R0-B data path minus the frozen tower."""
+    p, f_, l = 8, 6, 4
+
+    def enc(images, instruction):
+        n, v = images.shape[0], images.shape[1]
+        x = images.reshape(n, v, -1)[..., : p * f_].astype(np.float32) / 255.0
+        return x.reshape(n, v, p, f_), np.full((l, f_), float(len(instruction)), np.float32)
+
+    roots = []
+    for i in range(2):
+        r = tmp_path / "_shards" / f"rank{i}"
+        RT.encode_to_cache(enc, r, tasks_=("turn_switch",), max_episodes=2,
+                           shard=(i, 2), flush_every=1)
+        roots.append(r)
+    # a re-run is a no-op: resume must not re-encode or duplicate
+    RT.encode_to_cache(enc, roots[0], tasks_=("turn_switch",), max_episodes=2,
+                       shard=(0, 2), flush_every=1)
+    info = RT.merge_shards(roots, tmp_path / "cache")
+    assert info["entries"] == 2
+    assert info["spec"]["n_views"] == 4 and info["spec"]["dof"] == 14
+    assert info["spec"]["codec"] == CA.DEFAULT_CODEC
+
+    ds = RT.robotwin_dataset(tmp_path / "cache", tasks_=("turn_switch",), max_episodes=2)
+    assert len(ds) > 0
+    w = collate_window([ds[i] for i in range(min(3, len(ds)))])
+    assert w["embodiment"] == RT.EMBODIMENT
+    assert w["src_fps"] == pytest.approx(250.0 / 15.0)
+    assert len(w["feats"]) == C.N_STATES
+    assert w["actions"].shape[1:] == (C.DEPTH, C.H_OP, 14)
+    C.assert_action_segment(w["actions"][:, 0], RT.EMBODIMENT)
 
 
 def test_throughput_ratio_arithmetic():
