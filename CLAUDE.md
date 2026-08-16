@@ -102,8 +102,10 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
   `GLIBC_2.34 not found` and reads like "inductor is unsupported here". It is not — a fresh
   project-local cache rebuilds against the node's own glibc and compiles fine (verified on
   an A100). **Never clear `~/.triton/cache`**; another project shares it.
-- `/dev/shm` is **64 MiB**. A DataLoader prefetch queue does not fit, and the failure is an
-  opaque worker bus error. Use `loom.data.loader.fit_workers()`.
+- `/dev/shm` is **64 MiB on login nodes but 1008 GiB on compute nodes** — both measured. A
+  DataLoader prefetch queue does not fit on a login node and fails as an opaque worker bus
+  error, so local debugging misleads. Never hardcode `num_workers` from what you see on the
+  login node; `loom.data.loader.fit_workers()` measures at runtime and is the right call.
 - Lustre punishes small strided reads: fancy-indexed `np.memmap` measured 13 MiB/s where a
   coalesced `os.preadv` of the same bytes got 650 MiB/s.
 - `import torch` off Lustre costs ~44 s wall with ~1 s of CPU. Run test suites as one
