@@ -684,6 +684,27 @@ def _dataset_for(
     body: str, source: str, cache: FeatureCache, dcfg: Mapping
 ) -> CachedWindowDataset:
     """One embodiment's windows, from the cache plus that adapter's metadata."""
+    if source == "robotwin" and body == "robotwin_aloha":
+        from dataclasses import replace  # noqa: PLC0415
+
+        from .adapters import robotwin as RT  # noqa: PLC0415
+
+        trajs = RT.robotwin_trajectories(
+            root=dcfg.get("data_root"),
+            tasks_=tuple(dcfg["tasks"]) if dcfg.get("tasks") else None,
+            max_episodes=dcfg.get("max_episodes"),
+        )
+        trajs = [t for t in trajs if t.traj_id in cache]
+        if not trajs:
+            raise DataConfigError(
+                f"no cached RoboTwin trajectories in {cache.root}. The cache holds "
+                f"{len(cache)} entries; check data.tasks and $LOOM_DATA_ROOT "
+                f"(currently {os.environ.get('LOOM_DATA_ROOT')!r})."
+            )
+        if dcfg.get("action_free", False):
+            trajs = [replace(t, actions=None) for t in trajs]
+        return CachedWindowDataset(trajs, cache, stride=RT.WINDOW_STRIDE)
+
     if source != "libero" or body != "libero_franka":
         raise DataConfigError(
             f"no adapter wired for source={source!r} body={body!r}. LIBERO is the "
