@@ -61,20 +61,17 @@ export PYTHONUNBUFFERED=1
 # Team A's loader throughput gate needs a real training rate. Measure it/s from
 # the first link's log and set this; the 5.0 default is a placeholder.
 export LOOM_TRAIN_STEP_HZ="${LOOM_TRAIN_STEP_HZ:-5.0}"
-# Login nodes run glibc 2.35, compute nodes 2.31. The shared ~/.triton/cache holds
-# a cuda_utils.so linked against glibc >= 2.34, so Triton reuses it here and every
-# torch.compile dies with "GLIBC_2.34 not found" -- which reads as "inductor is
-# unsupported on this cluster". A project-local cache is the whole fix. Do NOT
-# clear ~/.triton/cache: the sibling pse project is mid-run and shares it.
-export TRITON_CACHE_DIR="$PWD/.triton_cache"
+# Data roots, HF cache, Triton cache. Shared with logs/*_smoke.sh so a green
+# smoke actually gates the real launch; raises if the feature cache is missing.
+source scripts/env.sh
 
 # Echo FIRST: a link that dies before any output is indistinguishable from a
 # hung node, and that costs a whole 4 h chain slot to diagnose.
 echo "link start: job=${SLURM_JOB_ID} restart=${LOOM_RESTART_COUNT} node=$(hostname) config=${CONFIG} run=${RUN_NAME}"
-# /dev/shm is 64 MiB on this cluster and DataLoader workers pass tensors through
-# it; the overflow surfaces as "DataLoader worker exited unexpectedly" or a bare
-# bus error, which reads like a code bug. The login node's value can differ from a
-# compute node's, so measure it here rather than inferring it from a crash.
+# DataLoader workers pass tensors through /dev/shm, and an overflow surfaces as
+# "DataLoader worker exited unexpectedly" or a bare bus error -- which reads like
+# a code bug. It is 64 MiB on a LOGIN node but 1008 GiB here, so measure it on
+# the node rather than inferring it from either value.
 df -h /dev/shm | tail -n1 | awk '{printf "shm: size=%s used=%s avail=%s\n", $2, $3, $4}'
 ldd --version | head -n1     # glibc differs between login and compute nodes
 
