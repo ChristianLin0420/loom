@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LOOM v0.4 — implementation proposal</title>
+<style>
+  :root{
+    --paper:#E9ECF0; --plate:#F7F8FA; --ink:#0E141B; --soft:#5A6672; --rule:#C3CBD4;
+    --frozen:#78848F; --train:#25467F; --tmp:#6A55A0; --body:#A8681C; --loss:#9E2F45; --live:#1C6B5A;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{background:var(--paper);color:var(--ink);
+    font-family:"Inter Tight","Inter","Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1120px;margin:0 auto;padding:40px 22px 90px}
+  header{border-bottom:1.5px solid var(--ink);padding-bottom:18px}
+  .eyebrow{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:11px;letter-spacing:.16em;
+    text-transform:uppercase;color:var(--soft);margin:0 0 10px}
+  h1{font-size:clamp(28px,4.4vw,44px);line-height:1.02;margin:0;font-weight:650;letter-spacing:-.022em}
+  .sub{margin:14px 0 0;max-width:64ch;color:var(--soft);font-size:15px;line-height:1.5}
+  .sub b{color:var(--ink);font-weight:600}
+  .panel{background:var(--plate);border:1.5px solid var(--ink);margin:26px 0}
+  .panel-head{display:flex;justify-content:space-between;align-items:baseline;gap:16px;flex-wrap:wrap;
+    padding:12px 18px;border-bottom:1px solid var(--rule)}
+  .panel-head h2{margin:0;font-size:13px;font-weight:650;letter-spacing:.12em;text-transform:uppercase;
+    font-family:ui-monospace,monospace}
+  .panel-head .note{font-size:12.5px;color:var(--soft);font-family:ui-monospace,monospace}
+  .panel svg{display:block;width:100%;height:auto}
+  .pad{padding:16px 18px}
+  text{font-family:ui-monospace,"SF Mono","JetBrains Mono",Menlo,monospace}
+  .band{font-size:10px;letter-spacing:.22em;fill:var(--soft)}
+  .nm{font-size:13px;font-weight:600;fill:var(--ink)}
+  .sm{font-size:10.5px;fill:var(--soft)}
+  .eq{font-size:12.5px;fill:var(--ink)}
+  .tag{font-size:9.5px;letter-spacing:.1em}
+  .legend{display:flex;flex-wrap:wrap;gap:6px 24px;padding:13px 18px;border-top:1px solid var(--rule);
+    font-family:ui-monospace,monospace;font-size:11.5px;color:var(--soft)}
+  .legend span{display:flex;align-items:center;gap:7px}
+  .sw{width:13px;height:13px;border:1.6px solid;flex:none}
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th,td{text-align:left;padding:9px 18px;border-bottom:1px solid var(--rule);vertical-align:top}
+  th{font-family:ui-monospace,monospace;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
+    color:var(--soft);font-weight:600}
+  td.m{font-family:ui-monospace,monospace;font-size:12.5px}
+  td.n{font-family:ui-monospace,monospace;font-size:12.5px;text-align:right}
+  tbody tr:last-child td{border-bottom:none}
+  tr.target td{background:#E4E9F2;font-weight:650}
+  tr.target td.m{color:var(--train)}
+  .bar{font-weight:650;color:var(--train)}
+  code{font-family:ui-monospace,monospace;font-size:12.5px;background:#E4E7EC;padding:1px 5px}
+  pre{font-family:ui-monospace,monospace;font-size:12.5px;line-height:1.65;background:#E4E7EC;
+    padding:14px 16px;overflow-x:auto;margin:0;border-left:3px solid var(--train)}
+  ol.steps{margin:0;padding:0;list-style:none;counter-reset:s}
+  ol.steps li{counter-increment:s;padding:13px 18px 13px 58px;border-bottom:1px solid var(--rule);position:relative;font-size:13.5px}
+  ol.steps li:last-child{border-bottom:none}
+  ol.steps li::before{content:counter(s,decimal-leading-zero);position:absolute;left:18px;top:13px;
+    font-family:ui-monospace,monospace;font-size:11px;color:var(--train);font-weight:650}
+  ol.steps b{font-family:ui-monospace,monospace;font-size:12.5px;font-weight:650}
+  .gate{border-left:3px solid var(--live);background:#E3EDEA;padding:11px 16px;margin:14px 18px;
+    font-size:13px}
+  .gate b{font-family:ui-monospace,monospace;color:var(--live)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">LOOM v0.4 · implementation proposal</p>
+  <h1>Operator-native control</h1>
+  <p class="sub">The action is the operator. Two losses carry the representation: <b>L<sub>dyn</sub></b> for what a transformation does, <b>L<sub>act</sub></b> for how this body produces it. Goal of this document: build it and read the success rate.</p>
+</header>
+
+<!-- ══════════ TRAINING GRAPH ══════════ -->
+<section class="panel">
+  <div class="panel-head"><h2>Architecture · training graph</h2>
+    <span class="note">the only route from a to z′ runs through c</span></div>
+
+<svg viewBox="0 0 1060 724" role="img" aria-label="LOOM training computation graph">
+<defs>
+  <marker id="a1" markerWidth="9" markerHeight="9" refX="7.2" refY="3.1" orient="auto"><path d="M0,0 L7.2,3.1 L0,6.2 z" fill="#0E141B"/></marker>
+  <marker id="a2" markerWidth="9" markerHeight="9" refX="7.2" refY="3.1" orient="auto"><path d="M0,0 L7.2,3.1 L0,6.2 z" fill="#78848F"/></marker>
+  <marker id="a3" markerWidth="9" markerHeight="9" refX="7.2" refY="3.1" orient="auto"><path d="M0,0 L7.2,3.1 L0,6.2 z" fill="#25467F"/></marker>
+  <marker id="a4" markerWidth="9" markerHeight="9" refX="7.2" refY="3.1" orient="auto"><path d="M0,0 L7.2,3.1 L0,6.2 z" fill="#9E2F45"/></marker>
+  <marker id="a5" markerWidth="9" markerHeight="9" refX="7.2" refY="3.1" orient="auto"><path d="M0,0 L7.2,3.1 L0,6.2 z" fill="#6A55A0"/></marker>
+</defs>
+
+<text class="band" transform="rotate(-90 18 96)" x="18" y="96" text-anchor="middle">SENSE</text>
+<text class="band" transform="rotate(-90 18 246)" x="18" y="246" text-anchor="middle">BELIEVE</text>
+<text class="band" transform="rotate(-90 18 468)" x="18" y="468" text-anchor="middle">OPERATOR CORE</text>
+<text class="band" transform="rotate(-90 18 650)" x="18" y="650" text-anchor="middle">REALIZE</text>
+
+<!-- R1 inputs -->
+<g>
+  <rect x="106" y="34" width="196" height="32" fill="#fff" stroke="#78848F" stroke-width="1.4"/>
+  <text class="nm" x="204" y="55" text-anchor="middle">third + wrist RGB</text>
+  <rect x="314" y="34" width="170" height="32" fill="#fff" stroke="#78848F" stroke-width="1.4"/>
+  <text class="nm" x="399" y="55" text-anchor="middle">tactile gel ×4</text>
+  <rect x="496" y="34" width="120" height="32" fill="#fff" stroke="#78848F" stroke-width="1.4"/>
+  <text class="nm" x="556" y="55" text-anchor="middle">proprio</text>
+  <rect x="628" y="34" width="136" height="32" fill="#fff" stroke="#78848F" stroke-width="1.4"/>
+  <text class="nm" x="696" y="55" text-anchor="middle">language ℓ</text>
+</g>
+<g fill="none" stroke="#78848F" stroke-width="1.3" marker-end="url(#a2)">
+  <path d="M204,66 L204,96"/><path d="M399,66 L399,96"/><path d="M556,66 L556,96"/><path d="M696,66 L696,96"/>
+</g>
+
+<!-- R2 encoders -->
+<g>
+  <rect x="106" y="98" width="378" height="44" fill="#EEF0F3" stroke="#78848F" stroke-width="1.8"/>
+  <text class="nm" x="295" y="117" text-anchor="middle">frozen visual encoder</text>
+  <text class="sm" x="295" y="132" text-anchor="middle">SigLIP2 / DINOv3 · every stream, RGB and tactile alike</text>
+  <rect x="496" y="98" width="120" height="44" fill="#EEF0F3" stroke="#78848F" stroke-width="1.8"/>
+  <text class="nm" x="556" y="125" text-anchor="middle">MLP</text>
+  <rect x="628" y="98" width="136" height="44" fill="#EEF0F3" stroke="#78848F" stroke-width="1.8"/>
+  <text class="nm" x="696" y="117" text-anchor="middle">frozen text</text>
+  <text class="sm" x="696" y="132" text-anchor="middle">encoder</text>
+</g>
+<g fill="none" stroke="#0E141B" stroke-width="1.4" marker-end="url(#a1)">
+  <path d="M295,142 L295,174"/><path d="M556,142 L556,174"/><path d="M696,142 L696,158 L600,158 L600,174"/>
+</g>
+
+<!-- R3 -->
+<g>
+  <rect x="200" y="176" width="456" height="54" fill="#fff" stroke="#25467F" stroke-width="2"/>
+  <text class="nm" x="428" y="197" text-anchor="middle" fill="#25467F">E — estimator</text>
+  <text class="sm" x="428" y="214" text-anchor="middle">Perceiver · K=128 queries · d=768 · 10 blocks · nonlinear · unconstrained</text>
+  <rect x="744" y="176" width="220" height="54" fill="#fff" stroke="#78848F" stroke-width="1.8" stroke-dasharray="6 3"/>
+  <text class="nm" x="854" y="197" text-anchor="middle">Ē — EMA target</text>
+  <text class="sm" x="854" y="214" text-anchor="middle">τ = 0.996 · stop-grad</text>
+</g>
+<g fill="none" stroke="#78848F" stroke-width="1.3" stroke-dasharray="5 3" marker-end="url(#a2)">
+  <path d="M658,203 L742,203"/><path d="M854,230 L854,260"/>
+</g>
+
+<!-- R4 -->
+<g>
+  <rect x="310" y="262" width="240" height="46" fill="#25467F" stroke="#25467F" stroke-width="2"/>
+  <text class="nm" x="430" y="282" text-anchor="middle" fill="#F7F8FA">z_t ∈ ℝ^(128×768)</text>
+  <text class="sm" x="430" y="298" text-anchor="middle" fill="#C9D3E4">belief · 200 KB · independent of stream count</text>
+  <rect x="744" y="262" width="220" height="46" fill="#fff" stroke="#78848F" stroke-width="1.6" stroke-dasharray="6 3"/>
+  <text class="eq" x="854" y="285" text-anchor="middle">z⁺ = sg( Ē(o_t+h) )</text>
+  <text class="sm" x="854" y="300" text-anchor="middle">prediction target</text>
+</g>
+<g fill="none" stroke="#0E141B" stroke-width="1.4" marker-end="url(#a1)"><path d="M430,230 L430,260"/></g>
+
+<!-- lane A: recurrence -->
+<g fill="none" stroke="#25467F" stroke-width="1.3" marker-end="url(#a3)">
+  <path d="M310,272 L48,272 L48,190 L198,190"/>
+</g>
+<text class="sm" x="54" y="264" fill="#25467F">z_(t−1)</text>
+
+<!-- lane B: z_t to imaginer and decoder -->
+<g fill="none" stroke="#25467F" stroke-width="1.3" marker-end="url(#a3)">
+  <path d="M310,296 L74,296 L74,550 L270,550"/>
+  <path d="M74,550 L74,650 L104,650"/>
+</g>
+
+<!-- z_t to sources -->
+<g fill="none" stroke="#25467F" stroke-width="1.3" marker-end="url(#a3)">
+  <path d="M370,308 L370,330 L213,330 L213,354"/>
+  <path d="M490,308 L490,338 L459,338 L459,354"/>
+</g>
+
+<!-- R5 sources -->
+<g>
+  <text class="tag" x="213" y="348" text-anchor="middle" fill="#6A55A0">ACTION-FREE PATH · S1</text>
+  <rect x="106" y="356" width="214" height="52" fill="#fff" stroke="#6A55A0" stroke-width="1.8" stroke-dasharray="6 3"/>
+  <text class="nm" x="213" y="377" text-anchor="middle" fill="#6A55A0">q_Δ( c | z_t , z_t+1 )</text>
+  <text class="sm" x="213" y="393" text-anchor="middle">canonical encoder · train only</text>
+  <text class="tag" x="459" y="348" text-anchor="middle" fill="#6A55A0">ACTION-LABELLED PATH · S2</text>
+  <rect x="352" y="356" width="214" height="52" fill="#fff" stroke="#6A55A0" stroke-width="1.8" stroke-dasharray="6 3"/>
+  <text class="nm" x="459" y="377" text-anchor="middle" fill="#6A55A0">q_a( c | a_t , z_t )</text>
+  <text class="sm" x="459" y="393" text-anchor="middle">regresses q_Δ · train only</text>
+  <rect x="598" y="356" width="110" height="52" fill="#fff" stroke="#0E141B" stroke-width="1.4"/>
+  <text class="nm" x="653" y="387" text-anchor="middle">a_t</text>
+</g>
+<g fill="none" stroke="#0E141B" stroke-width="1.4" marker-end="url(#a1)"><path d="M596,382 L568,382"/></g>
+
+<!-- sources to c -->
+<g fill="none" stroke="#6A55A0" stroke-width="1.5" marker-end="url(#a5)">
+  <path d="M213,408 L213,426 L330,426 L330,442"/>
+  <path d="M459,408 L459,418 L442,418 L442,442"/>
+</g>
+
+<!-- R6 -->
+<g>
+  <rect x="272" y="444" width="228" height="48" fill="#6A55A0" stroke="#6A55A0" stroke-width="2"/>
+  <text class="nm" x="386" y="464" text-anchor="middle" fill="#F7F8FA">c ∈ Δ¹²⁷ , ‖c‖₀ ≤ 4</text>
+  <text class="sm" x="386" y="480" text-anchor="middle" fill="#DAD2EC">hard top-k · + ε·L_balance</text>
+  <rect x="560" y="444" width="404" height="48" fill="#fff" stroke="#25467F" stroke-width="2"/>
+  <text class="nm" x="762" y="464" text-anchor="middle" fill="#25467F">operator bank { A₁ … A₁₂₈ }</text>
+  <text class="sm" x="762" y="480" text-anchor="middle">real 2×2 rotation-decay blocks · ‖A_m‖₂ ≤ ρ · SHARED ACROSS ALL BODIES</text>
+</g>
+
+<!-- c to imaginer, bank to imaginer -->
+<g fill="none" stroke="#0E141B" stroke-width="1.4" marker-end="url(#a1)">
+  <path d="M386,492 L386,522"/>
+  <path d="M762,492 L762,508 L620,508 L620,522"/>
+</g>
+<!-- c to decoder -->
+<g fill="none" stroke="#6A55A0" stroke-width="1.4" marker-end="url(#a5)">
+  <path d="M272,480 L240,480 L240,622"/>
+</g>
+
+<!-- R7 -->
+<g>
+  <rect x="272" y="524" width="436" height="54" fill="#EEF0F3" stroke="#25467F" stroke-width="2"/>
+  <text class="eq" x="490" y="546" text-anchor="middle">ẑ_(t+1) = A(c) z_t + b(c) ,  A(c) = Σ_m c_m A_m</text>
+  <text class="sm" x="490" y="563" text-anchor="middle">contractive ‖A(c)‖₂ ≤ ρ &lt; 1 by convexity · no MLP · no pixels · h&gt;1 by composition</text>
+  <rect x="768" y="524" width="196" height="54" fill="#fff" stroke="#9E2F45" stroke-width="2"/>
+  <text class="nm" x="866" y="545" text-anchor="middle" fill="#9E2F45">L_dyn</text>
+  <text class="sm" x="866" y="562" text-anchor="middle">InfoNCE over c · h ∈ {1,2,4}</text>
+</g>
+<g fill="none" stroke="#9E2F45" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#a4)">
+  <path d="M710,551 L766,551"/>
+  <path d="M964,285 L1012,285 L1012,551 L966,551"/>
+</g>
+
+<!-- R8 -->
+<g>
+  <rect x="106" y="624" width="272" height="52" fill="#fff" stroke="#A8681C" stroke-width="2"/>
+  <text class="nm" x="242" y="645" text-anchor="middle" fill="#A8681C">D_e( z_t , c ) → â</text>
+  <text class="sm" x="242" y="662" text-anchor="middle">flow matching · 20 M · only body-specific module</text>
+  <rect x="410" y="624" width="88" height="52" fill="#fff" stroke="#0E141B" stroke-width="1.4"/>
+  <text class="nm" x="454" y="655" text-anchor="middle">â</text>
+  <rect x="530" y="624" width="196" height="52" fill="#fff" stroke="#9E2F45" stroke-width="2"/>
+  <text class="nm" x="628" y="645" text-anchor="middle" fill="#9E2F45">L_act</text>
+  <text class="sm" x="628" y="662" text-anchor="middle">flow-matching( â , a_t )</text>
+</g>
+<g fill="none" stroke="#0E141B" stroke-width="1.4" marker-end="url(#a1)">
+  <path d="M380,650 L408,650"/><path d="M500,650 L528,650"/>
+</g>
+<g fill="none" stroke="#9E2F45" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#a4)">
+  <path d="M710,382 L986,382 L986,650 L728,650"/>
+</g>
+</svg>
+
+<div class="legend">
+  <span><i class="sw" style="border-color:#78848F;background:#EEF0F3"></i>frozen</span>
+  <span><i class="sw" style="border-color:#25467F;background:#fff"></i>trainable · shared</span>
+  <span><i class="sw" style="border-color:#6A55A0;background:#fff;border-style:dashed"></i>train only · discarded at deploy</span>
+  <span><i class="sw" style="border-color:#A8681C;background:#fff"></i>per-embodiment</span>
+  <span><i class="sw" style="border-color:#9E2F45;background:#fff"></i>loss</span>
+</div>
+</section>
+
+<!-- ══════════ INFERENCE ══════════ -->
+<section class="panel">
+  <div class="panel-head"><h2>Architecture · inference loop</h2>
+    <span class="note">one tree edge = one operator = 8 control steps · depth 4 = one 32-step chunk</span></div>
+
+<svg viewBox="0 0 1060 604" role="img" aria-label="LOOM inference and search loop">
+<text class="band" transform="rotate(-90 18 60)" x="18" y="60" text-anchor="middle">BELIEVE</text>
+<text class="band" transform="rotate(-90 18 270)" x="18" y="270" text-anchor="middle">PROPOSE + SEARCH</text>
+<text class="band" transform="rotate(-90 18 500)" x="18" y="500" text-anchor="middle">REALIZE</text>
+
+<g>
+  <rect x="428" y="28" width="204" height="44" fill="#25467F" stroke="#25467F" stroke-width="2"/>
+  <text class="nm" x="530" y="47" text-anchor="middle" fill="#F7F8FA">z_t = E( o_t , ℓ , z_(t−1) )</text>
+  <text class="sm" x="530" y="63" text-anchor="middle" fill="#C9D3E4">~30 ms · once per cycle</text>
+  <rect x="428" y="104" width="204" height="46" fill="#fff" stroke="#25467F" stroke-width="2"/>
+  <text class="nm" x="530" y="124" text-anchor="middle" fill="#25467F">π_c( c | z_t , ℓ )</text>
+  <text class="sm" x="530" y="140" text-anchor="middle">categorical over 128 · N=1000 · ~15 ms</text>
+</g>
+<g fill="none" stroke="#0E141B" stroke-width="1.4" marker-end="url(#a1)">
+  <path d="M530,72 L530,102"/><path d="M530,150 L530,178"/>
+</g>
+
+<!-- tree -->
+<circle cx="530" cy="186" r="5.5" fill="#6A55A0"/>
+<g stroke="#6A55A0" stroke-width="1.25" fill="none" opacity=".9">
+  <path d="M530,186 L410,226"/><path d="M530,186 L530,226"/><path d="M530,186 L650,226"/>
+  <path d="M410,226 L368,266"/><path d="M410,226 L452,266"/>
+  <path d="M530,226 L488,266"/><path d="M530,226 L572,266"/>
+  <path d="M650,226 L608,266"/><path d="M650,226 L692,266"/>
+  <path d="M368,266 L348,306"/><path d="M452,266 L472,306"/>
+  <path d="M488,266 L468,306"/><path d="M572,266 L592,306"/>
+  <path d="M608,266 L588,306"/><path d="M692,266 L712,306"/>
+  <path d="M348,306 L338,344"/><path d="M472,306 L482,344"/>
+  <path d="M468,306 L458,344"/><path d="M592,306 L602,344"/>
+  <path d="M588,306 L578,344"/><path d="M712,306 L722,344"/>
+</g>
+<g fill="#6A55A0">
+  <circle cx="410" cy="226" r="4"/><circle cx="530" cy="226" r="4"/><circle cx="650" cy="226" r="4"/>
+  <circle cx="368" cy="266" r="3.4"/><circle cx="452" cy="266" r="3.4"/><circle cx="488" cy="266" r="3.4"/>
+  <circle cx="572" cy="266" r="3.4"/><circle cx="608" cy="266" r="3.4"/><circle cx="692" cy="266" r="3.4"/>
+  <circle cx="348" cy="306" r="3"/><circle cx="472" cy="306" r="3"/><circle cx="468" cy="306" r="3"/>
+  <circle cx="592" cy="306" r="3"/><circle cx="588" cy="306" r="3"/><circle cx="712" cy="306" r="3"/>
+</g>
+<g fill="#1C6B5A">
+  <circle cx="338" cy="344" r="3.8"/><circle cx="482" cy="344" r="3.8"/><circle cx="458" cy="344" r="3.8"/>
+  <circle cx="602" cy="344" r="3.8"/><circle cx="578" cy="344" r="3.8"/><circle cx="722" cy="344" r="3.8"/>
+</g>
+<line x1="186" y1="218" x2="186" y2="352" stroke="#C3CBD4" stroke-width="1"/>
+<text class="sm" x="196" y="230">depth 1 · 8 steps</text>
+<text class="sm" x="196" y="270">depth 2 · 16 steps</text>
+<text class="sm" x="196" y="310">depth 3 · 24 steps</text>
+<text class="sm" x="196" y="348">depth 4 · 32 steps = 1 chunk</text>
+<text class="sm" x="790" y="196">ẑ′ = A(c) z + b(c)</text>
+<text class="sm" x="790" y="212">matrix algebra only</text>
+<text class="sm" x="790" y="228">~5 ms for the whole tree</text>
+
+<g>
+  <rect x="768" y="286" width="196" height="46" fill="#fff" stroke="#1C6B5A" stroke-width="2"/>
+  <text class="nm" x="866" y="306" text-anchor="middle" fill="#1C6B5A">Φ( z , ℓ )</text>
+  <text class="sm" x="866" y="322" text-anchor="middle">potential · trained in S3 only</text>
+</g>
+
+<!-- leaf collector -->
+<g stroke="#1C6B5A" stroke-width="1.2" fill="none">
+  <path d="M338,348 L338,358"/><path d="M458,348 L458,358"/><path d="M482,348 L482,358"/>
+  <path d="M578,348 L578,358"/><path d="M602,348 L602,358"/><path d="M722,348 L722,358"/>
+  <path d="M338,358 L722,358"/>
+</g>
+<g fill="none" stroke="#1C6B5A" stroke-width="1.4" marker-end="url(#a1)"><path d="M530,358 L530,370"/></g>
+<g fill="none" stroke="#1C6B5A" stroke-width="1.3" stroke-dasharray="5 3" marker-end="url(#a1)">
+  <path d="M766,309 L744,309 L744,396 L728,396"/>
+</g>
+
+<g>
+  <rect x="336" y="372" width="388" height="44" fill="#EEF0F3" stroke="#1C6B5A" stroke-width="2"/>
+  <text class="eq" x="530" y="392" text-anchor="middle">S = Φ(ẑ₄,ℓ) − Φ(z_t,ℓ) − λ_u·U − λ_c·C</text>
+  <text class="sm" x="530" y="407" text-anchor="middle">telescopes exactly · root baseline cancels across paths</text>
+</g>
+
+<g>
+  <rect x="462" y="450" width="136" height="42" fill="#6A55A0" stroke="#6A55A0" stroke-width="2"/>
+  <text class="nm" x="530" y="476" text-anchor="middle" fill="#F7F8FA">c* root edge</text>
+  <rect x="140" y="450" width="252" height="42" fill="#fff" stroke="#A8681C" stroke-width="2"/>
+  <text class="nm" x="266" y="469" text-anchor="middle" fill="#A8681C">D_e( z_t , c* ) → a</text>
+  <text class="sm" x="266" y="484" text-anchor="middle">swap per body · SO-101 / UR5e / Franka</text>
+  <rect x="668" y="450" width="256" height="42" fill="#fff" stroke="#78848F" stroke-width="1.6" stroke-dasharray="6 3"/>
+  <text class="nm" x="796" y="469" text-anchor="middle">‖ q_a(â,z) − c* ‖ &gt; τ → reject</text>
+  <text class="sm" x="796" y="484" text-anchor="middle">realizability check, take runner-up</text>
+  <rect x="140" y="514" width="252" height="42" fill="#0E141B" stroke="#0E141B" stroke-width="2"/>
+  <text class="nm" x="266" y="540" text-anchor="middle" fill="#F7F8FA">execute 8-step prefix</text>
+</g>
+<g fill="none" stroke="#0E141B" stroke-width="1.4" marker-end="url(#a1)">
+  <path d="M530,416 L530,448"/><path d="M460,471 L394,471"/><path d="M266,492 L266,512"/>
+</g>
+<g fill="none" stroke="#78848F" stroke-width="1.3" stroke-dasharray="5 3" marker-end="url(#a2)">
+  <path d="M600,471 L666,471"/>
+</g>
+<g fill="none" stroke="#25467F" stroke-width="1.4" marker-end="url(#a3)">
+  <path d="M140,535 L76,535 L76,50 L426,50"/>
+</g>
+<text class="sm" x="84" y="300" fill="#25467F">observe o_(t+1)</text>
+<text class="sm" x="84" y="316" fill="#25467F">→ re-filter</text>
+</svg>
+
+<div class="legend">
+  <span><i class="sw" style="border-color:#6A55A0;background:#6A55A0"></i>operator space — where search happens</span>
+  <span><i class="sw" style="border-color:#1C6B5A;background:#fff"></i>desirability, S3 only</span>
+  <span><i class="sw" style="border-color:#A8681C;background:#fff"></i>per-embodiment</span>
+</div>
+</section>
+
+<!-- ══════════ SPEC ══════════ -->
+<section class="panel">
+  <div class="panel-head"><h2>Module spec</h2><span class="note">0.9 B shared + 20 M per body</span></div>
+<table>
+<thead><tr><th>module</th><th>trainable</th><th>params</th><th>config</th></tr></thead>
+<tbody>
+<tr><td class="m">visual encoder</td><td>frozen</td><td class="n">—</td><td>SigLIP2-so400m, 224², all RGB + tactile streams</td></tr>
+<tr><td class="m">text encoder</td><td>frozen</td><td class="n">—</td><td>SigLIP2 text tower</td></tr>
+<tr><td class="m">E · estimator</td><td>yes</td><td class="n">700 M</td><td>Perceiver, K=128, d=768, 10 blocks, 16 heads</td></tr>
+<tr><td class="m">Ē · EMA target</td><td>no</td><td class="n">—</td><td>τ = 0.996</td></tr>
+<tr><td class="m">{A_m} · bank</td><td>yes</td><td class="n">12 M</td><td>M=128, 384 real 2×2 blocks each, r = ρ·σ(θ), ρ=0.98</td></tr>
+<tr><td class="m">q_Δ</td><td>train only</td><td class="n">30 M</td><td>(z_t, z_t+1) → Δ¹²⁷, top-4 straight-through</td></tr>
+<tr><td class="m">q_a</td><td>train only</td><td class="n">30 M</td><td>(a_t, z_t) → Δ¹²⁷, regresses sg(q_Δ)</td></tr>
+<tr><td class="m">D_e · decoder</td><td>yes, per body</td><td class="n">20 M</td><td>flow matching, 32×dof output</td></tr>
+<tr><td class="m">Φ · potential</td><td>S3 only</td><td class="n">0.2 M</td><td>pool(z) ⊕ ℓ → 256 → 1</td></tr>
+<tr><td class="m">π_c · proposal</td><td>S3 only</td><td class="n">150 M</td><td>categorical(128) + top-4 weights</td></tr>
+</tbody>
+</table>
+<div class="pad">
+<pre>z_t      = E(o_t, ℓ, z_{t-1})                     K=128, d=768
+c        = q_Δ(z_t, z_{t+1})   or   q_a(a_t, z_t)  Δ¹²⁷, ‖c‖₀ ≤ 4
+A(c)     = Σ_m c_m A_m                             ‖A(c)‖₂ ≤ ρ  (convexity)
+ẑ_{t+h}  = A(c_{t+h-1}) ⋯ A(c_t) z_t + Σ b         h > 1 by COMPOSITION only
+â        = D_e(z_t, c)
+
+L_dyn    = −Σ_h w_h log [ exp(sim(ẑ_{t+h}, z⁺_{t+h})/τ) / Σ_{c⁻} exp(sim(A(c⁻)…z_t, z⁺)/τ) ]
+L_act    = FlowMatching(â, a_t)
+L        = L_dyn + λ_a·L_act + ε·L_balance         λ_a = 1.0,  ε = 3e-3</pre>
+</div>
+</section>
+
+<!-- ══════════ BUILD ══════════ -->
+<section class="panel">
+  <div class="panel-head"><h2>Build order</h2><span class="note">fork lerobot v3.0 as the single spine</span></div>
+<ol class="steps">
+<li><b>data loader</b> — LeRobot v3.0 multi-stream reader. Variable camera count per embodiment, tactile treated as an ordinary RGB view. Frozen-encoder features cached to disk once; never re-encoded.</li>
+<li><b>estimator E</b> — Perceiver cross-attention block, K=128 learned queries over (all modality tokens ⊕ z_{t−1}). Verify a single forward runs at ≥ 30 Hz on one A100 with 7 streams.</li>
+<li><b>operator bank</b> — M=128 × 384 real 2×2 rotation-decay blocks. Radius <code>r = ρ·sigmoid(θ)</code>, angle <code>ω</code> free. Assert <code>‖A(c)‖₂ ≤ ρ</code> numerically on random simplex draws.</li>
+<li><b>q_Δ + top-k</b> — straight-through top-4 with renormalisation so <code>c</code> stays on the simplex. This is what makes the contractivity bound hold; do not substitute a plain softmax.</li>
+<li><b>imaginer</b> — batched composition <code>A(c_H)⋯A(c_1)z</code>. Must be a single fused elementwise kernel over the block-diagonal, not a matmul loop. Target: 1000 candidates × depth 4 under 5 ms.</li>
+<li><b>L_dyn</b> — InfoNCE with in-batch negatives drawn from other transitions. Uncurated negatives; do not group by task or embodiment.</li>
+<li><b>q_a + D_e</b> — <code>q_a</code> regresses <code>sg(q_Δ)</code>, so both write into one coefficient space by construction. <code>D_e</code> is flow matching on (z, c).</li>
+<li><b>Φ + π_c + MCTS</b> — 128-arm MCTS, depth 4, PUCT with π_c as prior. Only built for Run 3.</li>
+</ol>
+<div class="gate">
+<b>Single build assert.</b> During training, log <code>d(A(c_true)z, z⁺) − d(A(c_random)z, z⁺)</code>. If this gap sits near zero, <code>c</code> is being ignored, <code>A(c) ≈ I</code>, and the model has silently degenerated into a plain latent policy. Not a research metric — a unit test that the architecture is wired.
+</div>
+</section>
+
+<!-- ══════════ RUNS ══════════ -->
+<section class="panel">
+  <div class="panel-head"><h2>Runs</h2><span class="note">32–64 × A100 80 GB · bf16 · FSDP</span></div>
+<table>
+<thead><tr><th>run</th><th>data</th><th>trains</th><th>losses</th><th>time</th><th>read out</th></tr></thead>
+<tbody>
+<tr><td class="m">R0</td><td>LIBERO per-suite, from scratch</td><td>E, bank, q_Δ, q_a, D_e</td><td class="m">L_dyn + L_act</td><td class="n">~2 d</td><td>LIBERO success</td></tr>
+<tr><td class="m">R1</td><td>Ego4D + Ego-Exo4D + HoloAssist, action-free</td><td>E, bank, q_Δ</td><td class="m">L_dyn</td><td class="n">~4 d</td><td>—</td></tr>
+<tr><td class="m">R2</td><td>OpenNeoData 5k h + AgiBot 3k h + RoboMIND 1.4k h + OXE 600 h</td><td>+ q_a, D_e</td><td class="m">L_dyn + L_act</td><td class="n">~6 d</td><td>LIBERO, LIBERO-Plus, RoboTwin</td></tr>
+<tr><td class="m">R3</td><td>sim rollouts</td><td>+ Φ, π_c</td><td class="m">L_Φ + L_proposal + GRPO</td><td class="n">~3 d</td><td>same three, with search on</td></tr>
+</tbody>
+</table>
+<div class="gate">
+<b>Go / no-go.</b> R0 ≥ 96.2 average on standard LIBERO. That is VLA-Adapter's number at 0.6 B with no embodied pretraining, and it is the correct bar because LOOM also freezes a foundation encoder. Below it, the operator formulation is not competitive as a policy class and nothing downstream is worth running.
+</div>
+</section>
+
+<!-- ══════════ RESULTS ══════════ -->
+<section class="panel">
+  <div class="panel-head"><h2>Result table 1 · LIBERO-Plus, zero-shot transfer</h2>
+    <span class="note">primary · train on standard LIBERO, evaluate on 10,030 perturbed tasks</span></div>
+<table>
+<thead><tr><th>method</th><th>camera</th><th>robot init</th><th>layout</th><th>geo avg</th><th>light</th><th>backgnd</th><th>language</th><th>noise</th><th>total</th></tr></thead>
+<tbody>
+<tr><td class="m">HoloBrain-0</td><td class="n">65.5</td><td class="n">58.2</td><td class="n">79.5</td><td class="n">67.7</td><td class="n">88.1</td><td class="n">90.3</td><td class="n">78.7</td><td class="n">66.9</td><td class="n">74.0</td></tr>
+<tr><td class="m">GE-Act</td><td class="n">60.7</td><td class="n">77.0</td><td class="n">80.2</td><td class="n">72.6</td><td class="n">95.8</td><td class="n">86.0</td><td class="n">77.4</td><td class="n">90.9</td><td class="n">80.3</td></tr>
+<tr><td class="m">π0.5</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">79.5</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+<tr><td class="m">Cosmos-Policy</td><td class="n">75.8</td><td class="n">63.3</td><td class="n">82.2</td><td class="n">73.8</td><td class="n">96.5</td><td class="n">88.9</td><td class="n">81.7</td><td class="n">92.7</td><td class="n">82.2</td></tr>
+<tr><td class="m">OA-WAM</td><td class="n bar">80.5</td><td class="n bar">89.6</td><td class="n">82.8</td><td class="n bar">84.3</td><td class="n">96.5</td><td class="n bar">95.9</td><td class="n bar">85.3</td><td class="n">75.6</td><td class="n bar">83.9</td></tr>
+<tr class="target"><td class="m">LOOM · R2</td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td></tr>
+<tr class="target"><td class="m">LOOM · R3 (search)</td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td></tr>
+</tbody>
+</table>
+<div class="pad" style="color:var(--soft);font-size:13px">All baseline rows copied from a single source (OA-WAM Table 2). Light and background sit at ~96 and are solved; camera and robot-init at 60–80 are where the headroom is.</div>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h2>Result table 2 · standard LIBERO</h2><span class="note">R0 gate + sanity</span></div>
+<table>
+<thead><tr><th>method</th><th>params</th><th>emb. PT</th><th>spatial</th><th>object</th><th>goal</th><th>long</th><th>avg</th></tr></thead>
+<tbody>
+<tr><td class="m">Diffusion Policy</td><td class="n">—</td><td>✗</td><td class="n">78.3</td><td class="n">92.5</td><td class="n">68.3</td><td class="n">50.5</td><td class="n">72.4</td></tr>
+<tr><td class="m">OpenVLA</td><td class="n">7 B</td><td>✓</td><td class="n">84.7</td><td class="n">88.4</td><td class="n">79.2</td><td class="n">53.7</td><td class="n">76.5</td></tr>
+<tr><td class="m">π0</td><td class="n">3 B</td><td>✓</td><td class="n">96.8</td><td class="n">98.8</td><td class="n">95.8</td><td class="n">85.2</td><td class="n">94.1</td></tr>
+<tr><td class="m">VLA-Adapter</td><td class="n">0.6 B</td><td>✗</td><td class="n">96.0</td><td class="n">96.8</td><td class="n">97.4</td><td class="n">94.4</td><td class="n bar">96.2</td></tr>
+<tr><td class="m">π0.5</td><td class="n">3 B</td><td>✓</td><td class="n">98.8</td><td class="n">98.2</td><td class="n">98.0</td><td class="n">92.4</td><td class="n">96.9</td></tr>
+<tr><td class="m">Fast-WAM</td><td class="n">6 B</td><td>✗</td><td class="n">97.0</td><td class="n">99.4</td><td class="n">96.6</td><td class="n">94.8</td><td class="n">97.0</td></tr>
+<tr><td class="m">Motus</td><td class="n">8 B</td><td>✓</td><td class="n">96.8</td><td class="n">99.8</td><td class="n">96.6</td><td class="n">97.6</td><td class="n">97.7</td></tr>
+<tr><td class="m">LingBot-VA</td><td class="n">5.3 B</td><td>✓</td><td class="n">98.5</td><td class="n">99.6</td><td class="n">97.2</td><td class="n">98.5</td><td class="n">98.5</td></tr>
+<tr class="target"><td class="m">LOOM · R0</td><td class="n">0.9 B</td><td>✗</td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td></tr>
+<tr class="target"><td class="m">LOOM · R2</td><td class="n">0.9 B</td><td>✓</td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td></tr>
+</tbody>
+</table>
+<div class="pad" style="color:var(--soft);font-size:13px">Baselines from Light-WAM Table 1, single source. Fast-WAM's average is printed as 97.6 / 97.0 / 97.60 by three different papers — never assemble this table across sources.</div>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h2>Result table 3 · RoboTwin 2.0</h2><span class="note">average + the four tasks nobody has solved</span></div>
+<table>
+<thead><tr><th>method</th><th>clean</th><th>randomized</th><th>hanging mug</th><th>turn switch</th><th>place can basket</th><th>handover block</th></tr></thead>
+<tbody>
+<tr><td class="m">π0</td><td class="n">65.9</td><td class="n">58.4</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+<tr><td class="m">π0.5</td><td class="n">82.7</td><td class="n">76.8</td><td class="n">17</td><td class="n">54</td><td class="n">62</td><td class="n">57</td></tr>
+<tr><td class="m">Motus</td><td class="n">88.7</td><td class="n">87.0</td><td class="n">38</td><td class="n bar">78</td><td class="n">76</td><td class="n">73</td></tr>
+<tr><td class="m">Fast-WAM</td><td class="n">91.9</td><td class="n">91.8</td><td class="n bar">62</td><td class="n">59</td><td class="n">69</td><td class="n bar">81</td></tr>
+<tr><td class="m">LingBot-VA</td><td class="n bar">92.9</td><td class="n bar">91.5</td><td class="n">28</td><td class="n">45</td><td class="n bar">84</td><td class="n">78</td></tr>
+<tr class="target"><td class="m">LOOM · R2</td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td></tr>
+<tr class="target"><td class="m">LOOM · R3 (search)</td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td></tr>
+</tbody>
+</table>
+<div class="pad" style="color:var(--soft);font-size:13px">Baselines from Fast-WAM Table 1 and its per-task appendix, randomized column, single source.</div>
+</section>
+
+<!-- ══════════ COMPUTE ══════════ -->
+<section class="panel">
+  <div class="panel-head"><h2>Compute</h2><span class="note">64 × A100 80 GB ≈ 9.6 PFLOPS bf16</span></div>
+<table>
+<thead><tr><th>item</th><th>setting</th></tr></thead>
+<tbody>
+<tr><td class="m">precision</td><td>bf16 — A100 has no FP8</td></tr>
+<tr><td class="m">sharding</td><td>FSDP full-shard on E; bank and heads replicated</td></tr>
+<tr><td class="m">encoder</td><td>frozen, features pre-cached — never in the training graph</td></tr>
+<tr><td class="m">pixels</td><td>never decoded after R1; no VAE, no video DiT</td></tr>
+<tr><td class="m">total wall clock</td><td>R0 → R3 ≈ 15 days on 64 GPUs</td></tr>
+<tr><td class="m">simulator</td><td>ManiSkill3 for GPU-parallel envs; state save/restore required for R3</td></tr>
+</tbody>
+</table>
+</section>
+
+</div>
+</body>
+</html>
