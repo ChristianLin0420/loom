@@ -51,6 +51,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="fail instead of falling back to stub modules / zero "
                         "features. Already implied by --ckpt; set this to also "
                         "refuse the stub path when no checkpoint is given.")
+    r.add_argument("--op-stats", action="store_true",
+                   help="record which operator `argmax pi_c` selected at every "
+                        "replan into EpisodeResult.extra. Diagnostic only — it "
+                        "does not change the action the policy takes.")
     r.add_argument("--row-label", default="**LOOM · R0-A**",
                    help="which PLAN 8 LOOM row these numbers fill")
     r.add_argument("--quiet", action="store_true")
@@ -82,6 +86,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[loom.eval] workers={args.workers or n_devices()} "
               f"out={args.out}", file=sys.stderr)
 
+    policy_kw: dict = {}
+    if args.require_real:
+        policy_kw["allow_stub"] = False
+    if args.op_stats:
+        policy_kw["op_stats"] = True
+
     done = {"n": 0}
 
     def tick(rec):
@@ -98,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         workers=args.workers,
         resume=not args.no_resume,
         backend=args.backend,
-        policy_kw={"allow_stub": False} if args.require_real else None,
+        policy_kw=policy_kw or None,
         on_episode=tick,
     )
 

@@ -579,12 +579,21 @@ def run_episode(
             success = True
             break
 
-    return {
+    out = {
         "success": success,
         "steps": steps,
         "hit_step_cap": bool(not success and steps >= max_steps),
         "n_replans": int(getattr(policy, "replans", 0)) or None,
     }
+    # Opt-in policy diagnostics (`LoomPolicy(op_stats=True)`): which operator
+    # `pi_c` actually selected at each replan. Empty dict on every other policy
+    # and on a default run, so nothing changes in the normal results JSON.
+    summary = getattr(policy, "op_stats_summary", None)
+    if callable(summary):
+        extra = summary()
+        if extra:
+            out["extra"] = extra
+    return out
 
 
 def run_episode_safe(
@@ -605,7 +614,10 @@ def run_episode_safe(
         env = env_factory()
         out = run_episode(policy, env, instruction, max_steps, **kw)
         for k, v in out.items():
-            setattr(record, k, v)
+            if k == "extra" and isinstance(v, dict):
+                record.extra.update(v)      # merge; `_run_item` also writes here
+            else:
+                setattr(record, k, v)
     except Exception:                                    # noqa: BLE001 — one episode, not the run
         record.success = False
         record.error = traceback.format_exc()

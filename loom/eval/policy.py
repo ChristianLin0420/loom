@@ -284,6 +284,7 @@ class LoomPolicy:
         n_candidates: int = 16,
         clip_actions: bool = True,
         env_fps: float | None = None,
+        op_stats: bool = False,
     ) -> None:
         self.modules = modules
         self.embodiment = modules.embodiment
@@ -291,6 +292,10 @@ class LoomPolicy:
         self.device = modules.device
         self.n_candidates = n_candidates
         self.clip_actions = clip_actions
+        # Diagnostics only. Off by default; when off, `_plan` is byte-identical
+        # to what it was and `op_stats_summary()` is empty, so a normal run puts
+        # nothing extra in the results JSON.
+        self.op_stats = bool(op_stats)
         self._low = np.asarray(self.spec.action_low, dtype=np.float32)
         self._high = np.asarray(self.spec.action_high, dtype=np.float32)
         # ONE env rate, feeding both how many steps a segment becomes and what
@@ -306,6 +311,7 @@ class LoomPolicy:
         self._queue: list[np.ndarray] = []
         self.clock.reset()
         self.last_coeff: Tensor | None = None
+        self._op_log: list[dict[str, Any]] = []
 
     def act(self, obs: dict, instruction: str) -> np.ndarray:
         if not self._queue:
@@ -339,6 +345,8 @@ class LoomPolicy:
 
         c = _argmax_coeff(m.proposal, z, feats["lang"], self.n_candidates)
         self.last_coeff = c
+        if self.op_stats:
+            self._log_operator(m.proposal, z, feats["lang"], c)
 
         a = _call(m.decoder, z, c)                                   # (1, H_OP, dof)
         a = a.detach().to(torch.float32).cpu().numpy()
@@ -350,6 +358,71 @@ class LoomPolicy:
                 f"— one operator, never H_PLAN — got {a.shape}"
             )
         return a
+
+    # ── diagnostics · WHICH operator was chosen, not whether it worked ─────
+    #
+    # A `pi_c` sitting at its uniform Plackett-Luce baseline makes
+    # `c <- argmax pi_c` an effectively random draw over the M operators, and
+    # the only symptom in the score is a zero that looks exactly like an
+    # undertrained decoder. These two methods make the difference visible: the
+    # selected index per replan, how often it changes, and how peaked the
+    # logits are. Opt-in (`op_stats=True`), never on the scoring path.
+
+    def _log_operator(self, proposal: Any, z: Tensor, lang: Tensor, c: Tensor) -> None:
+        """One row per replan. `proposal.logits` is a second, diagnostic-only call.
+
+        Deliberately not folded into `_argmax_coeff`: the inference path must be
+        identical with and without diagnostics, and a ~50 M head re-run 96 times
+        an episode is noise against an 878 M tower plus MuJoCo.
+        """
+        row: dict[str, Any] = {}
+        cv = c.detach().to(torch.float32).reshape(-1)
+        top = torch.topk(cv, min(int(cv.numel()), 4))
+        row["m"] = int(cv.numel())
+        row["top1"] = int(top.indices[0])
+        row["support"] = [int(i) for i in top.indices]
+        row["w1"] = float(top.values[0])
+        fn = getattr(proposal, "logits", None)
+        if callable(fn):
+            lg = fn(z, lang).detach().to(torch.float32).reshape(-1)
+            p = torch.softmax(lg, dim=-1)
+            row["ent"] = float(-(p * p.clamp_min(1e-12).log()).sum())
+            two = torch.topk(lg, 2).values
+            row["gap"] = float(two[0] - two[1])
+        self._op_log.append(row)
+
+    def op_stats_summary(self) -> dict[str, Any]:
+        """Per-episode operator-selection summary, for `EpisodeResult.extra`.
+
+        Empty when `op_stats` is off, so `run_episode` adds nothing to a normal
+        results JSON. `op_top1` is kept in full — whether the selected operator
+        changes *between replans within one episode* is the question, and a mean
+        cannot answer it.
+        """
+        log = self._op_log
+        if not log:
+            return {}
+        top1 = [r["top1"] for r in log]
+        support = {i for r in log for i in r["support"]}
+        ents = [r["ent"] for r in log if "ent" in r]
+        gaps = [r["gap"] for r in log if "gap" in r]
+        out: dict[str, Any] = {
+            "op_m": log[0]["m"],
+            "op_n_replans": len(log),
+            "op_top1": top1,
+            "op_top1_unique": len(set(top1)),
+            "op_top1_switches": sum(a != b for a, b in zip(top1, top1[1:])),
+            "op_support_unique": len(support),
+            "op_w1_mean": round(sum(r["w1"] for r in log) / len(log), 5),
+        }
+        if ents:
+            out["op_ent_mean"] = round(sum(ents) / len(ents), 5)
+            out["op_ent_min"] = round(min(ents), 5)
+            out["op_ent_max"] = round(max(ents), 5)
+            out["op_ent_head"] = [round(e, 5) for e in ents[:5]]
+        if gaps:
+            out["op_logit_gap_mean"] = round(sum(gaps) / len(gaps), 5)
+        return out
 
 
 def _to_device(v: Any, device: str) -> Any:
@@ -442,6 +515,7 @@ def load_policy(
     device: str = "cpu",
     allow_stub: bool | None = None,
     n_candidates: int = 16,
+    op_stats: bool = False,
 ) -> LoomPolicy:
     """Build a `LoomPolicy` from a checkpoint, falling back to stubs.
 
@@ -473,7 +547,7 @@ def load_policy(
     if modules.featurize is None:
         modules.featurize = (zeros_featurizer(spec) if modules.is_stub
                              else default_featurizer(spec, device=device))
-    return LoomPolicy(modules, n_candidates=n_candidates)
+    return LoomPolicy(modules, n_candidates=n_candidates, op_stats=op_stats)
 
 
 def submodule_state(state: Any, name: str) -> dict[str, Tensor] | None:
