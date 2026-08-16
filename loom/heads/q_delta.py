@@ -223,20 +223,150 @@ class CenteredReadout(nn.Linear):
     0.25 against q_Delta's 1.80, and by `trunk[4]` every sample's hidden state
     was the same vector up to scale (pairwise cosine 1.0000), which the
     pre-readout LayerNorm then divides out. Centring makes the readout report
-    that faithfully instead of hiding it under quantisation noise.
+    that faithfully instead of hiding it under quantisation noise. That failure
+    is what `logit_rms` below addresses.
+
+
+    `logit_rms` -- WHY THE LOGIT SCALE IS PINNED, AND ONLY FOR q_a
+    ─────────────────────────────────────────────────────────────
+    `None` (q_Delta) is the historical behaviour, bit for bit. A float (q_a)
+    rescales each row to that rms over the operator axis, in fp32:
+
+        logits <- logit_rms * l / rms_M(l)          (l already mean-free)
+
+    Monotone and per-sample positive, so the ranking, the top-k support and the
+    on-simplex property are all untouched; `topk_simplex_st` never sees a
+    different kind of object. What changes is the *gradient*: the radial
+    direction (scale every logit by the same factor) is projected out and gets
+    exactly zero gradient.
+
+    That direction is the one q_a died along. `L_act`'s regression term is
+    `||c_a - sg(c_Delta)||^2` between two hard top-4 renormalised simplex points.
+    When the two supports are disjoint -- which is the situation at
+    initialisation -- the loss is `sum(c_a^2) + sum(c_Delta^2)` and the ONLY term
+    q_a controls is `sum(c_a^2)`, minimised by flat coefficients, i.e. by tied
+    logits. Worse, the straight-through head has a built-in asymmetry that drives
+    exactly that: an in-support atom's coefficient moves with
+    `d hard_m/d l_m = soft_m(1-soft_m)/Z`, an out-of-support atom's only with
+    `soft_m(1-soft_m)`, and `Z ~ TOPK/M`, so "push down whoever is on top now" is
+    `M/TOPK = 32x` stronger than "pull up the atom the target wants". Its fixed
+    point is all logits equal. Measured on R0-A: the operator-axis spread fell
+    0.929 (fresh init, on real beliefs) to 0.0195 at step 7004, `act/align` sat
+    on its disjoint-support floor of 0.500 for 7004 steps, and the head reached
+    the flattest point of the simplex, top-4 weights
+    [0.25058, 0.24991, 0.24979, 0.24971].
+
+    The route it took is worth recording, because it is what makes the collapse
+    irreversible. Flattening the logits *for every input at once* is cheapest if
+    the hidden state has no directions left to disagree about: with `h` confined
+    to a ray, one orthogonality constraint on the readout flattens everything,
+    where a full-rank `h` would need the whole readout shrunk. So the loss pays
+    for collapsing `h`. It duly collapsed -- `act_out`'s gain along the batch-mean
+    direction of its input went 0.284 (fresh) to 9.333 (step 7004) while its gain
+    on the deviations stayed 0.294 to 0.315, and the readout's row deviations
+    turned orthogonal to the mean hidden state (spread at `h_bar` 0.685 to 0.023
+    against 0.558 for a random readout of the same norm). By `trunk[4]` the
+    pairwise cosine over 1536 real windows was exactly 1.00000.
+
+    Pinning the rms makes the whole loss EXACTLY invariant to the scale of the
+    logits, so that entire route is closed: `dL/d(gain)` is analytically zero
+    (`tests/test_heads.py::test_the_align_objective_pays_to_shrink_free_logits...`
+    measures 9.7e-1 free against 1.9e-8 pinned), and shrinking the readout -- or
+    rotating it orthogonal to `h` -- buys the loss nothing whatsoever. What is
+    left of the gradient is purely rotational: it moves the support towards the
+    target's, which is the learning we want.
+
+    Be precise about what this does NOT claim, because it was measured and it is
+    not what you would hope. A flat coefficient vector is still *representable*
+    under the pin -- four tied logits high and 124 tied low has rms 1 -- so a head
+    whose target is genuinely unpredictable still switches itself off. What the
+    pin buys is that the switch is REVERSIBLE.
+
+    The experiment (`logs/probe_qa_train.py --noise_until 1500`, one A100, 60 s a
+    variant, R0-A's exact optimiser settings on real LIBERO beliefs): train q_a
+    for 1500 steps against a fresh random 4-of-128 target every step -- R0-A's
+    first ~2000 steps, when `delta_op` is ~0 and q_Delta carries nothing -- then
+    switch to the real, learnable, frozen q_Delta target for 1500 more.
+
+        after 1500 noise steps       pinned            unpinned
+          distinct supports / 1536      1                 1
+          pairwise cosine trunk[4]      1.0000            1.0000
+          operator-axis spread          1.004 (pinned)    0.254
+          shuffle a_seg, logit rms      5e-6              7.8e-5
+
+        after 1500 more REAL steps   pinned            unpinned
+          distinct supports             2                 2
+          pairwise cosine trunk[4]      0.6286            0.99999
+          operator-axis spread          1.004 (pinned)    0.0031
+          shuffle a_seg, logit rms      3.8e-4            2.1e-5
+          top-4 overlap with target     1.13 of 4         0.00 of 4
+          align MSE                     0.375             0.5248
+
+    The unpinned head's 0.5248 with a single constant support and a spread of
+    0.003 IS R0-A at step 7004 (0.4497, one support, spread 0.0195), reproduced
+    from scratch. It cannot come back because the gradient that would re-establish
+    input dependence is proportional to the logit scale it has already destroyed.
+    The pinned head has that scale held at 1 by construction, so the same gradient
+    is O(1) and it climbs out.
+
+    q_Delta keeps `None` -- it is trained through the bank by `L_dyn`, has no
+    flattening pressure, and measured a healthy spread of 1.41; pinning it would
+    change Team B's inputs for no reason.
+
+    A pinned scale is also the end of the bf16 resolution problem for q_a: the
+    spread is `logit_rms` by construction rather than 0.0195, which is 1.2 ulps
+    at a common mode of 3.88.
+
+    `logit_rms` is a CONSTANT, never a parameter. A learnable one is the same
+    null direction with an extra step, and would be driven to zero by exactly the
+    gradient this projects out.
     """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 *, logit_rms: float | None = None, **kw) -> None:
+        super().__init__(in_features, out_features, bias=bias, **kw)
+        if logit_rms is not None and not float(logit_rms) > 0.0:
+            raise ValueError(f"logit_rms must be positive or None, got {logit_rms}")
+        self.logit_rms = None if logit_rms is None else float(logit_rms)
+
+    def extra_repr(self) -> str:
+        s = super().extra_repr()
+        return s if self.logit_rms is None else f"{s}, logit_rms={self.logit_rms}"
 
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
-        wc = (w.float() - w.float().mean(0, keepdim=True)).to(w.dtype)
-        bc = None
+        w32 = (w.float() - w.float().mean(0, keepdim=True))
+        wc = w32.to(w.dtype)
+        b32 = bc = None
         if self.bias is not None:
             b = self.bias
-            bc = (b.float() - b.float().mean()).to(b.dtype)
-        return F.linear(x, wc, bc)
+            b32 = (b.float() - b.float().mean())
+            bc = b32.to(b.dtype)
+        y = F.linear(x, wc, bc)
+        if self.logit_rms is None:
+            return y
+        # The pinned path redoes the projection in fp32 and normalises there.
+        # `y` is only consulted for its dtype, so autocast's contract is kept.
+        #
+        # Not a micro-optimisation to skip: the pin leaves the PRE-normalisation
+        # scale of the readout completely unconstrained (the loss is invariant to
+        # it, which is the whole point), so it random-walks -- measured 0.93 at
+        # init and 317.4 after 4000 steps of R0-A. bf16's ulp is magnitude
+        # proportional, so rounding `y` at |317| quantised the row to 34.8
+        # distinct values of 128 and left the bf16 top-4 agreeing with the fp32
+        # ranking on only 1.37 of 4 atoms. Dividing afterwards cannot undo that;
+        # this is the same "centre before the rounding, not after" argument as
+        # above, applied to the scale. The extra matmul is (B, hidden) x
+        # (hidden, M) -- 10 MFLOP at the training batch, against a 150 M
+        # estimator.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            f = F.linear(x.float(), w32, b32)
+        scale = self.logit_rms / f.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
+        return (f * scale).to(y.dtype)
 
 
-def mlp_trunk(in_dim: int, hidden: int, out_dim: int, n_hidden: int = 2) -> nn.Sequential:
+def mlp_trunk(in_dim: int, hidden: int, out_dim: int, n_hidden: int = 2,
+              logit_rms: float | None = None) -> nn.Sequential:
     """Pre-LN MLP: in -> hidden (x n_hidden) -> out.  Final layer small-init.
 
     Small-init (not zero-init) on the logit layer matters: with exactly-zero
@@ -244,12 +374,14 @@ def mlp_trunk(in_dim: int, hidden: int, out_dim: int, n_hidden: int = 2) -> nn.S
     0..TOPK-1 would win every draw at step 0 and the rest would start dead.
 
     The readout is a `CenteredReadout`, not a plain `nn.Linear`: see that class
-    for why the operator-axis mean has to leave in fp32.
+    for why the operator-axis mean has to leave in fp32, and for what `logit_rms`
+    is for. `None` -- q_Delta's setting and this function's default -- is the
+    plain centred readout.
     """
     layers: list[nn.Module] = [nn.LayerNorm(in_dim), nn.Linear(in_dim, hidden), nn.GELU()]
     for _ in range(n_hidden - 1):
         layers += [nn.Linear(hidden, hidden), nn.GELU()]
-    layers += [nn.LayerNorm(hidden), CenteredReadout(hidden, out_dim)]
+    layers += [nn.LayerNorm(hidden), CenteredReadout(hidden, out_dim, logit_rms=logit_rms)]
     trunk = nn.Sequential(*layers)
     nn.init.normal_(trunk[-1].weight, std=0.02)
     nn.init.zeros_(trunk[-1].bias)

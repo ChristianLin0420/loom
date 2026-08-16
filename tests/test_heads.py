@@ -14,8 +14,8 @@ import torch
 import contracts as C
 import stubs as S
 from loom.heads.decoder import Decoder, DecoderBody
-from loom.heads.q_action import QAction
-from loom.heads.q_delta import AttnPool, QDelta, topk_simplex_st
+from loom.heads.q_action import ACTION_RMS, LOGIT_RMS, QAction
+from loom.heads.q_delta import AttnPool, CenteredReadout, QDelta, topk_simplex_st
 
 torch.manual_seed(0)
 
@@ -260,6 +260,164 @@ def test_q_action_parameter_budget_per_body():
     q = QAction([BODY_A])
     n = n_params(q.body(BODY_A))
     assert 18e6 <= n <= 42e6, f"q_action is {n / 1e6:.1f} M/body, budget is 30 M"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  q_a^e — WHAT KEEPS IT A FUNCTION OF ITS INPUTS
+#
+#  R0-A trained this head for 7004 steps and it ended up emitting ONE top-4
+#  support for all 1536 probed windows, in fp32, with `act/align` pinned on its
+#  disjoint-support floor of 0.500 the whole way. The head that shape produces
+#  at INITIALISATION gives 294 distinct supports on the same inputs, so the
+#  blindness was learned. These are the two mechanisms that stop it being
+#  learned, plus the fixed-point argument they rest on.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_q_action_logit_rms_is_pinned_per_row():
+    q = QAction([BODY_A], **SMALL_QA)
+    lg = q.logits(torch.randn(16, C.H_OP, DOF_A) * 7.0, belief(16), embodiment=BODY_A)
+    rms = lg.pow(2).mean(-1).sqrt()
+    assert torch.allclose(rms, torch.full_like(rms, LOGIT_RMS), atol=1e-5)
+    assert lg.mean(-1).abs().max() < 1e-5          # centred, as CenteredReadout promises
+
+
+def test_pinning_the_rms_does_not_change_the_ranking():
+    """It is a positive per-row rescale of a mean-free vector: same top-k, always."""
+    pinned = CenteredReadout(32, C.M, logit_rms=LOGIT_RMS)
+    plain = CenteredReadout(32, C.M, logit_rms=None)
+    plain.load_state_dict(pinned.state_dict())
+    h = torch.randn(64, 32)
+    a, b = pinned(h), plain(h)
+    assert torch.equal(a.topk(C.TOPK, -1).indices, b.topk(C.TOPK, -1).indices)
+    assert torch.equal(a.argsort(-1), b.argsort(-1))
+    # ... and the simplex point is still a hard, renormalised top-k
+    C.assert_simplex(topk_simplex_st(a, C.TOPK))
+
+
+def test_q_delta_readout_is_deliberately_not_pinned():
+    """q_Delta is trained through the bank by L_dyn, has no flattening pressure,
+    and measured a healthy spread of 1.41. Pinning it would change Team B's
+    inputs for no reason."""
+    assert QDelta(**SMALL_QD).trunk[-1].logit_rms is None
+    lg = QDelta(**SMALL_QD).logits(belief(8), belief(8))
+    assert lg.pow(2).mean(-1).sqrt().std() > 1e-4        # free to vary per sample
+
+
+def test_a_pinned_readout_gets_exactly_zero_gradient_from_the_radial_direction():
+    """The whole mechanism in one assertion.
+
+    `sum(logits^2)` is a pure function of the logit SCALE. Under the pin it is
+    the constant `B * M * logit_rms^2`, so its gradient is analytically zero --
+    the direction q_a died along is not merely opposed, it is annihilated. What
+    survives is fp32 round-off in the normalisation, five orders of magnitude
+    below the gradient the unpinned readout gets from the same objective.
+    """
+    torch.manual_seed(0)
+    h = torch.randn(32, 16)
+    g = {}
+    for pin in (LOGIT_RMS, None):
+        lin = CenteredReadout(16, C.M, logit_rms=pin)
+        lin.zero_grad()
+        y = lin(h)
+        y.pow(2).sum().backward()
+        g[pin] = float(lin.weight.grad.abs().max())
+        if pin is not None:               # the objective is a constant under the pin
+            assert torch.allclose(y.pow(2).sum(), torch.tensor(32.0 * C.M * pin ** 2),
+                                  rtol=1e-4)
+    assert g[LOGIT_RMS] < 1e-4 * g[None], g
+
+
+def test_the_align_objective_pays_to_shrink_free_logits_and_pays_nothing_pinned():
+    """R0-A's failure, reduced to one scalar and no network.
+
+    `L_act`'s regression term is `||c_a - sg(c_Delta)||^2` between two hard top-4
+    renormalised simplex points. With disjoint supports it is
+    `sum(c_a^2) + sum(c_Delta^2)`, so the only thing the head controls is
+    `sum(c_a^2)` -- monotonically decreasing as the logits shrink towards flat.
+    The straight-through head supplies the asymmetry that gets there:
+    `d hard_m/d l_m` carries a `1/Z ~ M/TOPK = 32` for an in-support atom and
+    nothing for an out-of-support one, so "push down whoever is on top" beats
+    "pull up what the target wants" and the fixed point is every logit equal.
+    R0-A duly went from a spread of 0.929 to 0.0195 and ended on the flattest
+    point of the simplex.
+
+    Hand the head one knob -- a global gain on its logits -- and read off
+    `dL/dgain`. Free, it is positive and large: shrinking pays. Pinned, the loss
+    does not depend on the gain at all, so it is zero to round-off, and no amount
+    of shrinking the readout or rotating it away from `h` buys anything.
+    """
+    torch.manual_seed(0)
+    l0 = torch.randn(256, C.M)                       # rms 1: what the pin produces
+    tl = torch.randn(256, C.M) * 1.5
+    tl.scatter_(-1, l0.topk(C.TOPK, -1).indices, -30.0)   # target avoids the head's atoms
+    target = topk_simplex_st(tl, C.TOPK)
+    assert (topk_simplex_st(l0, C.TOPK) * target).sum(-1).max() == 0.0, "not disjoint"
+
+    grads, losses = {}, {}
+    for name in ("free", "pinned"):
+        gain = torch.nn.Parameter(torch.ones(()))
+        lg = l0 * gain
+        lg = lg - lg.mean(-1, keepdim=True)
+        if name == "pinned":
+            lg = lg * (LOGIT_RMS / lg.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-6))
+        loss = (topk_simplex_st(lg, C.TOPK) - target).pow(2).sum(-1).mean()
+        loss.backward()
+        grads[name], losses[name] = float(gain.grad), float(loss)
+
+    assert grads["free"] > 1e-3, grads                       # shrinking pays, a lot
+    assert abs(grads["pinned"]) < 1e-6 * grads["free"], grads  # and pays nothing here
+    # both start above the 0.500 disjoint-support floor and can only reach it by
+    # flattening, which is the move the pin refuses to reward
+    assert losses["free"] > 0.5 and losses["pinned"] > 0.5, losses
+
+
+def test_action_rms_table_is_registered_and_well_formed():
+    for name, rms in ACTION_RMS.items():
+        assert name in C.EMBODIMENTS, f"{name} is not a registered embodiment"
+        assert len(rms) == C.EMBODIMENTS[name].dof
+        assert all(v > 0 for v in rms)
+
+
+def test_action_rms_divides_before_step_in_and_is_not_persistent():
+    q = QAction([BODY_A], **SMALL_QA)
+    b = q.body(BODY_A)
+    assert torch.equal(b.action_rms, torch.ones(DOF_A))      # unlisted body: unchanged
+    assert not any("action_rms" in k for k in b.state_dict()), \
+        "action_rms is a measured constant, not checkpoint state"
+
+    rms = torch.tensor(ACTION_RMS["libero_franka"])
+    scaled = QAction([BODY_A], action_rms=tuple(rms.tolist()), **SMALL_QA).body(BODY_A)
+    scaled.load_state_dict(b.state_dict())
+    a = torch.randn(4, C.H_OP, DOF_A)
+    assert torch.allclose(scaled.encode_action(a), b.encode_action(a / rms), atol=1e-5)
+
+
+def test_action_rms_brings_the_rotation_dofs_into_view():
+    """LIBERO's per-dof rms spans 0.027 to 1.0, and `step_in` is one Linear with a
+    shared init, so each dof enters in proportion to its variance: the binary
+    gripper is 82% of it and the three rotation dofs are 0.44%. Dividing by the
+    measured rms is what makes the head see a 7-dof action instead of one bit."""
+    rms = torch.tensor(ACTION_RMS["libero_franka"])
+    torch.manual_seed(0)
+    a = torch.randn(512, C.H_OP, DOF_A) * rms                 # LIBERO-like scales
+
+    def var_share(body):
+        x = body.step_in(a / body.action_rms)                 # (N, H_OP, d_act)
+        per = torch.stack([
+            (body.step_in.weight[:, d].pow(2).sum() * (a[..., d] / body.action_rms[d]).var())
+            for d in range(DOF_A)])
+        return per / per.sum(), x
+
+    plain = QAction([BODY_A], **SMALL_QA).body(BODY_A)        # action_rms == ones
+    scaled = QAction([BODY_A], action_rms=tuple(rms.tolist()), **SMALL_QA).body(BODY_A)
+    scaled.load_state_dict(plain.state_dict())
+
+    share_plain, _ = var_share(plain)
+    share_scaled, _ = var_share(scaled)
+    assert share_plain[6] > 0.75, share_plain                 # gripper swamps everything
+    assert share_plain[3:6].sum() < 0.02, share_plain         # rotation is invisible
+    assert share_scaled.max() < 0.25, share_scaled            # no dof dominates
+    assert share_scaled[3:6].sum() > 0.30, share_scaled       # rotation is now real
 
 
 # ═══════════════════════════════════════════════════════════════════════════
