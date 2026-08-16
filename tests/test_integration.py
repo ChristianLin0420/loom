@@ -288,9 +288,26 @@ def _sources() -> list[Path]:
 
 
 def test_no_view_as_complex_anywhere():
-    """PLAN §9: there is no complex-bf16 dtype and the whole run is bf16."""
-    bad = [p for p in _sources() if "view_as_complex" in p.read_text()]
-    assert not bad, f"view_as_complex found in {[str(p.relative_to(ROOT)) for p in bad]}"
+    """PLAN §9: there is no complex-bf16 dtype and the whole run is bf16.
+
+    Parsed, not grepped. `bank.py`'s module docstring says "No
+    `torch.view_as_complex` anywhere", and a substring search flags the very
+    comment that documents the rule.
+    """
+    import ast
+
+    bad = []
+    for p in _sources():
+        try:
+            tree = ast.parse(p.read_text())
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            name = (node.attr if isinstance(node, ast.Attribute) else
+                    node.id if isinstance(node, ast.Name) else None)
+            if name == "view_as_complex":
+                bad.append(f"{p.relative_to(ROOT)}:{node.lineno}")
+    assert not bad, f"view_as_complex is called in {bad}"
 
 
 def test_no_compose_on_the_bank():
