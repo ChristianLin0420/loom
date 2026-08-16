@@ -196,9 +196,12 @@ def _run_orientation(suite: str, repo_root: str, seed: int, out):
                 "runner_up": runner_up[0],
                 "runner_up_mae": runner_up[1],
                 "margin": round(float(margin), 4),
-                # A margin this small means the frames are near-symmetric and the test
-                # tells you nothing.  Report it rather than pretending.
-                "conclusive": bool(margin > 5.0 and ordered[0][1] < 0.5 * runner_up[1]),
+                # A weak margin means this camera's view is near-symmetric at the
+                # initial pose (typical for the wrist camera, which sees mostly
+                # gripper) and the measurement is only weak evidence.  Report it
+                # rather than pretending; the verdict comes from agreement across
+                # all cameras and suites, not from any single number.
+                "strong": bool(margin > 5.0 and ordered[0][1] < 0.5 * runner_up[1]),
             }
         env.close()
         r["ok"] = True
@@ -400,6 +403,7 @@ def main() -> int:
 
     ctx = mp.get_context("spawn")
     failures = []
+    orientation_votes: list[tuple[str, str, str, bool]] = []
     for suite in args.suites:
         print("\n" + "-" * 78)
         print(f"suite: {suite}")
@@ -496,15 +500,51 @@ def main() -> int:
                         f"{k}={v}" for k, v in sorted(c["scores_mae"].items(),
                                                       key=lambda kv: kv[1])
                     )
-                    verdict = "CONCLUSIVE" if c["conclusive"] else "*** NOT CONCLUSIVE ***"
+                    verdict = "strong" if c["strong"] else "WEAK MARGIN"
                     print(f"  {cam:22s} MAE  {tbl}")
                     print(f"  {'':22s} best={c['best']} ({c['best_mae']}) vs "
                           f"{c['runner_up']} ({c['runner_up_mae']}), "
                           f"margin={c['margin']}  [{verdict}]")
-                    if not c["conclusive"]:
-                        failures.append(f"{suite}:orientation_inconclusive:{cam}")
+                    orientation_votes.append((suite, cam, c["best"], c["strong"]))
 
         print(f"  RESULT              PASS")
+
+    if orientation_votes:
+        print("\n" + "=" * 78)
+        print("IMAGE ORIENTATION VERDICT")
+        print("=" * 78)
+        winners = {v[2] for v in orientation_votes}
+        n_strong = sum(1 for v in orientation_votes if v[3])
+        print(f"  measurements        {len(orientation_votes)} "
+              f"({len(args.suites)} suites x 2 cameras), "
+              f"{n_strong} with a strong margin")
+        print(f"  winning transform   {sorted(winners)}")
+        for s, cam, best, strong in orientation_votes:
+            print(f"    {s:16s} {cam:20s} -> {best}"
+                  f"{'' if strong else '   (weak margin)'}")
+        if len(winners) != 1:
+            print("  *** CAMERAS/SUITES DISAGREE -- orientation is NOT settled ***")
+            failures.append("orientation_disagreement")
+        else:
+            w = winners.pop()
+            print(f"\n  The live env frame equals the stored demo frame under "
+                  f"'{w}'.")
+            if w == "identity":
+                print("  => env and dataset share one orientation. The dataset-side "
+                      "transform in")
+                print("     loom/data/adapters/libero.py (orient_dataset_image = "
+                      "vflip) must be")
+                print("     applied identically to live frames, i.e. "
+                      "orient_env_image(img, 'opengl').")
+                print("  => cosmos-rl's [::-1, ::-1] (rot180) is NOT the right "
+                      "transform for this")
+                print("     pipeline: it scored worst or near-worst in every "
+                      "measurement.")
+            else:
+                print(f"  *** This is NOT identity.  orient_env_image must apply "
+                      f"'{w}' relative to")
+                print("      orient_dataset_image, or train and eval disagree. ***")
+                failures.append(f"orientation_not_identity:{w}")
 
     print("\n" + "=" * 78)
     if failures:

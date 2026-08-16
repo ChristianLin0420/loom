@@ -24,7 +24,8 @@ PSE_OBJECT_DIR="${USER_ROOT}/projects/pse/data/libero/libero_object"
 # PLAN.md Sec.8 (Light-WAM Table 1) evaluate on.  Do NOT swap this for the fwd4 fork
 # without saying so in the results table; it changes comparability.
 LIBERO_REPO="https://github.com/Lifelong-Robot-Learning/LIBERO.git"
-LIBERO_COMMIT="${LIBERO_COMMIT:-}"   # optional pin; empty = whatever master is
+# The commit the smoke test was validated against.  Set LIBERO_COMMIT="" to track master.
+LIBERO_COMMIT="${LIBERO_COMMIT-8f1084e3132a39270c3a13ebe37270a43ece2a01}"
 
 CONDA_BIN="${CONDA_BIN:-$(command -v conda || echo /home/chrislin/miniconda3/bin/conda)}"
 PY="${ENV_PREFIX}/bin/python"
@@ -234,15 +235,21 @@ done
 
 # ------------------------------------------------------------------- 7. summary
 say "7/7 versions"
-"${PY}" - <<'PYEOF'
+# On a login node `import robosuite` fails with
+#   AttributeError: 'NoneType' object has no attribute 'eglQueryString'
+# because there is no EGL there.  That line is EXPECTED here and is not a problem;
+# scripts/smoke_libero.py is what validates the stack, on a GPU node.
+"${PY}" - <<'PYEOF' 2>&1 | grep -v "robosuite WARNING\|Gym has been unmaintained\|Please upgrade to Gymnasium\|migration_guide"
 import importlib
-for m in ("numpy", "torch", "robosuite", "mujoco", "h5py", "gym", "bddl", "robomimic", "libero"):
+for m in ("numpy", "torch", "torchvision", "robosuite", "mujoco", "h5py", "gym",
+          "bddl", "robomimic", "libero"):
     try:
         mod = importlib.import_module(m)
-        print(f"  {m:12s} {getattr(mod, '__version__', '?')}")
+        print(f"  {m:12s} {getattr(mod, '__version__', 'installed')}")
     except Exception as e:
         print(f"  {m:12s} IMPORT FAILED: {type(e).__name__}: {e}")
 PYEOF
+echo "  (a robosuite EGL failure on this line is expected on a login node)"
 
 cat <<EOF
 
