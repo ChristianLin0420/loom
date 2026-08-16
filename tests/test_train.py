@@ -108,15 +108,44 @@ def curve(run_dir: Path) -> list[dict]:
     return [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
 
 
-def wait_for_step(run_dir: Path, step: int, timeout: float = 600.0) -> int:
-    """Block until the heartbeat reports >= ``step``. Returns the step seen."""
+def sigterm_mid_run(proc, run_dir: Path, kill_at: int, *, poll_s: float = 0.01,
+                    timeout: float = 900.0) -> int:
+    """Deliver SIGTERM while the loop is *provably* still running. Returns the
+    step the child was frozen at.
+
+    Polling the heartbeat and then signalling is a one-way handshake, and it is a
+    race: on an A100 the child finishes the whole run in the time the parent
+    takes to notice step ``kill_at``. The link then exits 0 having completed
+    every step -- correct behaviour, but it tests nothing about preemption.
+    Widening the band to accept it would be worse than failing, because a broken
+    save-on-signal path would go green too.
+
+    SIGSTOP closes the race: it cannot be caught, blocked or ignored, so the
+    child freezes inside one scheduler slice and cannot advance another step. A
+    SIGTERM sent to a stopped process stays pending and is delivered on SIGCONT.
+    The signal therefore lands mid-run on any hardware, and the assertion after
+    it keeps its original meaning: the signal interrupted a running loop.
+    """
     end = time.time() + timeout
-    while time.time() < end:
+    while True:
+        if proc.poll() is not None:
+            raise AssertionError(
+                f"the link exited (rc={proc.returncode}) before reaching step "
+                f"{kill_at}; raise run.steps so there is a run left to interrupt"
+            )
         hb = read_heartbeat(run_dir)
-        if hb is not None and hb[1] >= step:
-            return hb[1]
-        time.sleep(0.25)
-    raise AssertionError(f"heartbeat never reached step {step} in {timeout}s")
+        if hb is not None and hb[1] >= kill_at:
+            os.kill(proc.pid, signal.SIGSTOP)      # frozen: no further steps run
+            break
+        if time.time() > end:
+            raise AssertionError(f"heartbeat never reached step {kill_at} in {timeout}s")
+        time.sleep(poll_s)
+
+    assert proc.poll() is None, "child exited between the heartbeat and the SIGSTOP"
+    frozen_at = read_heartbeat(run_dir)[1]
+    os.kill(proc.pid, signal.SIGTERM)              # pending while stopped
+    os.kill(proc.pid, signal.SIGCONT)              # ... delivered here
+    return frozen_at
 
 
 def tiny_model() -> nn.Module:
@@ -422,7 +451,10 @@ def test_survives_sigterm_and_resumes_with_continuous_loss(tmp_path):
     that ``global_step`` picks up exactly where it stopped and the loss lands on
     the pre-kill trend rather than jumping back to its initialisation.
     """
-    n, kill_at = 6, 3
+    # kill_at is deliberately early and n comfortably beyond it: the SIGSTOP
+    # barrier in sigterm_mid_run makes the *delivery* device-independent, and the
+    # remaining steps make it obvious in the failure message if it ever is not.
+    n, kill_at = 8, 2
     cfg = write_test_config(tmp_path, run={"steps": n, "name": "sigterm"})
 
     base_dir = tmp_path / "baseline"
@@ -435,18 +467,30 @@ def test_survives_sigterm_and_resumes_with_continuous_loss(tmp_path):
     proc = subprocess.Popen(link_cmd(cfg, kill_dir), cwd=ROOT, env=_env(),
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
-        wait_for_step(kill_dir, kill_at)
-        proc.send_signal(signal.SIGTERM)
+        frozen_at = sigterm_mid_run(proc, kill_dir, kill_at)
         rc = proc.wait(timeout=300)
+        out = proc.stdout.read()
     finally:
         if proc.poll() is None:
-            proc.kill()
-    assert rc == 0, f"SIGTERM did not produce a graceful exit:\n{proc.stdout.read()}"
+            proc.kill()                          # SIGKILL also reaps a stopped child
+    assert rc == 0, f"SIGTERM did not produce a graceful exit:\n{out}"
 
     stopped_at = ckpt_mod.latest_step(kill_dir)
     assert stopped_at is not None and kill_at <= stopped_at < n, \
-        f"SIGTERM link saved at {stopped_at}, expected {kill_at}..{n - 1}"
+        f"SIGTERM link saved at {stopped_at}, expected {kill_at}..{n - 1}\n{out}"
+    # The step in flight when the signal landed is allowed to finish, and nothing
+    # beyond it may run: should_stop() is checked at the end of every step.
+    assert frozen_at <= stopped_at <= frozen_at + 1, \
+        f"frozen at {frozen_at} but the link ran on to {stopped_at}\n{out}"
     assert len(curve(kill_dir)) == stopped_at
+
+    # It must have stopped for the RIGHT reason. A link that hit its wall-clock
+    # budget at the right step would otherwise pass this test while the signal
+    # path was dead.
+    reason = ckpt_mod.load_latest(kill_dir).get("stop_reason", "")
+    assert reason.startswith("signal"), \
+        f"link stopped for {reason!r}, not the signal; SIGUSR1/SIGTERM handling is dead"
+    assert f"({reason})" in out
 
     run_link(cfg, kill_dir)                      # fresh process, resumes from LATEST
     resumed = curve(kill_dir)
@@ -456,6 +500,23 @@ def test_survives_sigterm_and_resumes_with_continuous_loss(tmp_path):
           f"post-resume {got['post_resume']:.6f} "
           f"(uninterrupted at that step: {got['baseline_at_post']:.6f}; "
           f"worst relative gap over the whole curve {got['worst_rel_gap']:.2e})")
+
+
+def test_sentinel_stop_is_recorded_as_a_different_reason(tmp_path):
+    """`stop_reason` must discriminate, or asserting it above proves nothing.
+
+    Also the operational contract: `touch runs/<name>/STOP` ends a run at the
+    next step boundary with a durable checkpoint. Never scancel.
+    """
+    cfg = write_test_config(tmp_path, run={"steps": 8, "name": "sentinel"})
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "STOP").touch()                   # already there before step 1
+    run_link(cfg, run_dir)
+
+    stopped_at = ckpt_mod.latest_step(run_dir)
+    assert stopped_at == 1, f"the sentinel did not stop the link promptly ({stopped_at})"
+    assert ckpt_mod.load_latest(run_dir)["stop_reason"] == "sentinel"
 
 
 @pytest.mark.slow

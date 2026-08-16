@@ -930,11 +930,17 @@ def main(argv=None) -> int:
     grad_clip = float(ocfg.get("grad_clip", 1.0))
     t0, last_delta = time.time(), float("nan")
 
-    def _save(step: int) -> None:
+    def _save(step: int, stop_reason: str = "") -> None:
+        # stop_reason rides in the payload so a chain of 38 links can be triaged
+        # from its checkpoints alone: "signal" is SLURM preempting on schedule,
+        # "budget" is the link running out of its own clock, "sentinel" is a
+        # human, "" is a periodic save. A run that keeps stopping for "budget"
+        # near step 0 is a startup that got slower, not a preemption problem.
         with fsdp_mod.sharded_state_dict(model):
             ckpt_mod.save(
                 ckpt_mod.build_state(state, config_hash=chash, world_size=world,
-                                     wandb_run_id=wandb_util.stable_run_id(run_dir)),
+                                     wandb_run_id=wandb_util.stable_run_id(run_dir),
+                                     extra={"stop_reason": stop_reason}),
                 run_dir, step, keep_last=int(rcfg.get("keep_last", 3)))
 
     while state.global_step < stop_at:
@@ -989,7 +995,7 @@ def main(argv=None) -> int:
         # the next collective until SLURM kills the job.
         stop = guard.should_stop()
         if stop or state.global_step % ckpt_every == 0 or state.global_step >= stop_at:
-            _save(state.global_step)
+            _save(state.global_step, guard.reason if stop else "")
         if stop:
             print(f"[rank{rank}] stopping at {state.global_step} ({guard.reason})",
                   flush=True)
