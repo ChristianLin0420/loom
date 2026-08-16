@@ -449,8 +449,29 @@ class LoomModel(nn.Module):
         self._est_takes_embodiment = _accepts(estimator, "embodiment")
         #: set by main() on the CUDA path; PLAN 9 build assert, see fsdp.assert_bf16
         self.check_bf16 = False
+        #: bf16 on CUDA, None on CPU. See `_cast`.
+        self.compute_dtype: torch.dtype | None = None
 
     # ── beliefs ────────────────────────────────────────────────────────────
+    def _cast(self, z: Tensor) -> Tensor:
+        """Pin the belief to the compute dtype at the estimator boundary.
+
+        Autocast is not enough on its own, and the reason is worth writing down.
+        `E` is a pre-LN Perceiver, so its last op is a LayerNorm -- and
+        `layer_norm` sits in autocast's **fp32** cast policy, so `z` comes back
+        fp32 even with every matmul in the block running bf16. `bank.step` then
+        does `a * x` with `a` bf16 (einsum, autocast-lowered) and `x` fp32, which
+        promotes the whole affine rollout to fp32: 2x the activation memory for
+        the one part of the model that is pure elementwise algebra.
+
+        The cast belongs here rather than inside the bank because the bank casts
+        `c` to its *parameter* dtype and hands back that, so the call site is the
+        only place that controls the belief's dtype. It is also correct under
+        FSDP, whose fp32 master weights are a storage detail: the forward already
+        runs on bf16 shards, and the LayerNorm upcast happens either way.
+        """
+        return z if self.compute_dtype is None else z.to(self.compute_dtype)
+
     def _est_kw(self, window: dict) -> dict:
         return {"embodiment": window["embodiment"]} if self._est_takes_embodiment else {}
 
@@ -458,7 +479,7 @@ class LoomModel(nn.Module):
         kw = self._est_kw(window)
         z, out = None, []
         for feats in window["feats"]:
-            z = self.estimator(feats, z, **kw)
+            z = self._cast(self.estimator(feats, z, **kw))
             out.append(z)
         return out
 
@@ -467,7 +488,7 @@ class LoomModel(nn.Module):
         kw = self._est_kw(window)
         z, out = None, []
         for feats in window["feats"]:
-            z = self.ema(feats, z, **kw)
+            z = self._cast(self.ema(feats, z, **kw))
             out.append(z.detach())
         return out
 
@@ -690,33 +711,80 @@ def log_shm_headroom(cfg: dict) -> None:
           f"(LoomLoader shrinks these with fit_workers to fit)", flush=True)
 
 
+#: (factory name, kwargs builder). `build_loader` is the agreed Team A factory;
+#: the class constructors are the fallback and spell `world_size`, not `world`.
+_LOADER_FACTORIES = (
+    ("build_loader", lambda r, w, s, d: dict(rank=r, world=w, seed=s, device=d)),
+    ("WindowLoader", lambda r, w, s, d: dict(rank=r, world_size=w, seed=s, device=d)),
+    ("LoomLoader", lambda r, w, s, d: dict(rank=r, world_size=w, seed=s)),
+)
+
+
 def build_sampler(cfg: dict, rank: int, world: int, seed: int, device: str):
-    """Real loader if Team A's is importable, otherwise the stub sampler."""
-    if cfg.get("data", {}).get("source", "stub") != "stub":
+    """Team A's loader for a real source; the stub sampler ONLY for `source: stub`.
+
+    Falling back to stub windows when the config asked for LIBERO is a wasted run,
+    not a degraded one: R0-A would have trained 16 GPUs for eight hours on
+    `torch.randn` and produced a first score that reads like a modelling result.
+    A missing loader is therefore fatal here, and the traceback names every
+    factory that was tried and why each failed.
+    """
+    source = cfg.get("data", {}).get("source", "stub")
+    if source == "stub":
+        return WindowSampler(cfg, rank, world, seed, device)
+
+    tried: list[str] = []
+    try:
+        mod = importlib.import_module("loom.data.loader")
+    except Exception as e:
+        raise RuntimeError(
+            f"data.source is {source!r} but loom.data.loader could not be imported "
+            f"({e!r}). Set data.source: stub to train on random windows on purpose."
+        ) from e
+
+    for name, kwargs_for in _LOADER_FACTORIES:
+        fn = getattr(mod, name, None)
+        if fn is None:
+            tried.append(f"{name}: absent")
+            continue
         try:
-            mod = importlib.import_module("loom.data.loader")
-            for cn in ("build_loader", "WindowLoader", "Loader", "LoomLoader"):
-                fn = getattr(mod, cn, None)
-                if fn is not None:
-                    # Never hardcode num_workers: fit_workers/_fit_shared_memory
-                    # inside the loader shrink it to what /dev/shm can hold.
-                    return fn(cfg, rank=rank, world=world, seed=seed, device=device)
+            # Never hardcode num_workers here: fit_workers/_fit_shared_memory
+            # inside the loader shrink it to what /dev/shm actually holds, and
+            # that differs between login (64 MiB) and compute (1008 GiB) nodes.
+            return fn(cfg, **kwargs_for(rank, world, seed, device))
         except Exception as e:
-            print(f"[data] real loader unavailable ({e!r}); using stub windows", flush=True)
-    return WindowSampler(cfg, rank, world, seed, device)
+            tried.append(f"{name}: {e!r}")
+
+    raise RuntimeError(
+        f"data.source is {source!r} but no usable loader factory was found in "
+        f"loom.data.loader:\n  " + "\n  ".join(tried) +
+        "\nTeam A owns build_loader(cfg, *, rank, world, seed, device). "
+        "Set data.source: stub to train on random windows on purpose."
+    )
 
 
-def _to_device(window: dict, device: str) -> dict:
-    if device == "cpu":
+def _to_device(window: dict, device: str, dtype=None) -> dict:
+    """Move and, on the CUDA path, pin every float tensor to the compute dtype.
+
+    Cached tower features arrive in whatever Team A's cache stored (fp16 or
+    fp32); leaving them fp32 drags the heads out of bf16 the same way the belief
+    did, and doubles the resident size of the largest tensor in the batch.
+    Integer tensors are left alone.
+    """
+    if device == "cpu" and dtype is None:
         return window
+
+    def _m(v):
+        v = v.to(device, non_blocking=True)
+        return v.to(dtype) if dtype is not None and v.is_floating_point() else v
+
     out = dict(window)
-    out["feats"] = [{k: v.to(device, non_blocking=True) for k, v in f.items()}
-                    for f in window["feats"]]
-    out["lang"] = window["lang"].to(device, non_blocking=True)
+    out["feats"] = [{k: _m(v) for k, v in f.items()} for f in window["feats"]]
+    out["lang"] = _m(window["lang"])
     if window.get("actions") is not None:
-        out["actions"] = window["actions"].to(device, non_blocking=True)
+        out["actions"] = _m(window["actions"])
     if window.get("reward") is not None:
-        out["reward"] = window["reward"].to(device, non_blocking=True)
+        out["reward"] = _m(window["reward"])
     return out
 
 
@@ -897,11 +965,12 @@ def main(argv=None) -> int:
     # bf16 throughout (PLAN 9). FSDP's MixedPrecision covers the wrapped modules;
     # autocast covers the single-GPU debug path where nothing is wrapped.
     amp = device == "cuda" and str(cfg["fsdp"].get("precision", "bf16")) == "bf16"
-    # The stub estimator emits whatever dtype stubs.make_window produced (fp32,
-    # and stubs.py is frozen), so the bf16 build assert only means something with
-    # the real modules. Asserting on the stub path fails every GPU smoke test for
-    # a reason that is not a bug.
-    model.check_bf16 = amp and cfg["model"].get("use_stubs", "auto") is not True
+    # LoomModel._cast pins the belief to bf16 at the estimator boundary, so the
+    # rollout is bf16 on the stub path too and the assert is checked everywhere
+    # amp is on. It was previously skipped for stubs, which is exactly why a GPU
+    # smoke could not have caught the fp32 rollout.
+    model.compute_dtype = torch.bfloat16 if amp else None
+    model.check_bf16 = amp
 
     # ── resume ─────────────────────────────────────────────────────────────
     with fsdp_mod.sharded_state_dict(model):
@@ -949,7 +1018,7 @@ def main(argv=None) -> int:
         is_frozen = freeze.apply(model, step, trainable)
         lrs = sched.apply(opt, step)
 
-        window = _to_device(sampler.next(step), device)
+        window = _to_device(sampler.next(step), device, model.compute_dtype)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
             loss, metrics = model.compute_losses(window, step, rank, seed)
 

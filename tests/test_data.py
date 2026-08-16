@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -594,6 +595,140 @@ def test_worker_queue_is_sized_to_shared_memory(tmp_path):
     assert loader.bytes_per_batch() > 0
     next(iter(loader.batches(0, 1)))
     assert 0 <= loader.effective_workers <= loader.num_workers
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  FACTORY  —  the interface loom.train.loop probes for
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_build_loader_accepts_the_loops_call_signature():
+    """REGRESSION: the loop calls fn(cfg, rank=, world=, seed=, device=).
+
+    It previously found `LoomLoader` (which wants datasets, not a config), the
+    TypeError was swallowed, and the run silently trained on stub windows.
+    """
+    import inspect
+
+    from loom.data.loader import build_loader
+
+    sig = inspect.signature(build_loader)
+    sig.bind({}, rank=0, world=1, seed=0, device="cpu")     # must not raise
+
+    # the loop probes these names in order and takes the first that exists
+    import loom.data.loader as LD
+    probed = [n for n in ("build_loader", "WindowLoader", "Loader", "LoomLoader")
+              if getattr(LD, n, None) is not None]
+    assert probed[0] == "build_loader", (
+        f"the loop would pick {probed[0]!r} first; it must find build_loader"
+    )
+
+
+def test_loader_exposes_the_samplers_runtime_interface(tmp_path):
+    """The loop drives `.next(step)` and checkpoints `.state_dict()`."""
+    ds = _make_body(tmp_path / "a", "libero_franka")
+    loader = LoomLoader({"libero_franka": ds}, batch_size=4, seed=5)
+    for name in ("next", "state_dict", "load_state_dict", "embodiment_for"):
+        assert callable(getattr(loader, name)), name
+    assert loader.n_windows == len(ds)
+
+
+def test_next_matches_the_batches_generator(tmp_path):
+    ds = _make_body(tmp_path / "a", "libero_franka")
+    a = LoomLoader({"libero_franka": ds}, batch_size=4, seed=5)
+    b = LoomLoader({"libero_franka": ds}, batch_size=4, seed=5)
+    ref = [w["feats"][0]["views"].clone() for w in b.batches(0, 4)]
+    for s in range(4):
+        torch.testing.assert_close(a.next(s)["feats"][0]["views"], ref[s])
+
+
+def test_next_reseeks_on_a_jump(tmp_path):
+    """A resumed link calls next(4137) first and must get step 4137's batch."""
+    ds = _make_body(tmp_path / "a", "libero_franka")
+    a = LoomLoader({"libero_franka": ds}, batch_size=4, seed=5)
+    sequential = [a.next(s)["feats"][0]["views"].clone() for s in range(6)]
+
+    b = LoomLoader({"libero_franka": ds}, batch_size=4, seed=5)
+    torch.testing.assert_close(b.next(5)["feats"][0]["views"], sequential[5])
+    torch.testing.assert_close(b.next(2)["feats"][0]["views"], sequential[2])
+    torch.testing.assert_close(b.next(3)["feats"][0]["views"], sequential[3])
+
+
+def test_load_state_dict_tolerates_a_stub_checkpoint(tmp_path):
+    """Migrating off the stub sampler must not be blocked by its cursor format."""
+    ds = _make_body(tmp_path / "a", "libero_franka")
+    loader = LoomLoader({"libero_franka": ds}, batch_size=4, seed=5)
+    loader.next(7)
+    assert loader.state_dict() == {"global_step": 7}
+    loader.load_state_dict({"cursor": 123, "epoch": 1})      # stub format
+    assert loader.state_dict() == {"global_step": 7}
+    loader.load_state_dict({"global_step": 11})
+    assert loader.state_dict() == {"global_step": 11}
+
+
+def test_resolve_cache_root_precedence(tmp_path, monkeypatch):
+    from loom.data.loader import BASE_CACHE_DIR_PLACEHOLDER, resolve_cache_root
+
+    monkeypatch.setenv("LOOM_CACHE_DIR", "/env/cache")
+
+    # the base.yaml placeholder is a default, not a choice: env wins
+    base = {"data": {"cache_dir": BASE_CACHE_DIR_PLACEHOLDER}}
+    assert resolve_cache_root(base) == Path("/env/cache")
+
+    # a run config that really set cache_dir beats the env
+    explicit = {"data": {"cache_dir": "/run/cache"}}
+    assert resolve_cache_root(explicit) == Path("/run/cache")
+
+    # an explicit argument beats everything
+    assert resolve_cache_root(explicit, "/arg/cache") == Path("/arg/cache")
+
+    # with no env at all the placeholder is used as written
+    monkeypatch.delenv("LOOM_CACHE_DIR")
+    assert resolve_cache_root(base) == Path(BASE_CACHE_DIR_PLACEHOLDER)
+
+
+def test_build_loader_refuses_stub_source():
+    from loom.data.loader import DataConfigError, build_loader
+
+    with pytest.raises(DataConfigError, match="stub"):
+        build_loader({"data": {"source": "stub"}}, rank=0, world=1, seed=0, device="cpu")
+
+
+def test_build_loader_dies_on_a_missing_cache(tmp_path):
+    """A real source with no cache must raise, never substitute stubs."""
+    from loom.data.loader import DataConfigError, build_loader
+
+    cfg = {"run": {"seed": 0},
+           "data": {"source": "libero", "embodiments": ["libero_franka"],
+                    "cache_dir": str(tmp_path / "nope")}}
+    with pytest.raises(DataConfigError, match="does not exist"):
+        build_loader(cfg, rank=0, world=1, seed=0, device="cpu")
+
+
+def test_build_loader_dies_on_a_cache_version_bump(tmp_path):
+    from loom.data.loader import DataConfigError, build_loader
+
+    _make_body(tmp_path / "c", "libero_franka", n_traj=1, n_src=120)
+    man = tmp_path / "c" / CA.MANIFEST_NAME
+    doc = json.loads(man.read_text())
+    doc["format_version"] = CA.CACHE_FORMAT_VERSION + 1
+    man.write_text(json.dumps(doc))
+
+    cfg = {"run": {"seed": 0},
+           "data": {"source": "libero", "embodiments": ["libero_franka"],
+                    "cache_dir": str(tmp_path / "c")}}
+    with pytest.raises(DataConfigError, match="format version"):
+        build_loader(cfg, rank=0, world=1, seed=0, device="cpu")
+
+
+def test_build_loader_rejects_an_unwired_body(tmp_path):
+    from loom.data.loader import DataConfigError, build_loader
+
+    _make_body(tmp_path / "c", "libero_franka", n_traj=1, n_src=120)
+    cfg = {"run": {"seed": 0},
+           "data": {"source": "robotwin", "embodiments": ["synth_a"],
+                    "cache_dir": str(tmp_path / "c")}}
+    with pytest.raises(DataConfigError, match="no adapter wired"):
+        build_loader(cfg, rank=0, world=1, seed=0, device="cpu")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

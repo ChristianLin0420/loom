@@ -216,6 +216,50 @@ def test_r1_config_disables_action_losses():
     assert set(cfg["train_modules"]) == {"estimator", "bank", "q_delta"}
 
 
+def test_a_real_data_source_never_falls_back_to_stub_windows(monkeypatch):
+    """`source: libero` + a stub fallback is a WASTED run, not a degraded one.
+
+    R0-A on 16 GPUs would have trained for eight hours on torch.randn and
+    produced a first score that reads like a modelling result. Only
+    `source: stub` may fall back, and then it is an explicit choice.
+    """
+    from loom.train import loop as loop_mod
+
+    def boom(name, *a, **kw):
+        raise ImportError(f"no {name}")
+
+    monkeypatch.setattr(loop_mod.importlib, "import_module", boom)
+
+    stub_cfg = {"data": {"source": "stub", "batch_per_gpu": 1,
+                         "embodiments": ["libero_franka"]}}
+    assert isinstance(loop_mod.build_sampler(stub_cfg, 0, 1, 0, "cpu"), WindowSampler)
+
+    for source in ("libero", "robotwin", "mixed"):
+        with pytest.raises(RuntimeError, match=r"data.source is"):
+            loop_mod.build_sampler({"data": {"source": source}}, 0, 1, 0, "cpu")
+
+
+def test_missing_loader_factory_names_everything_it_tried(monkeypatch):
+    from loom.train import loop as loop_mod
+
+    empty = type("mod", (), {})()
+    monkeypatch.setattr(loop_mod.importlib, "import_module", lambda *a, **k: empty)
+    with pytest.raises(RuntimeError, match="build_loader") as exc:
+        loop_mod.build_sampler({"data": {"source": "libero"}}, 0, 1, 0, "cpu")
+    assert "absent" in str(exc.value)
+
+
+def test_loader_factories_use_world_size_not_world():
+    """Team A's constructors spell it `world_size`; only build_loader takes `world`."""
+    from loom.train.loop import _LOADER_FACTORIES
+
+    names = [n for n, _ in _LOADER_FACTORIES]
+    assert names[0] == "build_loader", "the agreed factory must be tried first"
+    for name, kw in _LOADER_FACTORIES:
+        got = kw(0, 8, 1, "cuda")
+        assert ("world" in got) == (name == "build_loader"), got
+
+
 def test_batches_are_embodiment_homogeneous_and_dispatch(tmp_path):
     """PLAN 9: one embodiment per batch; q_a/D_e dispatched by window["embodiment"]."""
     cfg = {"data": {"batch_per_gpu": 2, "embodiments": ["libero_franka"]},
@@ -301,6 +345,40 @@ def test_cached_features_carry_no_autograd_history():
     w["feats"][0]["views"] = w["feats"][0]["views"].clone().requires_grad_(True)
     with pytest.raises(RuntimeError, match="frozen tower is in the training graph"):
         fsdp_mod.assert_features_are_cached(w)
+
+
+def test_belief_is_pinned_to_the_compute_dtype():
+    """The L_dyn rollout must not silently leave bf16.
+
+    `E` is pre-LN, so its last op is a LayerNorm -- and layer_norm is in
+    autocast's fp32 policy, so `z` comes back fp32 even with every matmul in bf16.
+    `bank.step` then computes `a * x` with `a` bf16 and `x` fp32 and promotes the
+    whole affine rollout. Found by a real R0-A smoke on one A100.
+    """
+    model = build_model({"data": {"embodiments": ["libero_franka"]},
+                         "model": {"use_stubs": True},
+                         "losses": {"dyn": {"enabled": True}}})
+    w = S.make_window(b=1)
+    assert model.compute_dtype is None
+    assert model.beliefs(w)[0].dtype is torch.float32       # CPU path untouched
+
+    model.compute_dtype = torch.bfloat16
+    for z in model.beliefs(w):
+        assert z.dtype is torch.bfloat16, "belief left the compute dtype"
+    for z in model.target_beliefs(w):
+        assert z.dtype is torch.bfloat16, "EMA target belief left the compute dtype"
+
+
+def test_to_device_casts_only_float_tensors():
+    from loom.train.loop import _to_device
+
+    w = S.make_window(b=1)
+    w["step_id"] = torch.tensor([3, 4])
+    out = _to_device(w, "cpu", torch.bfloat16)
+    assert out["feats"][0]["views"].dtype is torch.bfloat16
+    assert out["lang"].dtype is torch.bfloat16
+    assert out["actions"].dtype is torch.bfloat16
+    assert out["step_id"].dtype is torch.int64, "an index tensor was cast to bf16"
 
 
 def test_assert_bf16_is_a_real_build_assert():

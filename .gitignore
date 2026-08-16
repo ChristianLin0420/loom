@@ -229,5 +229,9 @@ checkpoints/
 *.pt
 results/
 outputs/
-data/
+# Anchored. A bare `data/` matches a directory named `data` at ANY depth, which
+# silently untracked the entire `loom/data/` package -- adapters, loader,
+# canonical, tower. `git status` was clean the whole time because ignored files
+# are not reported. Only a top-level dataset dir should be ignored here.
+/data/
 .triton_cache*/
