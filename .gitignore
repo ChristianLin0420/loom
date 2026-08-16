@@ -216,3 +216,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── LOOM ──────────────────────────────────────────────────────────────
+.env.local
+.env.*
+runs/
+logs/
+wandb/
+cache/
+checkpoints/
+*.ckpt
+*.pt
+results/
+outputs/
