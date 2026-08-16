@@ -30,7 +30,13 @@ __all__ = [
 BANK_LR_MULT = 0.1
 
 #: Parameter-name fragments that must not be weight-decayed.
-_NO_DECAY = ("bias", "norm", "ln_", "layernorm", "embed", "log_r", "omega")
+# "embed" does NOT match `step_emb` or `slot_emb`, so seven embedding tensors
+# across q_action, q_delta and the decoder were being weight-decayed. Against the
+# real CosineWithWarmup(3e-4, 2000, 60000) that is a 4.4% multiplicative shrink by
+# step 4000, 8.6% by 7004, and 37.6% over the full schedule -- noise for a probe,
+# material for a real run. "_emb" matches exactly those seven and nothing else;
+# no parameter name contains "embodiment".
+_NO_DECAY = ("bias", "norm", "ln_", "layernorm", "embed", "_emb", "log_r", "omega")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
