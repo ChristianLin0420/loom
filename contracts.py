@@ -1,302 +1,339 @@
 """
-LOOM — Phase 0 gate.
+LOOM — contracts.
 
-`pytest tests/test_contracts.py` must be green before contracts.py freezes and
-the six teams fan out. Nothing else starts until this passes.
+FROZEN AFTER PHASE 0. Do not edit.
+
+Every constant, shape validator and Protocol that more than one team touches
+lives here. A genuine contract change halts Phase 1, is made once, and all six
+teams rebase (PLAN.md 6.4).
+
+Nothing in this file imports anything from `loom` or `stubs`. It is the root of
+the dependency graph.
 """
 
 from __future__ import annotations
 
-import math
+from dataclasses import dataclass
+from typing import Protocol, TypedDict, runtime_checkable
 
-import pytest
+import numpy as np
 import torch
+from torch import Tensor
 
-import contracts as C
-import stubs as S
+__all__ = [
+    # temporal
+    "FPS_CANONICAL", "H_OP", "DEPTH", "H_PLAN", "N_STATES", "CANONICAL_FRAMES",
+    # model
+    "K", "D", "M", "TOPK", "RHO", "B_MAX", "EMA_TAU",
+    # losses
+    "DYN_WEIGHTS", "BALANCE_COEF", "REALIZABILITY_TAU",
+    # embodiments
+    "EmbodimentSpec", "EMBODIMENTS", "register_embodiment", "env_steps_per_segment",
+    # typed dicts
+    "ObsFeats", "TransitionWindow",
+    # protocols
+    "Estimator", "Bank", "QDelta", "QAction", "Decoder", "Proposal",
+    "Potential", "Policy",
+    # validators
+    "assert_belief", "assert_simplex", "assert_action_segment",
+    "assert_contractive", "assert_bias_bounded",
+]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  STRUCTURAL INVARIANTS
+#  TEMPORAL
 # ═══════════════════════════════════════════════════════════════════════════
 
-def test_temporal_consistency():
-    assert C.H_OP * C.DEPTH == C.H_PLAN
-    assert C.N_STATES == C.DEPTH + 1
-    assert len(C.DYN_WEIGHTS) == C.DEPTH
+FPS_CANONICAL = 30          # every dataset resampled to this before segmenting
+H_OP          = 8           # control steps per operator -> 267 ms
+DEPTH         = 4           # planning horizon, in operators
+H_PLAN        = H_OP * DEPTH        # 32 canonical steps, 1.07 s
+N_STATES      = DEPTH + 1           # 5 operator-boundary states per window
+
+#: canonical frame indices of the N_STATES boundary observations
+CANONICAL_FRAMES = tuple(H_OP * i for i in range(N_STATES))     # (0, 8, 16, 24, 32)
 
 
-def test_slot_width_even():
-    """The operator acts on adjacent pairs as 2x2 blocks."""
-    assert C.D % 2 == 0
+# ═══════════════════════════════════════════════════════════════════════════
+#  MODEL
+# ═══════════════════════════════════════════════════════════════════════════
+
+K       = 128           # belief slots
+D       = 768           # slot width, MUST be even
+M       = 128           # operator bank size
+TOPK    = 4             # nonzero coefficients
+RHO     = 0.98          # spectral radius bound per operator
+B_MAX   = 1.0           # norm bound per bias
+EMA_TAU = 0.996         # target-estimator EMA
 
 
-def test_bounds_are_contractive():
-    assert 0.0 < C.RHO < 1.0
-    assert C.B_MAX > 0.0
+# ═══════════════════════════════════════════════════════════════════════════
+#  LOSSES
+# ═══════════════════════════════════════════════════════════════════════════
+
+#: per-horizon weights in L_dyn; one entry per rollout step
+DYN_WEIGHTS = (1.0, 0.5, 0.25, 0.125)
+
+#: coefficient on KL(mean_batch(c) || uniform(M)); prevents dead operators only
+BALANCE_COEF = 3e-3
+
+#: search-time realizability gate: reject root c when ||q_a(D_e(z,c), z) - c|| > tau
+REALIZABILITY_TAU = 0.5
 
 
-def test_topk_valid():
-    assert 1 <= C.TOPK <= C.M
-
-
-def test_operator_duration_is_reasonable():
-    """One operator should be a plausible linearization interval."""
-    ms = 1000.0 * C.H_OP / C.FPS_CANONICAL
-    assert 150.0 < ms < 400.0, f"operator spans {ms:.0f} ms"
+# ═══════════════════════════════════════════════════════════════════════════
+#  TENSOR ALIASES  (documentation only)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#   Belief          (..., K, D)             real, never complex
+#   Coeff           (..., M)                simplex, <= TOPK nonzero
+#   LamPair         (..., K, D//2) x2       real (a, b) meaning a + ib, |a+ib| <= RHO
+#   ActionSegment   (..., H_OP, dof_e)      ONE operator's worth. NEVER H_PLAN.
+#   CoeffSeq        (B, N, DEPTH, M)        one candidate plan per n
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  EMBODIMENT REGISTRY
 # ═══════════════════════════════════════════════════════════════════════════
 
-def test_libero_registered():
-    spec = C.EMBODIMENTS["libero_franka"]
-    assert spec.dof == 7
-    assert spec.n_views == 2
-    assert spec.env_fps == 20.0
+@dataclass(frozen=True)
+class EmbodimentSpec:
+    """Everything head dispatch and action de/normalisation needs.
 
-
-def test_registration_is_idempotent():
-    C.register_embodiment(C.EMBODIMENTS["libero_franka"])
-
-
-def test_conflicting_registration_rejected():
-    bad = C.EmbodimentSpec("libero_franka", 9, 20.0, 2, (-1.0,) * 9, (1.0,) * 9)
-    with pytest.raises(ValueError):
-        C.register_embodiment(bad)
-
-
-def test_action_bounds_must_match_dof():
-    with pytest.raises(ValueError):
-        C.EmbodimentSpec("bad", 7, 30.0, 2, (-1.0,) * 3, (1.0,) * 7)
-
-
-def test_env_steps_per_segment_is_fractional_for_libero():
-    """8 canonical steps at 30 Hz onto a 20 Hz env is 5.333, not an integer.
-
-    A Policy must carry a fractional accumulator. Rounding each segment
-    independently drifts over an episode.
+    `env_fps` is the rate the *environment* steps at, not the rate the dataset
+    was recorded at (those can differ; the recorded rate travels in
+    `TransitionWindow.src_fps`).
     """
-    n = C.env_steps_per_segment(20.0)
-    assert math.isclose(n, 8 * 20 / 30)
-    assert not float(n).is_integer()
+
+    name:        str
+    dof:         int
+    env_fps:     float
+    n_views:     int
+    action_low:  tuple[float, ...]
+    action_high: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        if self.dof <= 0:
+            raise ValueError(f"{self.name}: dof must be positive, got {self.dof}")
+        if self.n_views <= 0:
+            raise ValueError(f"{self.name}: n_views must be positive, got {self.n_views}")
+        if self.env_fps <= 0.0:
+            raise ValueError(f"{self.name}: env_fps must be positive, got {self.env_fps}")
+        if len(self.action_low) != self.dof:
+            raise ValueError(
+                f"{self.name}: action_low has {len(self.action_low)} entries, dof is {self.dof}"
+            )
+        if len(self.action_high) != self.dof:
+            raise ValueError(
+                f"{self.name}: action_high has {len(self.action_high)} entries, dof is {self.dof}"
+            )
+        if any(hi <= lo for lo, hi in zip(self.action_low, self.action_high)):
+            raise ValueError(f"{self.name}: action_high must exceed action_low elementwise")
 
 
-def test_env_steps_identity_at_canonical_rate():
-    assert C.env_steps_per_segment(C.FPS_CANONICAL) == C.H_OP
+#: name -> spec. Adapters register their own embodiment at import time.
+EMBODIMENTS: dict[str, EmbodimentSpec] = {}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  DATA SHAPES
-# ═══════════════════════════════════════════════════════════════════════════
+def register_embodiment(spec: EmbodimentSpec) -> EmbodimentSpec:
+    """Idempotent for an identical spec; raises on a conflicting redefinition.
 
-def test_window_has_n_states():
-    w = S.make_window(b=2)
-    assert len(w["feats"]) == C.N_STATES
-
-
-def test_window_actions_shape():
-    w = S.make_window(b=2)
-    dof = C.EMBODIMENTS[w["embodiment"]].dof
-    assert w["actions"].shape == (2, C.DEPTH, C.H_OP, dof)
-
-
-def test_action_free_window():
-    w = S.make_window(b=2, action_free=True)
-    assert w["actions"] is None
-    assert len(w["feats"]) == C.N_STATES
-
-
-def test_window_records_src_fps():
-    """Eval needs this to invert canonical resampling."""
-    assert S.make_window(b=2)["src_fps"] > 0
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  STUB SHAPES
-# ═══════════════════════════════════════════════════════════════════════════
-
-def test_estimator_shape():
-    z = S.StubEstimator()(S.make_obs_feats(b=3), None)
-    C.assert_belief(z)
-    assert z.shape == (3, C.K, C.D)
-
-
-def test_estimator_accepts_recurrence():
-    e, feats = S.StubEstimator(), S.make_obs_feats(b=3)
-    z1 = e(feats, None)
-    z2 = e(feats, z1)
-    C.assert_belief(z2)
-
-
-def test_bank_step_shape():
-    bank, z = S.StubBank(), torch.randn(4, C.K, C.D)
-    out = bank.step(S.sparse_simplex(4), z)
-    assert out.shape == z.shape
-    C.assert_belief(out)
-
-
-def test_bank_step_broadcasts_over_candidates():
-    bank = S.StubBank()
-    z = torch.randn(2, 5, C.K, C.D)
-    out = bank.step(S.sparse_simplex(2, 5), z)
-    assert out.shape == z.shape
-
-
-def test_rollout_shape():
-    bank = S.StubBank()
-    out = bank.rollout(S.sparse_simplex(2, 7, C.DEPTH), torch.randn(2, C.K, C.D))
-    assert out.shape == (2, 7, C.K, C.D)
-
-
-def test_rollout_matches_sequential_step():
-    """rollout must be exactly DEPTH applications of step, bias included.
-
-    This is the test that catches the affine-composition bug: composing
-    (A2, b2) after (A1, b1) gives (A2@A1, A2@b1 + b2), so multiplying lambdas
-    alone silently drops the accumulated bias.
+    Adapters are imported more than once (workers, eval, tests). Re-registering
+    the same body must be free; silently overwriting a different one must not.
     """
-    bank = S.StubBank()
-    z0 = torch.randn(2, C.K, C.D)
-    c = S.sparse_simplex(2, 1, C.DEPTH)
-
-    manual = z0.unsqueeze(1)
-    for d in range(C.DEPTH):
-        manual = bank.step(c[:, :, d], manual)
-
-    assert torch.allclose(bank.rollout(c, z0), manual, atol=1e-5)
+    prev = EMBODIMENTS.get(spec.name)
+    if prev is not None and prev != spec:
+        raise ValueError(
+            f"conflicting registration for {spec.name!r}:\n  have {prev}\n  got  {spec}"
+        )
+    EMBODIMENTS[spec.name] = spec
+    return spec
 
 
-def test_decoder_emits_h_op_not_h_plan():
-    """A Decoder emits ONE operator's worth of action. Never H_PLAN."""
-    dec = S.StubDecoder()
-    a = dec(torch.randn(3, C.K, C.D), S.sparse_simplex(3))
-    assert a.shape == (3, C.H_OP, 7)
-    assert a.shape[1] != C.H_PLAN
-    C.assert_action_segment(a, "libero_franka")
+def env_steps_per_segment(env_fps: float) -> float:
+    """How many environment steps one operator spans. Deliberately fractional.
+
+    8 canonical steps at 30 Hz onto a 20 Hz env is 5.333, not 5. A Policy must
+    carry the remainder in an accumulator; rounding each segment independently
+    drifts by a full second over a 600-step episode.
+    """
+    return H_OP * float(env_fps) / FPS_CANONICAL
 
 
-def test_q_delta_returns_simplex():
-    q = S.StubQDelta()
-    C.assert_simplex(q(torch.randn(4, C.K, C.D), torch.randn(4, C.K, C.D)))
-
-
-def test_q_action_returns_simplex():
-    q = S.StubQAction()
-    C.assert_simplex(q(torch.randn(4, C.H_OP, 7), torch.randn(4, C.K, C.D)))
-
-
-def test_proposal_sample_shape_and_simplex():
-    p = S.StubProposal()
-    c = p.sample(torch.randn(2, C.K, C.D), torch.randn(2, 16, 1152), n=11)
-    assert c.shape == (2, 11, C.M)
-    C.assert_simplex(c)
-
-
-def test_proposal_log_prob_is_negative_and_finite():
-    p = S.StubProposal()
-    z, lang = torch.randn(3, C.K, C.D), torch.randn(3, 16, 1152)
-    lp = p.log_prob(z, lang, S.sparse_simplex(3))
-    assert lp.shape == (3,)
-    assert torch.isfinite(lp).all()
-    assert (lp <= 0).all()
-
-
-def test_potential_shape():
-    phi = S.StubPotential()
-    assert phi(torch.randn(2, 9, C.K, C.D), torch.randn(2, 16, 1152)).shape == (2, 9)
+# LIBERO: OSC_POSE delta control, 7-dim (3 pos, 3 axis-angle, 1 gripper), all in
+# [-1, 1]; agentview + eye_in_hand; robosuite control_freq 20 Hz.
+register_embodiment(EmbodimentSpec(
+    name="libero_franka",
+    dof=7,
+    env_fps=20.0,
+    n_views=2,
+    action_low=(-1.0,) * 7,
+    action_high=(1.0,) * 7,
+))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  INVARIANTS THE REAL MODULES MUST ALSO SATISFY
+#  DATA
 # ═══════════════════════════════════════════════════════════════════════════
 
-def test_stub_bank_is_contractive():
-    C.assert_contractive(S.StubBank(), n=2000)
+class ObsFeats(TypedDict):
+    """Frozen-tower features for ONE canonical frame. Never raw pixels."""
+
+    views:   Tensor   # (B, V, P, F)  V streams; tactile gel-pads are just views
+    proprio: Tensor   # (B, dof_e)
+    lang:    Tensor   # (B, L, F)
 
 
-def test_stub_bank_bias_is_bounded():
-    C.assert_bias_bounded(S.StubBank(), n=2000)
+class TransitionWindow(TypedDict):
+    """One training example. Embodiment-homogeneous by construction."""
 
-
-def test_rollout_does_not_explode():
-    """DEPTH applications must stay bounded by rho^T ||z|| + (1-rho^T)/(1-rho) B."""
-    bank = S.StubBank()
-    z0 = torch.randn(8, C.K, C.D)
-    leaves = bank.rollout(S.sparse_simplex(8, 1, C.DEPTH), z0)
-
-    bound = (C.RHO ** C.DEPTH) * z0.flatten(1).norm(dim=1) \
-        + (1 - C.RHO ** C.DEPTH) / (1 - C.RHO) * C.B_MAX
-    assert (leaves.squeeze(1).flatten(1).norm(dim=1) <= bound + 1e-3).all()
-
-
-def test_simplex_validator_rejects_dense():
-    with pytest.raises(AssertionError):
-        C.assert_simplex(torch.full((2, C.M), 1.0 / C.M))
-
-
-def test_simplex_validator_rejects_unnormalized():
-    c = S.sparse_simplex(2) * 2.0
-    with pytest.raises(AssertionError):
-        C.assert_simplex(c)
-
-
-def test_belief_validator_rejects_complex():
-    """z is real throughout. Complex is only a view of adjacent real pairs."""
-    with pytest.raises(AssertionError):
-        C.assert_belief(torch.randn(2, C.K, C.D // 2, dtype=torch.complex64))
-
-
-def test_action_segment_validator_rejects_h_plan():
-    with pytest.raises(AssertionError):
-        C.assert_action_segment(torch.randn(2, C.H_PLAN, 7), "libero_franka")
+    feats:      list[ObsFeats]   # length N_STATES, at CANONICAL_FRAMES
+    actions:    Tensor | None    # (B, DEPTH, H_OP, dof_e); None for action-free data
+    lang:       Tensor           # (B, L, F)
+    embodiment: str              # HOMOGENEOUS within a batch
+    src_fps:    float            # original rate, needed to invert resampling at eval
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  BF16
+#  PROTOCOLS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def test_bank_runs_in_bf16_without_promotion():
-    """A100 has no FP8 and no complex-bf16. The 2x2 algebra must be real bf16."""
-    bank = S.StubBank().to(torch.bfloat16)
-    z = torch.randn(2, C.K, C.D, dtype=torch.bfloat16)
-    out = bank.step(S.sparse_simplex(2, dtype=torch.bfloat16), z)
-    assert out.dtype == torch.bfloat16
-    assert not out.is_complex()
+@runtime_checkable
+class Estimator(Protocol):                                # shared
+    def forward(self, feats: ObsFeats, z_prev: Tensor | None) -> Tensor: ...
 
 
-def test_view_as_complex_is_not_available_in_bf16():
-    """Documents why bank.py must use explicit real 2x2 algebra."""
-    z = torch.randn(2, C.K, C.D // 2, 2, dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError):
-        torch.view_as_complex(z)
+@runtime_checkable
+class Bank(Protocol):                                     # shared
+    def mix(self, c: Tensor) -> tuple[Tensor, Tensor]: ...      # Coeff -> (a, b)
+    def bias(self, c: Tensor) -> Tensor: ...                    # Coeff -> (..., K, D)
+    def step(self, c: Tensor, z: Tensor) -> Tensor: ...         # ONE affine step
+    def rollout(self, c_seq: Tensor, z: Tensor) -> Tensor: ...
+    # (B,N,DEPTH,M), (B,K,D) -> (B,N,K,D). Sequential over DEPTH.
+    # There is NO compose(). Composing affine maps gives (A2A1, A2b1+b2);
+    # multiplying lambdas alone silently discards the bias.
+
+
+@runtime_checkable
+class QDelta(Protocol):                                   # shared
+    def forward(self, z_t: Tensor, z_next: Tensor) -> Tensor: ...
+
+
+@runtime_checkable
+class QAction(Protocol):                                  # ONE PER EMBODIMENT
+    def forward(self, a_seg: Tensor, z: Tensor) -> Tensor: ...  # a_seg (B,H_OP,dof_e)
+
+
+@runtime_checkable
+class Decoder(Protocol):                                  # ONE PER EMBODIMENT
+    def forward(self, z: Tensor, c: Tensor) -> Tensor: ...      # -> (B,H_OP,dof_e)
+    def loss(self, z: Tensor, c: Tensor, a_seg: Tensor) -> Tensor: ...
+
+
+@runtime_checkable
+class Proposal(Protocol):                                 # shared
+    def sample(self, z: Tensor, lang: Tensor, n: int) -> Tensor: ...   # -> (B,n,M)
+    def log_prob(self, z: Tensor, lang: Tensor, c: Tensor) -> Tensor: ...
+
+
+@runtime_checkable
+class Potential(Protocol):                                # shared, R3 only
+    def forward(self, z: Tensor, lang: Tensor) -> Tensor: ...          # -> (B,)
+
+
+@runtime_checkable
+class Policy(Protocol):
+    """The ONLY interface eval depends on."""
+
+    def reset(self) -> None: ...
+    def act(self, obs: dict, instruction: str) -> np.ndarray: ...
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  POLICY LOOP
+#  VALIDATORS
+#
+#  These raise AssertionError, not ValueError. They are build asserts: cheap
+#  enough to leave on in tests, stripped by -O in a hot loop.
 # ═══════════════════════════════════════════════════════════════════════════
 
-def test_policy_emits_single_actions():
-    p = S.StubPolicy()
-    p.reset()
-    a = p.act({}, "pick up the bowl")
-    assert a.shape == (7,)
+def _tol(t: Tensor) -> float:
+    """Slack proportional to the dtype. bf16 has 8 mantissa bits; f32 has 24."""
+    return max(8.0 * float(torch.finfo(t.dtype).eps), 1e-6)
 
 
-def test_policy_replans_at_segment_boundaries():
-    """Over 100 env steps at 20 Hz, expect ~100 / 5.333 replans."""
-    p = S.StubPolicy()
-    p.reset()
-    for _ in range(100):
-        p.act({}, "task")
-    expected = 100 / C.env_steps_per_segment(20.0)
-    assert abs(p.replans - expected) <= 2, f"{p.replans} replans, expected ~{expected:.1f}"
+def _simplex_draw(n: int, device="cpu", dtype=torch.float32) -> Tensor:
+    """(n, M) with exactly TOPK nonzeros summing to 1. Local copy so that
+    contracts.py stays at the root of the import graph."""
+    idx = torch.argsort(torch.rand(n, M, device=device), dim=1)[:, :TOPK]
+    w = torch.rand(n, TOPK, device=device)
+    w = w / w.sum(-1, keepdim=True)
+    return torch.zeros(n, M, device=device).scatter_(1, idx, w).to(dtype)
 
 
-def test_policy_reset_clears_state():
-    p = S.StubPolicy()
-    for _ in range(20):
-        p.act({}, "task")
-    p.reset()
-    assert p.replans == 0 and p._accum == 0.0
+def assert_belief(z: Tensor) -> None:
+    """z is real, finite, and (..., K, D)."""
+    assert isinstance(z, Tensor), f"belief must be a Tensor, got {type(z).__name__}"
+    assert not z.is_complex(), (
+        "z is real throughout; the 2x2 block algebra is four real elementwise ops "
+        "and there is no complex-bf16 dtype"
+    )
+    assert z.ndim >= 2, f"belief needs at least (K, D), got {tuple(z.shape)}"
+    assert z.shape[-2:] == (K, D), f"belief must end in ({K}, {D}), got {tuple(z.shape)}"
+    assert torch.isfinite(z.float()).all(), "belief contains nan/inf"
+
+
+def assert_simplex(c: Tensor, topk: int = TOPK) -> None:
+    """c is on the simplex with at most `topk` nonzeros. Every bound depends on this."""
+    assert isinstance(c, Tensor), f"coeff must be a Tensor, got {type(c).__name__}"
+    assert not c.is_complex(), "coefficients are real"
+    assert c.shape[-1] == M, f"coeff must end in M={M}, got {tuple(c.shape)}"
+    tol = _tol(c)
+    cf = c.float()
+    assert (cf >= -tol).all(), f"negative coefficient: min {cf.min().item():.3g}"
+    total = cf.sum(-1)
+    assert torch.allclose(total, torch.ones_like(total), atol=max(tol, 1e-4)), (
+        f"coeff must sum to 1 (a plain softmax over M does not); "
+        f"got range [{total.min().item():.4g}, {total.max().item():.4g}]"
+    )
+    nnz = (cf > tol).sum(-1)
+    assert (nnz <= topk).all(), (
+        f"coeff must have at most {topk} nonzeros (hard top-k, then renormalise); "
+        f"got up to {int(nnz.max())}"
+    )
+
+
+def assert_action_segment(a: Tensor, embodiment: str) -> None:
+    """One c = one operator = H_OP control steps. Never H_PLAN."""
+    assert embodiment in EMBODIMENTS, f"unregistered embodiment {embodiment!r}"
+    spec = EMBODIMENTS[embodiment]
+    assert a.ndim >= 2, f"action segment needs (H_OP, dof), got {tuple(a.shape)}"
+    assert a.shape[-2] == H_OP, (
+        f"an action segment is {H_OP} steps, got {a.shape[-2]}"
+        + (f" — that is H_PLAN, not H_OP" if a.shape[-2] == H_PLAN else "")
+    )
+    assert a.shape[-1] == spec.dof, (
+        f"{embodiment} has dof {spec.dof}, got {a.shape[-1]}"
+    )
+
+
+def assert_contractive(bank: Bank, n: int = 2000, device="cpu", tol: float = 1e-4) -> None:
+    """||A(c)||_2 <= RHO over n random simplex draws.
+
+    A is block-diagonal in 2x2 rotation-decay blocks, so its spectral norm is
+    the largest block magnitude sqrt(a^2 + b^2).
+    """
+    c = _simplex_draw(n, device=device)
+    with torch.no_grad():
+        a, b = bank.mix(c)
+        r = torch.sqrt(a.float() ** 2 + b.float() ** 2)
+    worst = float(r.max())
+    assert worst <= RHO + tol, f"spectral radius {worst:.6f} exceeds RHO={RHO}"
+
+
+def assert_bias_bounded(bank: Bank, n: int = 2000, device="cpu", tol: float = 1e-4) -> None:
+    """||b(c)|| <= B_MAX over n random simplex draws."""
+    c = _simplex_draw(n, device=device)
+    with torch.no_grad():
+        nb = bank.bias(c).float().flatten(1).norm(dim=1)
+    worst = float(nb.max())
+    assert worst <= B_MAX + tol, f"bias norm {worst:.6f} exceeds B_MAX={B_MAX}"

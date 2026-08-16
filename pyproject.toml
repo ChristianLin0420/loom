@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loom"
+version = "0.1.0"
+description = "LOOM — a persistent belief state transformed by operators"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4",
+    "numpy",
+    "einops",
+    "pyyaml",
+    "h5py",
+    "tqdm",
+    "wandb",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-timeout"]
+
+[tool.setuptools]
+py-modules = ["contracts", "stubs"]
+
+[tool.setuptools.packages.find]
+include = ["loom*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "gpu: requires a CUDA device",
+    "slow: takes more than ~30 s",
+    "bench: performance budget, not correctness",
+]
