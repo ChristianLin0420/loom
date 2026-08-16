@@ -1,0 +1,60 @@
+# R3 — sim rollouts, init from R2 (PLAN 7).
+#
+# trains:    Phi, pi_c (RL); light E / bank tune
+# losses:    potential + GRPO
+# inference: shooting  (search/shooting.py, Team E)
+# GPUs:      32 = 4 nodes x 8      time: ~3 d
+#
+# 4 h cap: "~3 d" is 18 links of compute; budget 20.
+#     bash scripts/submit.sh r3 20
+#
+# UNDER-SPECIFIED IN PLAN.md. PLAN 7 names "potential + GRPO" and PLAN 5 fixes
+# the search, but nothing specifies the reward, the rollout source, or the GRPO
+# group size, and no module in this repo produces sim rollouts yet. What exists
+# here is the plumbing: loop._grpo samples a group from pi_c, scores the rollout
+# leaf with Phi, centres the reward inside the group and reinforces;
+# `losses.potential` regresses Phi onto window["reward"], which the stub sampler
+# does not produce (so it trains against zeros). Do not launch this before Team E
+# and the sim-rollout source land.
+
+extends: base.yaml
+
+run:
+  name: r3
+  steps: 120000
+  log_every: 20
+  ckpt_every: 1000
+
+data:
+  source: sim_rollouts
+  embodiments: [robotwin_aloha]
+  batch_per_gpu: 4                 # a group of 8 candidates per window
+  action_free: false
+
+optim:
+  lr: 5.0e-5                       # RL fine-tune, not pretraining
+  warmup: 2000
+  lr_scales:
+    estimator: 0.1                 # "light E/bank tune" (PLAN 7)
+    bank: 0.1                      # already the PLAN 4.D default; explicit here
+    q_delta: 0.0                   # q_Delta is not tuned in R3
+    q_action: 0.0
+    decoder: 0.0
+
+losses:
+  dyn:       {enabled: false, weight: 0.0}
+  act:       {enabled: false, weight: 0.0}
+  proposal:  {enabled: false, weight: 0.0}
+  balance:   {enabled: true,  weight: 3.0e-3}   # still needed: RL kills operators
+  potential: {enabled: true,  weight: 1.0}
+  grpo:      {enabled: true,  weight: 1.0, group: 8}
+
+train_modules: [estimator, bank, proposal, potential]
+
+fsdp:
+  replicate: [bank, q_delta, q_action, decoder, proposal, potential]
+
+slurm:
+  nodes: 4
+  gpus_per_node: 8
+  n_links: 20

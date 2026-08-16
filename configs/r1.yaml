@@ -1,0 +1,45 @@
+# R1 — Ego4D / Ego-Exo4D / HoloAssist. Action-free pretraining (PLAN 7).
+#
+# trains:    E, bank, q_Delta          (no q_a, no D_e, no pi_c — no actions exist)
+# losses:    dyn + balance
+# inference: none
+# GPUs:      64 = 8 nodes x 8      time: ~4 d
+#
+# 4 h cap: "~4 d" is 24 links of compute; budget 26.
+#     bash scripts/submit.sh r1 26
+#
+# This run establishes the coefficient space that R2 freezes onto. `delta_op` is
+# the only signal that it is working — with no action loss there is nothing else
+# holding `c` away from the degenerate A(c) ~ I solution. Watch it in the
+# HEARTBEAT line from the first hour.
+
+extends: base.yaml
+
+run:
+  name: r1
+  steps: 400000
+  log_every: 20
+  ckpt_every: 1000
+
+data:
+  source: egocentric               # ego4d + ego_exo4d + holoassist adapters
+  embodiments: [ego_human]         # registered by loom/data/adapters/ego4d.py
+  batch_per_gpu: 8
+  action_free: true                # NO action labels anywhere in R1
+
+optim:
+  lr: 3.0e-4
+  warmup: 2000
+
+losses:
+  dyn:      {enabled: true,  weight: 1.0, negatives: within_trajectory}
+  act:      {enabled: false, weight: 0.0}
+  proposal: {enabled: false, weight: 0.0}
+  balance:  {enabled: true,  weight: 3.0e-3}
+
+train_modules: [estimator, bank, q_delta]
+
+slurm:
+  nodes: 8
+  gpus_per_node: 8
+  n_links: 26

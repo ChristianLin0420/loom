@@ -1,0 +1,89 @@
+# LOOM — shared defaults. Every run config `extends: base.yaml` and overrides.
+#
+# Everything here is part of `config_hash`. The knobs that describe *one link* of
+# a chained run — --run_dir/--stop_at/--budget_s/--safety_s — are CLI-only and
+# land in cfg["link"], which config_hash excludes. Keep it that way: if --stop_at
+# leaked into the hash, every requeue would look like a different experiment, and
+# if it leaked into `run.steps` the LR curve would change with how long a job
+# happened to run.
+
+run:
+  name: base
+  project: loom
+  seed: 0
+  steps: 100000          # SCHEDULE HORIZON. Identical on every link of a chain.
+  log_every: 20
+  ckpt_every: 500
+  keep_last: 3
+  deterministic: false
+
+data:
+  source: stub           # Team A swaps this for `libero` / `robotwin` / ...
+  embodiments: [libero_franka]
+  batch_per_gpu: 8       # windows per GPU; one window is N_STATES=5 states
+  action_free: false     # true for R1 (Ego4D/Ego-Exo4D/HoloAssist)
+  cache_dir: cache/
+  # /dev/shm is 64 MiB on this cluster and DataLoader workers pass tensors
+  # through it. These are a REQUEST: LoomLoader calls fit_workers() and shrinks
+  # them (down to in-process) to whatever the queue can actually hold. Never
+  # hardcode a worker count that assumes a normal /dev/shm.
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: true
+
+model:
+  # true  -> never import a real module (what tests/test_train.py uses)
+  # auto  -> real module if importable, stubs.* otherwise (see loop.build_model)
+  # false -> a missing real module is a hard error. Flip this at Phase 2.
+  use_stubs: auto
+  estimator: {}
+  bank: {}
+  q_delta: {}
+  q_action: {}
+  decoder: {}
+  proposal: {}
+  potential: {}
+
+optim:
+  lr: 3.0e-4
+  bank_lr_mult: 0.1      # PLAN 4.D: bank at 10x LOWER LR than the estimator.
+                         # log_r/omega are poles; an estimator-sized step moves
+                         # one across half the unit disc.
+  betas: [0.9, 0.95]
+  weight_decay: 0.05
+  warmup: 2000           # PLAN 4.D
+  min_lr_ratio: 0.05
+  grad_clip: 1.0         # PLAN 4.D
+  ema_tau: 0.996         # contracts.EMA_TAU, the L_dyn target estimator
+
+losses:
+  # PLAN 9: never add a loss beyond these, plus potential + RL in R3.
+  dyn:       {enabled: true,  weight: 1.0, negatives: within_trajectory}
+  act:       {enabled: true,  weight: 1.0}
+  proposal:  {enabled: true,  weight: 1.0}
+  balance:   {enabled: true,  weight: 3.0e-3}   # contracts.BALANCE_COEF
+  potential: {enabled: false, weight: 1.0}      # R3 only
+  grpo:      {enabled: false, weight: 1.0, group: 8}   # R3 only
+
+# Modules whose parameters carry a gradient in this run. Anything absent is
+# requires_grad_(False) for the whole run.
+train_modules: [estimator, bank, q_delta, q_action, decoder, proposal]
+
+# R2 warm-up only. Freezing the bank WITHOUT the estimator is rejected at
+# construction: the operators would be fixed vectors in a drifting basis.
+freeze:
+  modules: []
+  until_frac: 0.0
+
+fsdp:
+  shard: [estimator, ema]        # full-shard: E is the only big module
+  replicate: [bank, q_delta, q_action, decoder, proposal, potential]
+  activation_checkpointing: true
+  block_names: [PerceiverBlock, EstimatorBlock, Block]   # Team B's block class
+  limit_all_gathers: true
+  forward_prefetch: true
+
+slurm:
+  nodes: 2
+  gpus_per_node: 8
+  n_links: 3

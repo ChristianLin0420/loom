@@ -1,0 +1,45 @@
+# R0-A — LIBERO, from scratch. THE FIRST SCORE (PLAN 4, PLAN 7).
+#
+# trains:    E, bank, q_Delta, q_a, D_e, pi_c
+# losses:    dyn + act + proposal + balance
+# inference: pi_c -> D_e   (no search in R0)
+# GPUs:      16 = 2 nodes x 8      time: ~8 h
+#
+# The 4 h walltime cap means "~8 h" is 2 full links of compute; budget 3 so a
+# preempted link does not truncate the run:
+#     bash scripts/submit.sh r0a 3
+#
+# Read the result correctly (PLAN 7): a low score proves something is broken, a
+# high score does not prove the method works. Under ~85 -> stop and debug;
+# check delta_op first, then the action-rate resampling in the eval harness.
+
+extends: base.yaml
+
+run:
+  name: r0a
+  steps: 60000           # schedule horizon; retune once it/s is measured on 16 GPUs
+  log_every: 20
+  ckpt_every: 500
+
+data:
+  source: libero
+  embodiments: [libero_franka]     # registered in contracts.py
+  batch_per_gpu: 8
+  action_free: false
+
+optim:
+  lr: 3.0e-4
+  warmup: 2000
+
+losses:
+  dyn:      {enabled: true, weight: 1.0, negatives: within_trajectory}
+  act:      {enabled: true, weight: 1.0}
+  proposal: {enabled: true, weight: 1.0}
+  balance:  {enabled: true, weight: 3.0e-3}
+
+train_modules: [estimator, bank, q_delta, q_action, decoder, proposal]
+
+slurm:
+  nodes: 2
+  gpus_per_node: 8
+  n_links: 3

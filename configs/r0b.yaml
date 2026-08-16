@@ -1,0 +1,48 @@
+# R0-B — RoboTwin 2.0 clean, from scratch. THE DECISION GATE (PLAN 7).
+#
+# trains:    E, bank, q_Delta, q_a, D_e, pi_c        (same as R0-A)
+# losses:    dyn + act + proposal + balance
+# inference: pi_c -> D_e
+# GPUs:      16 = 2 nodes x 8      time: ~1 d
+#
+# 4 h cap: "~1 d" is 6 links of compute; budget 7.
+#     bash scripts/submit.sh r0b 7
+#
+#   < 55    KILL. The operator formulation is not competitive as a policy class.
+#   55-75   proceed to R1/R2 (pi0 from scratch is 65.9 clean)
+#   >= 75   strong pass
+#
+# `robotwin_aloha` is registered by loom/data/adapters/robotwin.py at import
+# (Team A, Phase 1B). Until that lands this config raises at startup by design —
+# an unregistered embodiment means no dof, no action bounds and no head dispatch.
+
+extends: base.yaml
+
+run:
+  name: r0b
+  steps: 180000
+  log_every: 20
+  ckpt_every: 500
+
+data:
+  source: robotwin
+  embodiments: [robotwin_aloha]
+  batch_per_gpu: 8
+  action_free: false
+
+optim:
+  lr: 3.0e-4
+  warmup: 2000
+
+losses:
+  dyn:      {enabled: true, weight: 1.0, negatives: within_trajectory}
+  act:      {enabled: true, weight: 1.0}
+  proposal: {enabled: true, weight: 1.0}
+  balance:  {enabled: true, weight: 3.0e-3}
+
+train_modules: [estimator, bank, q_delta, q_action, decoder, proposal]
+
+slurm:
+  nodes: 2
+  gpus_per_node: 8
+  n_links: 7

@@ -1,0 +1,58 @@
+# R2 — OpenNeoData + AgiBot + RoboMIND + OXE, init from R1 (PLAN 7).
+#
+# trains:    E, bank, q_Delta + q_a, D_e, pi_c
+# losses:    dyn + act + proposal + balance
+# inference: pi_c -> D_e
+# GPUs:      64 = 8 nodes x 8      time: ~6 d
+#
+# 4 h cap: "~6 d" is 36 links of compute; budget 38.
+#     bash scripts/submit.sh r2 38
+#
+# WARM-UP — the whole point of this run (PLAN 7):
+#   freeze E *and* the bank together for the first 30% of steps, then unfreeze
+#   everything. Freezing the bank alone does not preserve the coefficient space:
+#   the operators would be fixed vectors in a drifting basis. With both frozen,
+#   q_a and D_e are forced into the coordinate system R1 established, and that is
+#   what lets us drop an explicit alignment loss.
+#   `freeze.modules: [bank]` alone is rejected at construction.
+#
+# Resume from R1 by pointing --run_dir at a fresh dir and seeding it with the R1
+# checkpoint; the config_hash differs, so the loop prints a loud warning rather
+# than pretending this is the same experiment.
+
+extends: base.yaml
+
+run:
+  name: r2
+  steps: 600000
+  log_every: 20
+  ckpt_every: 1000
+
+data:
+  source: mixed                    # openneo + agibot + robomind + oxe
+  # Embodiment-homogeneous BATCHES, mixed BETWEEN batches (PLAN 9). Each name is
+  # registered by its adapter at import.
+  embodiments: [openneo_g1, agibot_a2, robomind_franka, oxe_widowx]
+  batch_per_gpu: 8
+  action_free: false
+
+optim:
+  lr: 2.0e-4
+  warmup: 2000
+
+losses:
+  dyn:      {enabled: true, weight: 1.0, negatives: within_trajectory}
+  act:      {enabled: true, weight: 1.0}
+  proposal: {enabled: true, weight: 1.0}
+  balance:  {enabled: true, weight: 3.0e-3}
+
+train_modules: [estimator, bank, q_delta, q_action, decoder, proposal]
+
+freeze:
+  modules: [estimator, bank]       # BOTH, never the bank alone
+  until_frac: 0.3                  # 180000 of 600000 steps
+
+slurm:
+  nodes: 8
+  gpus_per_node: 8
+  n_links: 38
