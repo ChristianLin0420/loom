@@ -59,6 +59,31 @@ die()  { printf '\033[1;31m[fail ]\033[0m %s\n' "$*" >&2; exit 1; }
 stamped() { [ -f "$STAMP_DIR/$1" ]; }
 stamp()   { mkdir -p "$STAMP_DIR"; date -Is > "$STAMP_DIR/$1"; }
 
+# Recompile curobo's CUDA/C++ extensions in place. Must run where the built
+# objects will be *used* -- see the glibc note in the curobo stage.
+# Driven entirely by env vars so it can be shipped to a compute node with
+# `declare -f`.
+build_curobo_ext() {
+  set -e
+  echo "curobo-ext: host=$(hostname) glibc=$(ldd --version | head -1)"
+  local T="$ENV_PREFIX/targets/x86_64-linux"
+  export CUDA_HOME="$ENV_PREFIX" CUDA_PATH="$ENV_PREFIX"
+  export CPATH="$T/include:${CPATH:-}"
+  export LIBRARY_PATH="$T/lib:$T/lib/stubs:${LIBRARY_PATH:-}"
+  export LD_LIBRARY_PATH="$T/lib:${LD_LIBRARY_PATH:-}"
+  export TORCH_CUDA_ARCH_LIST="$CUDA_ARCH_LIST"
+  export PATH="$ENV_PREFIX/bin:$PATH"
+  cd "$CUROBO_DIR"
+  rm -f src/curobo/curobolib/*.so
+  "$ENV_PREFIX/bin/python" setup.py build_ext --inplace 2>&1 | tail -4
+  # `import torch` FIRST: the extensions link -lc10 -ltorch without an rpath
+  # into torch/lib, so they resolve only once torch has loaded those objects
+  # into the process. Importing them standalone gives a misleading
+  # "ImportError: libc10.so: cannot open shared object file".
+  "$ENV_PREFIX/bin/python" -c \
+    'import torch; from curobo.wrap.reacher.motion_gen import MotionGen; print("curobo-ext: MotionGen import OK")'
+}
+
 if [ "${1:-}" = "--list" ]; then echo "$ALL_STAGES"; exit 0; fi
 STAGES="${*:-$ALL_STAGES}"
 want() { case " $STAGES " in *" $1 "*) return 0;; *) return 1;; esac; }
@@ -215,7 +240,18 @@ if want curobo; then
           "$ROBOTWIN_DIR/envs/curobo" 2>&1 | tail -2
       fi
       log "curobo: building (TORCH_CUDA_ARCH_LIST=$CUDA_ARCH_LIST; ~20 min, no GPU needed)"
+      # conda-forge's CUDA packages put headers and libs under
+      # $PREFIX/targets/x86_64-linux/{include,lib}, NOT $PREFIX/{include,lib}.
+      # nvcc finds them relative to its own path, but the *host* gcc pass that
+      # compiles torch's C++ glue does not, and dies with
+      #   c10/cuda/CUDAStream.h:3:10: fatal error: cuda_runtime_api.h
+      # CPATH / LIBRARY_PATH are what plain gcc honours.
+      _tgt="$ENV_PREFIX/targets/x86_64-linux"
       CUDA_HOME="$ENV_PREFIX" \
+      CUDA_PATH="$ENV_PREFIX" \
+      CPATH="$_tgt/include:${CPATH:-}" \
+      LIBRARY_PATH="$_tgt/lib:$_tgt/lib/stubs:${LIBRARY_PATH:-}" \
+      LD_LIBRARY_PATH="$_tgt/lib:${LD_LIBRARY_PATH:-}" \
       TORCH_CUDA_ARCH_LIST="$CUDA_ARCH_LIST" \
       "$PIP" install --no-input -e "$ROBOTWIN_DIR/envs/curobo" --no-build-isolation \
         2>&1 | tee "$LOG_DIR/06-curobo.log" | tail -5
@@ -226,7 +262,33 @@ if want curobo; then
     # ...and re-pin numpy: a fresh scipy/scikit-image can drag in the 2.x ABI,
     # which breaks sapien and RoboTwin's native extensions at import.
     "$PIP" install --no-input "numpy==1.26.4" 2>&1 | tail -1
-    "$PY" -c 'import curobo; print("curobo", curobo.__version__)' || die "curobo: import failed"
+    # curobo falls back to torch's JIT `load()` when a prebuilt .so will not
+    # import; that path needs ninja.
+    "$PIP" install --no-input ninja 2>&1 | tail -1
+
+    # ---- glibc: the reason this is a TWO-PHASE build -------------------
+    # Login node  : Ubuntu 22.04, glibc 2.35
+    # Compute node: Ubuntu 20.04, glibc 2.31
+    # Extensions compiled against the login node's libc link GLIBC_2.32+ and
+    # die on every compute node with
+    #   ImportError: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.32'
+    #   not found (required by .../kinematics_fused_cu...so)
+    # Phase 1 (above, login node) resolves and installs the pure-python deps,
+    # which needs outbound network. Phase 2 recompiles the extensions on a
+    # compute node, which has none but has the right libc.
+    if [ -z "${SLURM_JOB_ID:-}" ]; then
+      log "curobo: recompiling extensions on a compute node (login glibc is too new)"
+      srun -A "${SLURM_ACCOUNT:-edgeai_tao-ptm_image-foundation-model-clip}" \
+           -p "${SLURM_PARTITIONS:-interactive_singlenode,polar4,polar3,batch_singlenode}" \
+           -t 01:00:00 --gpus-per-node=1 -N1 --job-name=curobo-build \
+           bash -c "$(declare -f build_curobo_ext); \
+                    ENV_PREFIX='$ENV_PREFIX' CUROBO_DIR='$ROBOTWIN_DIR/envs/curobo' \
+                    CUDA_ARCH_LIST='$CUDA_ARCH_LIST' build_curobo_ext" \
+        2>&1 | tee "$LOG_DIR/06-curobo-compute.log" | tail -8
+    else
+      ENV_PREFIX="$ENV_PREFIX" CUROBO_DIR="$ROBOTWIN_DIR/envs/curobo" \
+      CUDA_ARCH_LIST="$CUDA_ARCH_LIST" build_curobo_ext | tail -8
+    fi
     stamp curobo
   fi
 fi
@@ -355,13 +417,21 @@ for m in ["numpy", "torch", "sapien", "mplib", "gymnasium", "trimesh",
     except Exception as e:
         ok = False
         print(f"  {m:14s} FAILED: {type(e).__name__}: {e}")
+import torch
+have_gpu = torch.cuda.is_available()
 try:
-    import envs  # RoboTwin task package
-    from envs.hanging_mug import hanging_mug
+    from envs.hanging_mug import hanging_mug   # noqa: F401
     print("  envs.hanging_mug   import OK")
 except Exception as e:
-    ok = False
-    print(f"  envs               FAILED: {type(e).__name__}: {e}")
+    # curobo's motion_gen evaluates `Pose.from_list([...])` as a class-body
+    # default argument, which allocates a CUDA tensor AT IMPORT TIME. So
+    # `import envs.<task>` cannot succeed without a GPU -- not a broken env.
+    msg = f"{type(e).__name__}: {e}"
+    if not have_gpu:
+        print(f"  envs.hanging_mug   import needs a GPU (expected on the login node): {msg[:90]}")
+    else:
+        ok = False
+        print(f"  envs.hanging_mug   FAILED: {msg}")
 sys.exit(0 if ok else 1)
 PYEOF
   log "verify: OK"

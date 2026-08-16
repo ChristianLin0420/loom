@@ -104,22 +104,28 @@ def report_environment() -> None:
     print(f"  sapien            {sapien.__version__}")
 
     # SAPIEN enumerates physical devices through its own Vulkan loader. If the
-    # loader falls through to Mesa's lvp (llvmpipe) software ICD this still
-    # "works" -- on CPU, at ~1 fps, and not on the path we are benchmarking.
+    # loader falls through to Mesa's lvp (llvmpipe) SOFTWARE ICD everything
+    # still "works" -- on the CPU, at ~1 fps, producing plausible non-black
+    # frames that are not the GPU path this benchmark assumes. So assert that
+    # a hardware device is what SAPIEN actually picked.
+    import sapien.render as sr
+    summary = ""
     try:
-        import sapien.render as sr
-        devs = sr.get_devices() if hasattr(sr, "get_devices") else []
-        names = []
-        for d in devs:
-            nm = getattr(d, "name", str(d))
-            names.append(f"{nm}(render={getattr(d, 'can_render', '?')})")
-        if names:
-            print(f"  sapien devices    {', '.join(names)}")
-            check(any("llvmpipe" not in n.lower() and "software" not in n.lower()
-                      for n in names),
-                  "SAPIEN sees a hardware (non-llvmpipe) Vulkan device")
+        summary = str(sr.get_device_summary())
     except Exception as exc:
-        print(f"  sapien devices    unavailable ({type(exc).__name__}: {exc})")
+        summary = f"<unavailable: {type(exc).__name__}: {exc}>"
+    print("  sapien device summary:")
+    for line in summary.splitlines():
+        print(f"    {line}")
+    low = summary.lower()
+    check(not summary.startswith("<unavailable"),
+          "SAPIEN can enumerate Vulkan devices")
+    # get_device_summary() prints a table whose header mentions CUDA, so a
+    # substring match on 'cuda' proves nothing. llvmpipe/lavapipe appearing as
+    # the selected device does prove something, and so does the render
+    # throughput measured per task below.
+    check("llvmpipe" not in low and "lavapipe" not in low,
+          "SAPIEN did NOT fall through to the llvmpipe software rasteriser")
 
 
 # ---------------------------------------------------------------------------
@@ -207,13 +213,20 @@ class StepCounter:
         self.task = task
         self.steps = 0
         self.frames = 0
+        #: physx step index at which each demonstration frame was captured.
+        self.frame_at_step: list[int] = []
         self._real_scene = task.scene
         self._take_picture = task._take_picture
         self._patched_scene_attr = False
 
+        # Capture the ORIGINAL bound method before overwriting the attribute.
+        # `self._real_scene.step` would re-resolve to the wrapper we are about
+        # to install and recurse until RecursionError.
+        orig_step = task.scene.step
+
         def counted_step(*a, **k):
             self.steps += 1
-            return self._real_scene.step(*a, **k)
+            return orig_step(*a, **k)
 
         try:
             task.scene.step = counted_step          # works if dynamic attrs allowed
@@ -223,9 +236,23 @@ class StepCounter:
 
         def counted_picture(*a, **k):
             self.frames += 1
+            self.frame_at_step.append(self.steps)
             return self._take_picture(*a, **k)
 
         task._take_picture = counted_picture
+
+    def frame_gap(self) -> float:
+        """Median physx-step gap between consecutive recorded frames.
+
+        This -- not steps/frames -- is `save_freq`. RoboTwin also snaps one
+        frame immediately before and one immediately after each planned motion
+        segment, so a plain ratio is biased low by ~2 frames per `move()` call.
+        Taking the median over positive gaps discards those zero/short gaps.
+        """
+        import numpy as np
+        gaps = np.diff(np.asarray(self.frame_at_step, dtype=np.int64))
+        gaps = gaps[gaps > 0]
+        return float(np.median(gaps)) if gaps.size else float("nan")
 
     def restore(self):
         if self._patched_scene_attr:
@@ -403,8 +430,8 @@ def joint_limits(task, left_arm_dim: int, right_arm_dim: int):
 # ---------------------------------------------------------------------------
 # [6] control frequency, measured from the expert data-collection path
 # ---------------------------------------------------------------------------
-def measure_control_rate(robotwin_root: Path, task_name: str, task_config: str,
-                         seed: int) -> dict | None:
+def measure_control_rate(robotwin_root: Path, data_root: Path, task_name: str,
+                         task_config: str, seed: int) -> dict | None:
     """
     RoboTwin records a demonstration frame every `save_freq` physics steps, so
     the rate at which the released trajectories are authored is
@@ -425,34 +452,65 @@ def measure_control_rate(robotwin_root: Path, task_name: str, task_config: str,
     save_freq = args.get("save_freq")
     print(f"  task config save_freq   {save_freq}")
 
-    try:
-        task = build_task(task_name, args, seed=seed)
-    except Exception as exc:
-        check(False, "control-rate probe: env build", f"{type(exc).__name__}: {exc}")
+    # Not every seed yields a solvable scene -- RoboTwin's own collector
+    # searches for seeds whose expert succeeds and records them in seed.txt.
+    # Prefer those; they are the seeds the released demos were collected with.
+    seeds = [seed]
+    seed_file = (data_root / "data" / task_config / task_name /
+                 "aloha_agilex" / "seed.txt")
+    if seed_file.is_file():
+        known = [int(s) for s in seed_file.read_text().split()][:4]
+        seeds = known or seeds
+        print(f"  seeds from seed.txt     {seeds}")
+
+    task = counter = None
+    for s in seeds:
+        try:
+            task = build_task(task_name, args, seed=s)
+        except Exception as exc:
+            print(f"  seed {s}: build failed ({type(exc).__name__}: {exc})")
+            continue
+        counter = StepCounter(task)
+        try:
+            task.play_once()
+        except Exception as exc:
+            print(f"  seed {s}: expert raised {type(exc).__name__}: {exc}")
+        if task.plan_success and task.check_success():
+            print(f"  seed {s}: expert succeeded")
+            break
+        print(f"  seed {s}: expert did not reach success, trying next seed")
+        counter.restore()
+        with contextlib.suppress(Exception):
+            task.close_env()
+        task = counter = None
+
+    if task is None or counter is None:
+        check(False, "control-rate probe: expert episode",
+              f"no seed in {seeds} produced a runnable expert episode")
         return None
 
-    counter = StepCounter(task)
     dt = physics_timestep(task)
-    try:
-        task.play_once()
-    except Exception as exc:
-        print(f"  expert raised {type(exc).__name__}: {exc}")
-
     steps, frames = counter.steps, counter.frames
-    ratio = steps / max(frames - 1, 1)
-    env_fps_measured = 1.0 / (dt * ratio) if ratio else float("nan")
+    gap = counter.frame_gap()                 # median physx steps between frames
+    ratio = steps / max(frames - 1, 1)        # naive, biased low; shown for contrast
+    env_fps_measured = 1.0 / (dt * gap)
     env_fps_config = 1.0 / (dt * save_freq)
 
     print(f"  physics timestep        {dt:.6f} s  ({1 / dt:.1f} Hz)")
     print(f"  physx steps (expert)    {steps}")
     print(f"  recorded frames         {frames}")
-    print(f"  steps / frame           {ratio:.2f}")
-    print(f"  env_fps  measured       {env_fps_measured:.4f} Hz")
+    print(f"  median steps / frame    {gap:.1f}      <- this is save_freq")
+    print(f"  naive steps/frame       {ratio:.2f}     (biased low: 2 extra frames per move())")
+    print(f"  env_fps  MEASURED       {env_fps_measured:.4f} Hz  (= 1/({dt:.6f} * {gap:.0f}))")
     print(f"  env_fps  from save_freq {env_fps_config:.4f} Hz  (= 1/({dt:.6f} * {save_freq}))")
+    print(f"  HDF5 'frequency' field  {save_freq}  <- decimation factor, NOT Hz")
 
-    check(abs(ratio - save_freq) <= 1.0,
-          "measured steps/frame matches task-config save_freq",
-          f"{ratio:.2f} vs {save_freq}")
+    check(abs(gap - save_freq) < 0.5,
+          "measured median steps/frame equals task-config save_freq",
+          f"{gap:.1f} vs {save_freq}")
+    check(abs(env_fps_measured - 250.0 / 15.0) < 0.01,
+          "measured env_fps == 250/15 == 16.6667 Hz",
+          f"{env_fps_measured:.4f} Hz")
 
     # -- [5] success flag plumbing ------------------------------------------
     section(f"[5] success / termination plumbing ({task_name})")
@@ -480,10 +538,101 @@ def measure_control_rate(robotwin_root: Path, task_name: str, task_config: str,
     return {
         "physics_dt": dt,
         "save_freq": save_freq,
+        "median_steps_per_frame": gap,
         "steps_per_frame": ratio,
         "env_fps_measured": env_fps_measured,
         "env_fps_config": env_fps_config,
         "expert_success": succeeded,
+    }
+
+
+# ---------------------------------------------------------------------------
+# [7] end-to-end replay of a recorded demonstration through the eval path
+# ---------------------------------------------------------------------------
+def replay_demo(robotwin_root: Path, data_root: Path, task_name: str,
+                task_config: str, episode: int = 0) -> dict | None:
+    """
+    Drive the *policy* path with the recorded actions of one demonstration.
+
+    This is the strongest available check that the embodiment contract is
+    right: it reconstructs the exact scene from seed.txt, feeds
+    `/action/joint_states` -- 14 absolute joint targets per frame -- straight
+    into `take_action`, and asks whether `eval_success` latches. If dof, the
+    channel order, or the absolute-vs-delta reading were wrong, nothing would
+    succeed.
+
+    INFORMATIONAL, not a hard gate: replay is open-loop and RoboTwin re-plans
+    each step with TOPP rather than replaying the original dense trajectory,
+    so a miss is not by itself evidence of a broken environment.
+    """
+    import h5py
+    import numpy as np
+    from PIL import Image  # noqa: F401  (h5py stores JPEG bytes)
+
+    section(f"[7] recorded-demo replay through take_action ({task_name}, ep {episode})")
+    ep_dir = data_root / "data" / task_config / task_name / "aloha_agilex"
+    h5 = ep_dir / "data" / f"episode_{episode:07d}.hdf5"
+    seed_file = ep_dir / "seed.txt"
+    if not h5.is_file() or not seed_file.is_file():
+        print(f"  skipped: no demonstration at {h5}")
+        return None
+
+    seeds = [int(s) for s in seed_file.read_text().split()]
+    seed = seeds[episode]
+    with h5py.File(h5, "r") as f:
+        actions = np.asarray(f["/action/joint_states"][:], dtype=np.float64)
+        states = np.asarray(f["/state/joint_states"][:], dtype=np.float64)
+        instruction = f["/instruction"][()]
+        declared_freq = int(f["/additional_info/frequency"][()])
+    print(f"  seed                    {seed}   (seed.txt[{episode}])")
+    print(f"  instruction             {instruction!r}")
+    print(f"  actions                 {actions.shape}")
+    print(f"  HDF5 additional_info/frequency = {declared_freq}   "
+          f"(this is save_freq, NOT Hz -- see docs/ENV_ROBOTWIN.md §4)")
+
+    # The absolute-target claim, re-verified on this episode.
+    d_same = float(np.abs(actions[:-1] - states[1:]).max())
+    print(f"  max|action[t] - state[t+1]| = {d_same:.3e}   "
+          f"(0 => actions are absolute joint targets, not deltas)")
+    check(d_same < 1e-5,
+          "actions are ABSOLUTE joint targets (state[t+1] == action[t])",
+          f"max abs diff {d_same:.3e}")
+
+    args = load_task_args(robotwin_root, task_name, task_config)
+    try:
+        task = build_task(task_name, args, seed=seed, ep=episode)
+    except Exception as exc:
+        check(False, "replay: env build", f"{type(exc).__name__}: {exc}")
+        return None
+
+    counter = StepCounter(task)
+    t0 = time.time()
+    n = 0
+    for a in actions:
+        task.take_action(a, action_type="qpos")
+        n += 1
+        if task.eval_success or task.take_action_cnt >= (task.step_lim or 10 ** 9):
+            break
+    wall = time.time() - t0
+
+    print(f"  replayed                {n}/{len(actions)} actions in {wall:.1f}s "
+          f"({n / max(wall, 1e-9):.2f} action/s)")
+    print(f"  physx steps             {counter.steps}  "
+          f"({counter.steps / max(n, 1):.1f} per action)")
+    print(f"  eval_success            {task.eval_success}")
+    print(f"  check_success()         {task.check_success()}")
+    ok = bool(task.eval_success or task.check_success())
+    print(f"  \033[32mREPLAY REPRODUCED THE DEMONSTRATION\033[0m" if ok else
+          "  \033[33mreplay did not reach success (informational only -- open-loop "
+          "replay re-plans with TOPP and can drift)\033[0m")
+
+    counter.restore()
+    with contextlib.suppress(Exception):
+        task.close_env()
+    return {
+        "episode": episode, "seed": seed, "n_actions": int(n),
+        "eval_success": bool(task.eval_success), "replay_ok": ok,
+        "physx_steps_per_action": counter.steps / max(n, 1),
     }
 
 
@@ -501,6 +650,8 @@ def main() -> int:
     ap.add_argument("--rate-task", default="turn_switch",
                     help="task used for the expert-path control-rate measurement")
     ap.add_argument("--skip-rate", action="store_true")
+    ap.add_argument("--skip-replay", action="store_true")
+    ap.add_argument("--data-root", default=os.environ.get("ROBOTWIN_DATA", DEFAULT_DATA))
     ap.add_argument("--out", default=None, help="write a JSON summary here")
     a = ap.parse_args()
 
@@ -527,9 +678,15 @@ def main() -> int:
             summary["tasks"][task_name] = res
 
     if not a.skip_rate:
-        rate = measure_control_rate(root, a.rate_task, a.task_config, a.seed)
+        rate = measure_control_rate(root, Path(a.data_root), a.rate_task,
+                                    a.task_config, a.seed)
         if rate:
             summary["control_rate"] = rate
+
+    if not a.skip_replay:
+        rep = replay_demo(root, Path(a.data_root), a.rate_task, a.task_config)
+        if rep:
+            summary["replay"] = rep
 
     section("summary")
     dofs = {r["dof"] for r in summary["tasks"].values()}
@@ -542,7 +699,11 @@ def main() -> int:
     if "control_rate" in summary:
         cr = summary["control_rate"]
         print(f"  measured env_fps     {cr['env_fps_measured']:.4f} Hz  "
-              f"(physics {1 / cr['physics_dt']:.0f} Hz / {cr['steps_per_frame']:.1f})")
+              f"(physics {1 / cr['physics_dt']:.0f} Hz / {cr['median_steps_per_frame']:.0f})")
+    if "replay" in summary:
+        rp = summary["replay"]
+        print(f"  demo replay          seed={rp['seed']} actions={rp['n_actions']} "
+              f"-> eval_success={rp['eval_success']}")
 
     print(f"\n  {CHECKS - len(FAILURES)}/{CHECKS} checks passed")
     if FAILURES:
