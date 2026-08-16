@@ -1026,3 +1026,76 @@ def test_per_seed_rates_are_reported():
 def test_aggregate_on_no_episodes_is_not_a_crash():
     s = runner.aggregate([], tiny_protocol())
     assert s["avg"] == 0.0 and s["n_episodes"] == 0 and not s["complete"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CHECKPOINT PROVENANCE
+#
+#  `loom.train.ckpt.build_state` stores `payload["model"] =
+#  LoomModel.state_dict()`, which is FLAT and dotted. `state.get("estimator")`
+#  on that returns None, and the old loader treated that as "nothing to load"
+#  and scored randomly initialised weights with no error and no warning.
+#  Measured against runs/r0a_smoke/ckpt_000000030_rank0.pt: 929 flat keys, none
+#  of them reachable by name.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_submodule_state_reads_the_flat_training_layout():
+    """The layout `loom.train.ckpt` actually writes, including the `inner.` hop."""
+    flat = {
+        "estimator.latents": torch.zeros(2),
+        "estimator.blocks.0.w": torch.zeros(2),
+        "proposal.query": torch.zeros(2),
+        "decoder.inner.bodies.libero_franka.step_emb": torch.zeros(2),
+        "bank.log_r": torch.zeros(2),
+    }
+    est = pol.submodule_state(flat, "estimator")
+    assert set(est) == {"latents", "blocks.0.w"}, est
+    assert set(pol.submodule_state(flat, "proposal")) == {"query"}
+    # EmbodimentHeads wraps Team C's container; that level has to come off
+    assert set(pol.submodule_state(flat, "decoder")) == {"bodies.libero_franka.step_emb"}
+    assert pol.submodule_state(flat, "q_delta") is None
+
+
+def test_submodule_state_still_reads_a_nested_layout():
+    nested = {"estimator": {"latents": torch.zeros(2)}}
+    assert set(pol.submodule_state(nested, "estimator")) == {"latents"}
+
+
+def test_a_checkpoint_with_no_matching_weights_never_yields_a_scored_policy():
+    """Silence here is the one failure mode that cannot be seen in the number."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "wrong.pt"
+        torch.save({"model": {"totally.unrelated.key": torch.zeros(2)}}, p)
+        mods, err = pol._try_real_modules(str(p), "libero_franka", "cpu")
+        assert mods is None
+        assert err is not None and "estimator" in str(err)
+        with pytest.raises(RuntimeError):
+            pol.load_policy(str(p), allow_stub=False)
+
+
+def test_provenance_records_whether_stubs_ran():
+    prov = pol.policy_provenance(pol.load_policy(None))
+    assert prov["is_stub"] is True
+    assert "zeros_featurizer" in prov["featurizer"]
+    assert prov["resampler"] == "loom.data.canonical.to_env_rate"
+    assert prov["env_steps_per_segment"] == C.env_steps_per_segment(20.0)
+
+
+def test_results_json_records_the_policy_that_actually_ran(tmp_path):
+    out = tmp_path / "r.json"
+    runner.run_eval(tiny_protocol(), bench="libero", out=out, backend="fake")
+    meta = json.loads(out.read_text())["meta"]
+    assert "policy" in meta, "the results JSON must say which modules ran"
+    assert meta["policy"]["is_stub"] is True
+
+
+def test_a_named_checkpoint_never_degrades_to_stubs_by_default(tmp_path):
+    """`--ckpt` means it. The stub path is opt-in once a checkpoint is named."""
+    missing = tmp_path / "does_not_exist.pt"
+    with pytest.raises(RuntimeError):
+        pol.load_policy(str(missing))
+    # still explicitly available for anyone who wants it
+    p = pol.load_policy(str(missing), allow_stub=True)
+    assert p.modules.is_stub

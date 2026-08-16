@@ -402,6 +402,20 @@ class LiberoEnv:
     def step(self, action: np.ndarray) -> tuple[dict, float, bool, dict]:
         return self.env.step(np.asarray(action, dtype=np.float64))
 
+    def check_success(self) -> bool:
+        """The task's own goal predicate, straight from the BDDL problem.
+
+        `bddl_base_domain.step` already overwrites `done` with
+        `self._check_success()`, so `done` and this agree — but only as long as
+        nothing ever wraps the env in something that reports horizon exhaustion
+        as `done`. Exposing the predicate explicitly means `_episode_success`
+        reads the goal state rather than a termination flag, which is the
+        difference between "the policy failed" and "the detector never fires".
+        Verified live by replaying a ground-truth demo: see
+        `logs/eval_libero_probe.py --check success_replay`.
+        """
+        return bool(self.env.check_success())
+
     def close(self) -> None:
         try:
             self.env.close()

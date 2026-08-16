@@ -1195,7 +1195,7 @@ def test_freeze_schedule_is_step_based_not_wall_clock():
 # ═══════════════════════════════════════════════════════════════════════════
 
 GHOST_PARTITIONS = re.compile(r"batch_block[123]")
-REAL_PARTITIONS = "polar4,polar3,polar,grizzly,batch_singlenode"
+REAL_PARTITIONS = "polar4,polar3,polar,grizzly"
 ACCOUNT = "edgeai_tao-ptm_image-foundation-model-clip"
 
 
@@ -1206,6 +1206,33 @@ def test_sbatch_names_no_nonexistent_partition(stage):
     assert not GHOST_PARTITIONS.search(text), \
         f"{stage}.sbatch names a partition that does not exist"
     assert f"#SBATCH --partition={REAL_PARTITIONS}" in text
+
+
+@pytest.mark.parametrize("stage", STAGES)
+def test_multinode_sbatch_never_names_a_single_node_partition(stage):
+    """`batch_singlenode` carries QoS `..._1_node_per_job`: 8 GPUs, 1970G per job.
+
+    A partition list is NOT a fallback chain. sbatch validates the request
+    against it and rejects the whole submission with `QOSMaxMemoryPerJob`
+    rather than scheduling onto a partition that fits, so naming it alongside
+    polar4 failed all five stages at submit time -- every LOOM stage is
+    multi-node. This asserts the rule rather than a literal string, so it keeps
+    holding if the partition list is ever retuned.
+    """
+    text = (SLURM / f"{stage}.sbatch").read_text()
+    m = re.search(r"^#SBATCH --nodes=(\d+)", text, re.M)
+    assert m, f"{stage}.sbatch does not declare --nodes"
+    # The --partition directive only, never the whole file: these sbatch files
+    # carry a comment explaining why batch_singlenode must not be listed, and a
+    # substring search flags the very comment that documents the rule.
+    part = re.search(r"^#SBATCH --partition=(\S+)", text, re.M)
+    assert part, f"{stage}.sbatch does not declare --partition"
+    named = part.group(1).split(",")
+    if int(m.group(1)) > 1:
+        assert "batch_singlenode" not in named, (
+            f"{stage}.sbatch is --nodes={m.group(1)} but names batch_singlenode; "
+            "sbatch rejects the whole submission, it does not fall through"
+        )
 
 
 def test_no_file_in_this_workstream_names_a_nonexistent_partition():

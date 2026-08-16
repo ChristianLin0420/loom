@@ -323,16 +323,21 @@ _WORKER: dict[str, Any] = {}
 def _init_worker(device_queue, bench: str, ckpt: str | None,
                  backend: str | None, policy_kw: dict) -> None:
     """One policy per process, pinned to one device. Runs in the child."""
-    device = "cpu"
+    device = default_device()
     if device_queue is not None:
         try:
             dev = device_queue.get_nowait()
             if dev is not None:
                 os.environ["CUDA_VISIBLE_DEVICES"] = str(dev)
+                # EGL enumerates physical devices and does NOT honour
+                # CUDA_VISIBLE_DEVICES, so without this every worker renders on
+                # GPU 0 while its policy runs on GPU k. The run still completes;
+                # it just serialises the sim behind one device.
+                os.environ["MUJOCO_EGL_DEVICE_ID"] = str(dev)
                 device = "cuda:0"
         except Exception:                                # noqa: BLE001
             pass
-    from loom.eval.policy import make_policy             # noqa: PLC0415
+    from loom.eval.policy import make_policy, policy_provenance  # noqa: PLC0415
 
     mod = bench_module(bench)
     # once per worker process, before any env is built: headless render vars and
@@ -343,6 +348,10 @@ def _init_worker(device_queue, bench: str, ckpt: str | None,
     _WORKER["mod"] = mod
     _WORKER["policy"] = make_policy(ckpt, device=device, **(policy_kw or {}))
     _WORKER["backend"] = backend
+    # Carried out of the child on the first record only. Which modules actually
+    # ran is not recoverable from the score, and a silent stub fallback under
+    # `--ckpt` looks exactly like an untrained model.
+    _WORKER["provenance"] = policy_provenance(_WORKER["policy"])
 
 
 def _worker_run(item_dict: dict) -> dict:
@@ -356,6 +365,9 @@ def _worker_run(item_dict: dict) -> dict:
             episode=item.episode, seed=item.seed, env_seed=item.env_seed,
             error=traceback.format_exc(),
         )
+    prov = _WORKER.pop("provenance", None)
+    if prov is not None:
+        rec.extra["_policy"] = prov
     return rec.to_dict()
 
 
@@ -414,6 +426,7 @@ def run_eval(
             policy_factory() if policy_factory is not None
             else _default_policy(ckpt, policy_kw)
         )
+        store.meta["policy"] = _provenance(pol)
         for item in todo:
             rec = _run_item(item, pol, mod, env_factory, backend)
             store.add(rec)                               # atomic write per episode
@@ -424,10 +437,38 @@ def run_eval(
     return store.to_dict()
 
 
+def default_device() -> str:
+    """`cuda:0` when there is a GPU, else `cpu`. Never a silent CPU run."""
+    try:
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    except Exception:                                    # noqa: BLE001
+        return "cpu"
+
+
 def _default_policy(ckpt: str | None, policy_kw: dict | None) -> Any:
+    """The single-worker policy. **Must pick a device**, or it lands on CPU.
+
+    `_init_worker` sets `device=` for every parallel worker; this branch did
+    not, so `--workers 1` on an 8-GPU node built the 878 M tower and the
+    estimator on CPU and ran the whole evaluation there. Measured: 64 env steps
+    took 85-90 s on CPU against ~3 s on an A100, and nothing in the output said
+    so except `meta.policy.device`.
+    """
     from loom.eval.policy import make_policy             # noqa: PLC0415
 
-    return make_policy(ckpt, **(policy_kw or {}))
+    kw = dict(policy_kw or {})
+    kw.setdefault("device", default_device())
+    return make_policy(ckpt, **kw)
+
+
+def _provenance(pol: Any) -> dict[str, Any]:
+    """`policy_provenance`, but never a reason the run cannot start."""
+    try:
+        from loom.eval.policy import policy_provenance   # noqa: PLC0415
+
+        return policy_provenance(pol)
+    except Exception:                                    # noqa: BLE001
+        return {"policy": type(pol).__name__}
 
 
 def _mp_context():
@@ -466,6 +507,9 @@ def _run_parallel(todo, store, bench, ckpt, backend, policy_kw, n_workers, on_ep
         futures = [pool.submit(_worker_run, it.to_dict()) for it in todo]
         for fut in as_completed(futures):
             rec = EpisodeResult.from_dict(fut.result())
+            prov = rec.extra.pop("_policy", None)        # one per worker process
+            if prov is not None:
+                store.meta.setdefault("policy", prov)
             store.add(rec)                               # parent owns the file
             if on_episode is not None:
                 on_episode(rec)

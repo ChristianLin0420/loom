@@ -106,6 +106,8 @@ __all__ = [
     "default_featurizer",
     "zeros_featurizer",
     "feats_to",
+    "submodule_state",
+    "policy_provenance",
     "PLACEHOLDER_FEATURES",
 ]
 
@@ -144,8 +146,13 @@ class SegmentClock:
         n      = floor(accum)
         accum -= n
 
-    which keeps `|n_replans * steps_per_segment - n_steps_dispatched| < 1` for
-    the whole episode. This mirrors `stubs.StubPolicy` step for step, including
+    which keeps `|n_replans * steps_per_segment - n_steps_dispatched| <= 1` for
+    the whole episode. Measured over a full 512-step episode (96 segments) the
+    maximum is exactly 1.0: repeated addition of `float(16/3)` accumulates a
+    ~1e-13 deficit, so the 96th segment is still a 5 and the accumulator tips one
+    segment later. That is 50 ms of phase over 25.6 s, against the 32 steps
+    (1.6 s) that rounding each segment to 5 would cost. This mirrors
+    `stubs.StubPolicy` step for step, including
     its `max(n, 1)` floor: an env slower than `FPS_CANONICAL / H_OP` = 3.75 Hz
     would want less than one env step per operator, and there is no way to
     execute a fraction of a step, so the segment is truncated and the drift
@@ -186,7 +193,7 @@ class SegmentClock:
 
     @property
     def drift(self) -> float:
-        """`replans * steps_per_segment - dispatched`. Must stay in (-1, 1)."""
+        """`replans * steps_per_segment - dispatched`. Must stay in [-1, 1]."""
         return self.n_replans * self.steps_per_segment - self.n_steps_dispatched
 
 
@@ -433,7 +440,7 @@ def load_policy(
     *,
     embodiment: str = "libero_franka",
     device: str = "cpu",
-    allow_stub: bool = True,
+    allow_stub: bool | None = None,
     n_candidates: int = 16,
 ) -> LoomPolicy:
     """Build a `LoomPolicy` from a checkpoint, falling back to stubs.
@@ -442,11 +449,19 @@ def load_policy(
     That is what keeps `loom.eval` importable while Teams B/C/E are mid-flight,
     and what `tests/test_eval.py` enforces by reading the source.
 
-    `ckpt=None`, or a repo where the real modules do not import, yields a
-    stub-backed policy: the harness runs end to end and emits a correctly
-    shaped table with random success rates, which is the Phase 1A deliverable
-    (PLAN 4.F). Set `allow_stub=False` to make that an error instead.
+    `ckpt=None` yields a stub-backed policy: the harness runs end to end and
+    emits a correctly shaped table with random success rates, which is the
+    Phase 1A deliverable (PLAN 4.F).
+
+    **`allow_stub` defaults to `ckpt is None`.** If a checkpoint was named, a
+    failure to load it — bad path, missing tower, key layout the loader does not
+    understand — raises instead of quietly substituting zero features and stub
+    modules. That fallback scores ~0 and is indistinguishable from an untrained
+    model, which is precisely the confusion that would poison a real evaluation.
+    Pass `allow_stub=True` explicitly to opt back into it.
     """
+    if allow_stub is None:
+        allow_stub = ckpt is None
     spec = EMBODIMENTS[embodiment]
     modules, err = _try_real_modules(ckpt, embodiment, device)
 
@@ -459,6 +474,44 @@ def load_policy(
         modules.featurize = (zeros_featurizer(spec) if modules.is_stub
                              else default_featurizer(spec, device=device))
     return LoomPolicy(modules, n_candidates=n_candidates)
+
+
+def submodule_state(state: Any, name: str) -> dict[str, Tensor] | None:
+    """One submodule's `state_dict` out of a training checkpoint. Both layouts.
+
+    `loom.train.ckpt.build_state` stores ``payload["model"] =
+    LoomModel.state_dict()``, which is **flat and dotted** —
+    ``estimator.latents``, ``proposal.query``,
+    ``decoder.inner.bodies.libero_franka.step_emb`` — not a dict of per-module
+    state dicts. `state.get("estimator")` on that returns `None`.
+
+    That is the bug this function exists to close, and it is the worst kind:
+    eval built `Estimator()`, loaded nothing into it, and evaluated **randomly
+    initialised weights** with no error, no warning and a plausible-looking
+    near-zero score. Verified against `runs/r0a_smoke/ckpt_000000030_rank0.pt`:
+    929 flat keys, zero of which `state.get(name)` reaches.
+
+    The ``inner.`` hop is `loom.train.loop.EmbodimentHeads`, which wraps Team
+    C's per-embodiment container (`q_action`, `decoder`) so the loop can write
+    ``heads[embodiment]``. Eval instantiates the container directly, so that
+    level has to come off.
+
+    Returns `None` when the name is absent entirely — the caller raises rather
+    than proceeding with random weights.
+    """
+    if not isinstance(state, dict):
+        return None
+    sub = state.get(name)
+    if isinstance(sub, dict) and sub:
+        return sub                                       # nested layout
+    prefix = name + "."
+    flat = {k[len(prefix):]: v for k, v in state.items()
+            if isinstance(k, str) and k.startswith(prefix)}
+    if not flat:
+        return None
+    if all(k.startswith("inner.") for k in flat):         # EmbodimentHeads
+        flat = {k[len("inner."):]: v for k, v in flat.items()}
+    return flat
 
 
 def _try_real_modules(
@@ -478,12 +531,34 @@ def _try_real_modules(
         payload = torch.load(ckpt, map_location="cpu", weights_only=False)
         state = payload.get("model", payload) if isinstance(payload, dict) else payload
 
-        estimator, proposal, decoder = Estimator(), Proposal(), Decoder()
+        # Only the body under evaluation. Building every registered embodiment
+        # would make a body the checkpoint has never seen look like a *missing*
+        # key, and the missing-key check below is the whole guard.
+        estimator = Estimator(embodiments=[embodiment])
+        proposal = Proposal()
+        decoder = Decoder(embodiments=[embodiment], default_embodiment=embodiment)
+
+        loaded: dict[str, Any] = {}
         for name, mod in (("estimator", estimator), ("proposal", proposal),
                           ("decoder", decoder)):
-            sd = state.get(name) if isinstance(state, dict) else None
-            if sd is not None:
-                mod.load_state_dict(sd, strict=False)
+            sd = submodule_state(state, name)
+            if sd is None:
+                raise KeyError(
+                    f"{ckpt} has no weights for {name!r}. Keys look like "
+                    f"{sorted(state)[:4] if isinstance(state, dict) else type(state)}. "
+                    f"Refusing to evaluate a randomly initialised {name}."
+                )
+            incompatible = mod.load_state_dict(sd, strict=False)
+            missing = list(getattr(incompatible, "missing_keys", []) or [])
+            unexpected = list(getattr(incompatible, "unexpected_keys", []) or [])
+            if missing:
+                raise RuntimeError(
+                    f"{ckpt}: {len(missing)} parameters of {name} are not in the "
+                    f"checkpoint (e.g. {missing[:3]}). A partly-loaded module is a "
+                    f"partly-random module; refusing to score it."
+                )
+            loaded[name] = {"tensors_loaded": len(sd) - len(unexpected),
+                            "unexpected": len(unexpected)}
             mod.eval().to(device)
 
         # The frozen tower is part of "real modules": if the checkpoint loaded
@@ -500,7 +575,11 @@ def _try_real_modules(
             device=device,
             is_stub=False,
             meta={"ckpt": str(ckpt), "tower": TOWER_MODEL_ID,
-                  "tower_image_size": IMAGE_SIZE},
+                  "tower_image_size": IMAGE_SIZE,
+                  "featurizer": "loom.data.tower.obs_featurizer",
+                  "ckpt_global_step": (payload.get("global_step")
+                                       if isinstance(payload, dict) else None),
+                  "state_dict": loaded},
         ), None
     except Exception as e:                               # noqa: BLE001 — degrade, never crash eval
         return None, e
@@ -527,10 +606,37 @@ def _stub_modules(embodiment: str, device: str, reason: str = "") -> PolicyModul
         embodiment=embodiment,
         device=device,
         is_stub=True,
-        meta={"stub_reason": reason},
+        meta={"stub_reason": reason,
+              "featurizer": "loom.eval.policy.zeros_featurizer (ZEROS, not the tower)"},
     )
 
 
 def make_policy(ckpt: str | None = None, **kw: Any) -> LoomPolicy:
     """Alias used by `runner.py` and the CLI, so the seam has one name."""
     return load_policy(ckpt, **kw)
+
+
+def policy_provenance(policy: Any) -> dict[str, Any]:
+    """What actually ran, for the results JSON. Never inferred from the score.
+
+    `is_stub` is the field that matters: a run that asked for `--ckpt` and got
+    stubs (bad path, missing tower, unreadable checkpoint) scores ~0 and is
+    indistinguishable from an untrained model unless this is written down.
+    """
+    m = getattr(policy, "modules", None)
+    if m is None:
+        return {"is_stub": None, "policy": type(policy).__name__}
+    out: dict[str, Any] = {
+        "policy": type(policy).__name__,
+        "is_stub": bool(m.is_stub),
+        "embodiment": m.embodiment,
+        "device": str(m.device),
+        "env_fps": getattr(policy, "env_fps", None),
+        "env_steps_per_segment": getattr(getattr(policy, "clock", None),
+                                         "steps_per_segment", None),
+        "h_op": H_OP,
+        "fps_canonical": FPS_CANONICAL,
+        "resampler": f"{to_env_rate.__module__}.{to_env_rate.__name__}",
+    }
+    out.update(m.meta or {})
+    return out

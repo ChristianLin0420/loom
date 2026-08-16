@@ -47,6 +47,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="default: real env when importable, fake otherwise")
     r.add_argument("--no-resume", action="store_true",
                    help="ignore an existing --out instead of continuing it")
+    r.add_argument("--require-real", action="store_true",
+                   help="fail instead of falling back to stub modules / zero "
+                        "features. Already implied by --ckpt; set this to also "
+                        "refuse the stub path when no checkpoint is given.")
     r.add_argument("--row-label", default="**LOOM · R0-A**",
                    help="which PLAN 8 LOOM row these numbers fill")
     r.add_argument("--quiet", action="store_true")
@@ -94,8 +98,15 @@ def main(argv: list[str] | None = None) -> int:
         workers=args.workers,
         resume=not args.no_resume,
         backend=args.backend,
+        policy_kw={"allow_stub": False} if args.require_real else None,
         on_episode=tick,
     )
+
+    if not args.quiet:
+        prov = results.get("meta", {}).get("policy") or {}
+        print(f"[loom.eval] policy: is_stub={prov.get('is_stub')} "
+              f"featurizer={prov.get('featurizer')} "
+              f"ckpt_step={prov.get('ckpt_global_step')}", file=sys.stderr)
 
     md = render_report(results, row_label=args.row_label)
     if args.md:
