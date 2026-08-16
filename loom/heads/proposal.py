@@ -259,7 +259,29 @@ class Proposal(nn.Module):
         x = self.query.unsqueeze(0).expand(b, -1, -1).to(ctx.dtype)
         for blk in self.blocks:
             x = blk(x, ctx)
-        return self.readout(self.ln_out(x)).squeeze(-1)          # (B, m)
+        h = self.ln_out(x)
+        # Plackett-Luce is EXACTLY invariant to a constant added to every logit
+        # (`l_i - logsumexp` cancels it), so the operator-axis mean is an
+        # unregularised null direction of L_proposal: no gradient, and
+        # `readout.bias` is in `schedule._NO_DECAY`, so nothing pulls it back.
+        # It random-walks, and under autocast(bf16) that is fatal -- ulp is
+        # magnitude-proportional, 2**(floor(log2|x|)-7): 0.25 at |x|=59, 16 at
+        # 2656. R0-A measured the common mode drifting -58.9 (step 2000) ->
+        # +2656 (step 6000) while the operator spread decayed 0.410 -> 0.000,
+        # leaving ONE distinct logit value across all 128 operators. The loss
+        # was then exactly sum(log(128 - i)) = 19.360813 on 646 of 748
+        # consecutive steps, and `argmax` degenerated to an index tie-break
+        # picking operators {0,1,2,3} at 0.25 every replan. It is also
+        # self-sealing: once constant, the loss no longer depends on the
+        # weights at all, so nothing rewards spread while weight_decay keeps
+        # shrinking it -- the head un-learns from a working 6.76.
+        #
+        # Project the null direction out HERE, in fp32, BEFORE the readout
+        # rounds to bf16. Centring after the readout does not work: measured
+        # 2.95 distinct values per row, because the rounding already happened.
+        h = h - h.mean(dim=1, keepdim=True)
+        lg = self.readout(h).squeeze(-1)                          # (B, m)
+        return lg - lg.mean(-1, keepdim=True)
 
     # ── contracts.Proposal ────────────────────────────────────────────────
 
