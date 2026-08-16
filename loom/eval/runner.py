@@ -304,6 +304,12 @@ def _run_item(
         record=rec,
     )
     rec.wall_s = time.time() - t0
+    if rec.error is not None:
+        # The overwhelmingly likely cause of a failure at reset is a missing
+        # torch.load shim (torch >= 2.6 refuses LIBERO's .pruned_init files), so
+        # carry the runtime status alongside the traceback rather than making
+        # someone reconstruct it from a run of 1200 identical failures.
+        rec.extra["runtime_status"] = getattr(mod, "LIBERO_RUNTIME_STATUS", None)
     return rec
 
 
@@ -328,7 +334,13 @@ def _init_worker(device_queue, bench: str, ckpt: str | None,
             pass
     from loom.eval.policy import make_policy             # noqa: PLC0415
 
-    _WORKER["mod"] = bench_module(bench)
+    mod = bench_module(bench)
+    # once per worker process, before any env is built: headless render vars and
+    # the torch.load shim LIBERO's init states need
+    setup = getattr(mod, "ensure_libero_runtime", None)
+    if callable(setup) and backend != "fake":
+        setup()
+    _WORKER["mod"] = mod
     _WORKER["policy"] = make_policy(ckpt, device=device, **(policy_kw or {}))
     _WORKER["backend"] = backend
 

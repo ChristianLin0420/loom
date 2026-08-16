@@ -49,6 +49,8 @@ from loom.data.adapters.libero import orient_env_image
 __all__ = [
     "SUITES", "SUITE_ALIASES", "N_TASKS", "MAX_STEPS_BY_SUITE",
     "SETTLE_STEPS", "DUMMY_ACTION", "LIBERO_ENV_IMAGE_CONVENTION",
+    "LIBERO_PYTHON", "MEASURED_CONTROL_FREQ",
+    "patch_torch_load_for_init_states", "ensure_libero_runtime",
     "libero_available", "make_env", "FakeLiberoEnv",
     "orient_env_image", "quat2axisangle", "extract_obs",
     "task_name", "task_instruction", "n_tasks",
@@ -59,29 +61,50 @@ __all__ = [
 # ═══════════════════════════════════════════════════════════════════════════
 #  INSTALLATION CONSTANTS
 #
-#  Every path the real LIBERO run needs, in ONE block, all overridable from the
-#  environment. Nothing here is guessed: the values below are what Team G is
-#  provisioning. Nothing in this module reads a path outside this block.
+#  Every path and version the real LIBERO run needs, in ONE block, all
+#  overridable from the environment. Nothing here is guessed — every value is
+#  measured by Team G's `scripts/smoke_libero.py`, which is green on an A100 for
+#  all four suites. Nothing in this module reads a path outside this block.
 # ═══════════════════════════════════════════════════════════════════════════
 
 #: Dataset root: <root>/{libero_spatial,libero_object,libero_goal,libero_10}/
+#: 10 tasks x 50 demos per suite. bddl files and .pruned_init states (10 + 10
+#: per suite, 50 init states per task across all 40 tasks) ship in-repo, so
+#: `trial_id % n_trials` below indexes against 50.
 LOOM_DATA_ROOT = os.environ.get(
     "LOOM_DATA_ROOT",
     "/lustre/fsw/portfolios/edgeai/users/chrislin/datasets/loom/libero",
 )
 
 #: Separate interpreter for the real env. Eval does NOT run in the training venv.
-LIBERO_CONDA_ENV = os.environ.get(
-    "LOOM_LIBERO_ENV",
-    "/lustre/fsw/portfolios/edgeai/users/chrislin/envs/loom-libero",
+#: python 3.10.20, mujoco 2.3.2 (HARD PIN), robosuite 1.4.1, numpy 1.26.4,
+#: torch 2.6.0+cu124, gym 0.25.2.
+LIBERO_PYTHON = os.environ.get(
+    "LOOM_LIBERO_PYTHON",
+    "/lustre/fsw/portfolios/edgeai/users/chrislin/envs/loom-libero/bin/python",
 )
+LIBERO_CONDA_ENV = os.path.dirname(os.path.dirname(LIBERO_PYTHON))
 
 #: Headless rendering on a compute node. Applied by `apply_headless_env()`.
+#: EGL only: `osmesa` is not available as a fallback, and the whole LIBERO stack
+#: is unimportable on the login node — even a physics-only check must go through
+#: `srun` on a GPU node.
 HEADLESS_ENV = {
     "MUJOCO_GL": os.environ.get("MUJOCO_GL", "egl"),
     "PYOPENGL_PLATFORM": os.environ.get("PYOPENGL_PLATFORM", "egl"),
     "MUJOCO_EGL_DEVICE_ID": os.environ.get("MUJOCO_EGL_DEVICE_ID", "0"),
 }
+
+#: Measured: control_timestep 0.05 s / model_timestep 0.002 s -> exactly 20.0 Hz,
+#: confirming the frozen `contracts.EMBODIMENTS["libero_franka"].env_fps`. The
+#: whole fractional-accumulator path depends on this number.
+MEASURED_CONTROL_FREQ = 20.0
+
+#: Measured throughput, for shard sizing: 36-55 env steps/s per process, i.e.
+#: ~10-15 s per 512-step episode. The default protocol is 1200 episodes ~= 4-5
+#: GPU-hours single-process, which does NOT fit the 4 h walltime cap alone;
+#: sharded across 8 GPUs it is ~30-40 min. See `runner.run_eval(workers=...)`.
+EPISODE_SECONDS = (10.0, 15.0)
 
 #: bddl files and init states resolve through `libero.libero.get_libero_path`,
 #: which reads ~/.libero/config.yaml. Set these only to override that.
@@ -103,6 +126,53 @@ def apply_headless_env() -> None:
     """Set the offscreen-render variables. Call before importing `libero`."""
     for k, v in HEADLESS_ENV.items():
         os.environ.setdefault(k, v)
+
+
+def patch_torch_load_for_init_states() -> str:
+    """LIBERO reads `.pruned_init` files with a bare `torch.load(path)`.
+
+    torch >= 2.6 flipped that call's default to `weights_only=True`, which
+    refuses to unpickle the plain-python payload in those files. The symptom is
+    an `UnpicklingError: Weights only load failed` the first time you ask for an
+    init state — i.e. **every evaluation episode fails at reset and you never
+    get a single score.**
+
+    Copied verbatim from `scripts/smoke_libero.py` (Team G), which is the only
+    place this has been verified against the real files. Returns a short status
+    string, which `runner` records in the results JSON so that a run which died
+    at reset says why.
+    """
+    import torch                                        # noqa: PLC0415
+
+    major_minor = tuple(int(x) for x in torch.__version__.split(".")[:2])
+    if major_minor < (2, 6):
+        return f"torch {torch.__version__}: no shim needed"
+    _orig_load = torch.load
+
+    def _load(*a, **kw):
+        kw.setdefault("weights_only", False)
+        return _orig_load(*a, **kw)
+
+    torch.load = _load
+    return f"torch {torch.__version__}: torch.load patched to weights_only=False"
+
+
+#: Status of the one-time runtime setup, reported into the results JSON.
+LIBERO_RUNTIME_STATUS: str | None = None
+
+
+def ensure_libero_runtime() -> str:
+    """Idempotent, once per process, before anything touches the real env.
+
+    Deliberately NOT done at import: `torch.load` is process-global state and
+    `loom.eval` is imported by the training venv too. It runs only when a real
+    LIBERO env or task suite is actually constructed.
+    """
+    global LIBERO_RUNTIME_STATUS
+    if LIBERO_RUNTIME_STATUS is None:
+        apply_headless_env()
+        LIBERO_RUNTIME_STATUS = patch_torch_load_for_init_states()
+    return LIBERO_RUNTIME_STATUS
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -252,6 +322,9 @@ _SUITE_CACHE: dict[str, Any] = {}
 def _task_suite(suite: str) -> Any:
     name = benchmark_name(suite)
     if name not in _SUITE_CACHE:
+        # `get_task_init_states` calls a bare torch.load; without the shim every
+        # episode dies at reset.
+        ensure_libero_runtime()
         import libero.libero.benchmark as benchmark      # noqa: PLC0415  (lazy by design)
 
         _SUITE_CACHE[name] = benchmark.get_benchmark(name)()
@@ -300,7 +373,9 @@ class LiberoEnv:
     def __init__(self, suite: str, task_id: int, seed: int, *,
                  trial_id: int = 0, image_size: int = IMAGE_SIZE,
                  **_ignored: Any) -> None:
-        apply_headless_env()
+        # headless render vars + the torch.load shim, before anything imports
+        # libero or asks for an init state
+        ensure_libero_runtime()
         from libero.libero import get_libero_path        # noqa: PLC0415  (lazy by design)
         from libero.libero.envs import OffScreenRenderEnv  # noqa: PLC0415
 

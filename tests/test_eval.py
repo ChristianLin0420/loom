@@ -851,6 +851,68 @@ def test_quat2axisangle_matches_the_reference():
     assert np.allclose(libero.quat2axisangle(q), [0.5, 0.0, 0.0], atol=1e-6)
 
 
+def test_torch_load_shim_unblocks_libero_init_states(tmp_path):
+    """Without this, every episode dies at reset and there is no score at all.
+
+    LIBERO reads `.pruned_init` with a bare `torch.load(path)`; torch >= 2.6
+    defaults that to `weights_only=True` and refuses the plain-python payload.
+    """
+    payload = {"states": np.zeros((50, 71)), "meta": {"note": "plain python"}}
+    p = tmp_path / "task.pruned_init"
+    torch.save(payload, p)
+
+    orig = torch.load
+    try:
+        # the bare call LIBERO makes, unpatched
+        with pytest.raises(Exception) as e:
+            orig(p)
+        assert "weights_only" in str(e.value).lower() or "unpickl" in str(e.value).lower()
+
+        status = libero.patch_torch_load_for_init_states()
+        assert "weights_only=False" in status
+        loaded = torch.load(p)                    # same bare call, now fine
+        assert loaded["meta"]["note"] == "plain python"
+    finally:
+        torch.load = orig
+
+
+def test_runtime_setup_is_idempotent_and_not_applied_at_import():
+    """`torch.load` is process-global; eval is imported by the training venv too."""
+    src = (EVAL_DIR / "libero.py").read_text()
+    tree = ast.parse(src)
+    for node in ast.iter_child_nodes(tree):
+        assert not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call), (
+            "libero.py calls something at import time; the torch.load patch must "
+            "only happen when a real env is actually constructed"
+        )
+    orig = torch.load
+    try:
+        first = libero.ensure_libero_runtime()
+        assert libero.ensure_libero_runtime() is first, "shim applied twice"
+        assert libero.LIBERO_RUNTIME_STATUS == first
+    finally:
+        torch.load = orig
+        libero.LIBERO_RUNTIME_STATUS = None
+
+
+def test_verified_environment_facts_are_pinned():
+    """Measured by Team G's smoke test on an A100; green for all four suites."""
+    assert libero.MEASURED_CONTROL_FREQ == C.EMBODIMENTS["libero_franka"].env_fps == 20.0
+    assert libero.LIBERO_ENV_IMAGE_CONVENTION == "opengl"    # 8/8 vote identity
+    assert libero.HEADLESS_ENV["MUJOCO_GL"] == "egl"         # no osmesa fallback
+    assert libero.SETTLE_STEPS == 15
+    assert libero.LIBERO_PYTHON.endswith("/loom-libero/bin/python")
+    assert all(v == 512 for v in libero.MAX_STEPS_BY_SUITE.values())
+
+
+def test_default_protocol_fits_the_walltime_cap_when_sharded():
+    """1200 episodes at 10-15 s each is 4-5 GPU-hours; the cap is 4 h per link."""
+    lo, hi = libero.EPISODE_SECONDS
+    serial_h = libero.DEFAULT_PROTOCOL.total_episodes * hi / 3600.0
+    assert 4.0 <= serial_h <= 5.0, f"{serial_h:.1f} GPU-hours single-process"
+    assert serial_h / 8 < 4.0, "must fit the 4 h walltime cap on one 8-GPU node"
+
+
 def test_suite_names_and_aliases():
     assert libero.SUITES == E.DEFAULT_LIBERO_SUITES
     assert libero.benchmark_name("libero_long") == "libero_10"
