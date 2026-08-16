@@ -53,9 +53,21 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/pip install --index-url https://download.pytorch.org/whl/cu124 "torch==2.6.0"
 ```
 
-- SLURM account is `edgeai_tao-ptm_image-foundation-model-clip`. Partitions
+- SLURM account is `edgeai_tao-ptm_image-foundation-model-clip` — **not** `edgeai`,
+  which fails with "Invalid account or account/partition combination". Partitions
   `batch_block1/2/3` **do not exist**; the real 4 h list is
-  `polar4,polar3,polar,grizzly,batch_singlenode`. QoS: `free,normal`.
+  `polar4,polar3,polar,grizzly`. QoS: `free,normal`.
+- **Never list `batch_singlenode` on a `--nodes>1` job.** It carries QoS
+  `128_nodes_per_user_1_node_per_job` (8 GPUs, 1970G per job). A partition list is
+  *not* a fallback chain: sbatch validates the request against it and rejects the
+  whole submission with `QOSMaxMemoryPerJob` rather than scheduling onto polar4.
+  Every LOOM stage is multi-node, so this failed all five at submit time.
+  `polar4/polar3/polar/grizzly` all carry `..._128_nodes_per_job`.
+- Non-secret paths (`LOOM_DATA_ROOT`, `LOOM_CACHE_DIR`, `HF_HOME`, `TRITON_CACHE_DIR`)
+  live in `scripts/env.sh`, sourced by **both** the sbatch and `logs/*_smoke.sh`. They
+  were once duplicated in the smoke only, so a green 1-GPU smoke was followed by a
+  16-GPU link that died at init on a missing cache. A gate that runs in a different
+  environment than the thing it gates is not a gate.
 - Hard **4 h** walltime cap on every partition, 8×A100-80GB per node. An "8 h" run in
   PLAN §7 means ≥2 chained links; "6 d" means ~40.
 - **No container, no enroot, no `module load`.** A plain `.venv` activated in the sbatch.
