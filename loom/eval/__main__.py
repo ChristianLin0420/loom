@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 from loom.eval import EvalProtocol
-from loom.eval.runner import bench_module, n_devices, run_eval
+from loom.eval.runner import bench_module, git_sha, n_devices, run_eval
 from loom.eval.table import render_report
 
 #: Which PLAN 8 row the numbers fill. `--row-label` overrides; when it is left
@@ -109,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[loom.eval] {protocol.bench}: {protocol.describe()}", file=sys.stderr)
         print(f"[loom.eval] workers={args.workers or n_devices()} "
               f"out={args.out}", file=sys.stderr)
+        print(f"[loom.eval] git_sha={git_sha()}", file=sys.stderr)
 
     policy_kw: dict = {}
     if args.embodiment:

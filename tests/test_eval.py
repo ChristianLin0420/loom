@@ -1253,6 +1253,21 @@ def test_results_json_records_the_policy_that_actually_ran(tmp_path):
     assert meta["policy"]["is_stub"] is True
 
 
+def test_results_json_records_the_commit_that_scored_it(tmp_path):
+    """Two evaluations of one checkpoint have already disagreed (6.3 vs 5.1)
+    with nothing in either file to attribute it to; it had to be reconstructed
+    from job windows and file mtimes. The commit goes in the results.
+    """
+    out = tmp_path / "r.json"
+    runner.run_eval(tiny_protocol(), bench="libero", out=out, backend="fake")
+    meta = json.loads(out.read_text())["meta"]
+    assert "git_sha" in meta and meta["git_sha"]
+    # 40 hex, optionally "-dirty"; "unknown" only outside a checkout
+    sha = meta["git_sha"].removesuffix("-dirty")
+    assert sha == "unknown" or (len(sha) == 40 and all(c in "0123456789abcdef" for c in sha))
+    assert "slurm_job_id" in meta and "hostname" in meta
+
+
 def test_a_named_checkpoint_never_degrades_to_stubs_by_default(tmp_path):
     """`--ckpt` means it. The stub path is opt-in once a checkpoint is named."""
     missing = tmp_path / "does_not_exist.pt"

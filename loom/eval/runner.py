@@ -39,10 +39,53 @@ from loom.eval import EpisodeResult, EvalProtocol, episode_seed
 __all__ = [
     "WorkItem", "iter_work", "shard", "n_devices", "seed_fn_for",
     "ResultStore", "aggregate", "run_eval", "bench_module", "ensure_runtime",
-    "claim_device",
+    "claim_device", "git_sha", "code_provenance",
 ]
 
 RESULTS_VERSION = 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CODE PROVENANCE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def git_sha() -> str:
+    """The commit this evaluation ran at, or `"unknown"`. Never raises.
+
+    Deliberately a local copy rather than an import of `loom.train.ckpt.git_sha`:
+    `loom.eval` must stay importable in the py3.10 LIBERO interpreter, which has
+    no training stack (see the `policy.py` import-discipline note).
+    """
+    import subprocess                                    # noqa: PLC0415
+
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL,
+            cwd=str(Path(__file__).resolve().parents[2]), timeout=30,
+        ).decode().strip()
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            stderr=subprocess.DEVNULL,
+            cwd=str(Path(__file__).resolve().parents[2]), timeout=30,
+        ).decode().strip()
+        return f"{sha}-dirty" if dirty else sha
+    except Exception:                                    # noqa: BLE001
+        return "unknown"
+
+
+def code_provenance() -> dict[str, Any]:
+    """Which code, in which job, produced these numbers.
+
+    Two evaluations of the same checkpoint have already disagreed (6.3 vs 5.1)
+    with nothing in either results file to attribute the difference to; it had to
+    be reconstructed from job windows and file mtimes. The commit and the SLURM
+    job id cost nothing and make that a lookup.
+    """
+    return {
+        "git_sha": git_sha(),
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "hostname": os.environ.get("SLURMD_NODENAME") or os.uname().nodename,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -505,6 +548,10 @@ def run_eval(
         "env_available": env_available(mod),
         "libero_available": bool(getattr(mod, "libero_available", lambda: False)()),
         "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        # Which commit scored this. `meta` is not restored from an existing
+        # results file, so on a resumed run this names the process that finished
+        # it — which is the one whose behaviour the last episodes reflect.
+        **code_provenance(),
     })
     todo = [it for it in items if not store.has(it.key())]
 
