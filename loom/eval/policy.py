@@ -461,6 +461,16 @@ class LoomPolicy:
             return {}
         top1 = [r["top1"] for r in log]
         support = {i for r in log for i in r["support"]}
+        # The *set* the top-4 picks out, not just which indices ever appear in
+        # one. `op_support_unique` counts operators; two replans on supports
+        # {1,2,3,4} and {1,2,3,5} share three of them and are still different
+        # actions. Counted as sorted "a-b-c-d" keys so the run-wide number of
+        # distinct supports is recoverable from the results JSON without
+        # keeping every replan's tuple.
+        support_counts: dict[str, int] = {}
+        for r in log:
+            k = "-".join(str(i) for i in sorted(r["support"]))
+            support_counts[k] = support_counts.get(k, 0) + 1
         ents = [r["ent"] for r in log if "ent" in r]
         gaps = [r["gap"] for r in log if "gap" in r]
         out: dict[str, Any] = {
@@ -470,6 +480,8 @@ class LoomPolicy:
             "op_top1_unique": len(set(top1)),
             "op_top1_switches": sum(a != b for a, b in zip(top1, top1[1:])),
             "op_support_unique": len(support),
+            "op_support_counts": support_counts,
+            "op_support_set_unique": len(support_counts),
             "op_w1_mean": round(sum(r["w1"] for r in log) / len(log), 5),
         }
         if ents:
