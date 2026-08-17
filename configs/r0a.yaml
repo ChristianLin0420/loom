@@ -30,6 +30,19 @@ data:
 optim:
   lr: 3.0e-4
   warmup: 2000
+  # Spike rejection: skip the optimizer step when the pre-clip grad norm exceeds
+  # this multiple of its running geometric mean. 0 = off (the R0-A2 behaviour).
+  #
+  # grad_clip alone does NOT protect this run: AdamW's update is invariant to a
+  # global rescale of the gradient, so clipping a norm-70000 gradient to 1.0
+  # hands the optimizer a unit vector pointing the same way and it takes a full
+  # learning-rate step regardless. Measured A/B from the same step-2000 R0-A2
+  # weights and the same data order: without the guard the coefficient space
+  # collapsed at step 2323 (live_ops 22 -> 5, act/align 0.373 -> 0.500,
+  # delta_op 0.064 -> 0.000, peak grad norm 71535); with spike_mult: 10 it did
+  # not collapse through step 2700 (act/align 0.369, delta_op 0.069,
+  # live_ops 24, peak grad norm 413) at a cost of 11.4% of steps skipped.
+  spike_mult: 0.0
 
 losses:
   dyn:      {enabled: true, weight: 1.0, negatives: within_trajectory}

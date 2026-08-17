@@ -28,6 +28,7 @@ import argparse
 import hashlib
 import importlib
 import json
+import math
 import os
 import sys
 import time
@@ -54,7 +55,8 @@ from loom.train.determinism import (
 )
 from loom.train.preempt import PreemptGuard, write_heartbeat
 from loom.train.schedule import (
-    BANK_LR_MULT, CosineWithWarmup, EMATarget, FreezeSchedule, build_optimizer, clip_grad,
+    BANK_LR_MULT, CosineWithWarmup, EMATarget, FreezeSchedule, SpikeGuard,
+    build_optimizer, clip_grad, module_grad_norms,
 )
 
 __all__ = [
@@ -807,6 +809,10 @@ class TrainState:
     scheduler: CosineWithWarmup
     ema: Any
     sampler: Any
+    #: spike-rejection reference. Optimizer state in every sense that matters:
+    #: left out of the checkpoint it would reset at every 4 h link boundary, and
+    #: the first ``warmup`` steps of every link would run unguarded.
+    guard: Any = None
     global_step: int = 0
     samples_seen: int = 0
 
@@ -959,8 +965,17 @@ def main(argv=None) -> int:
     if rank == 0:
         log_shm_headroom(cfg)
     sampler = build_sampler(cfg, rank, world, seed, "cpu")
+    # `spike_mult: 0` is OFF and is the default: a guard is an intervention, and a
+    # chain already in flight must not silently acquire one at a link boundary.
+    spike = SpikeGuard(mult=float(ocfg.get("spike_mult", 0.0)),
+                       beta=float(ocfg.get("spike_beta", 0.98)),
+                       warmup=int(ocfg.get("spike_warmup", 100)))
     state = TrainState(model=model, optimizer=opt, scheduler=sched, ema=model.ema,
-                       sampler=sampler)
+                       sampler=sampler, guard=spike)
+    if rank == 0 and spike.enabled:
+        print(f"[rank0] spike guard ON: skip when gnorm > {spike.mult}x the "
+              f"running geometric mean (beta={spike.beta}, warmup={spike.warmup})",
+              flush=True)
 
     # bf16 throughout (PLAN 9). FSDP's MixedPrecision covers the wrapped modules;
     # autocast covers the single-GPU debug path where nothing is wrapped.
@@ -997,6 +1012,7 @@ def main(argv=None) -> int:
     stop_at = min(link["stop_at"], steps) if link["stop_at"] else steps
     batch = int(dcfg.get("batch_per_gpu", 2))
     grad_clip = float(ocfg.get("grad_clip", 1.0))
+    grad_report = bool(ocfg.get("grad_report", True))
     t0, last_delta = time.time(), float("nan")
 
     def _save(step: int, stop_reason: str = "") -> None:
@@ -1023,14 +1039,26 @@ def main(argv=None) -> int:
             loss, metrics = model.compute_losses(window, step, rank, seed)
 
         opt.zero_grad(set_to_none=True)
-        gnorm = 0.0
+        gnorm, skipped, gparts = 0.0, False, {}
         if loss.requires_grad:
             loss.backward()
             # Replicated modules are invoked through step()/log_prob()/loss(), not
             # forward(), so no DDP/FSDP hook ever fires for them. Sync by hand.
             sync.all_reduce_grads()
+            # BEFORE clip_grad: afterwards every number carries the same `coef`
+            # and the decomposition is no longer in the units the spike happened
+            # in. One extra all-reduce of ~7 floats, unconditional on every rank.
+            if grad_report:
+                gparts = module_grad_norms(model, sync=sync,
+                                           module_names=MODULE_NAMES)
             gnorm = clip_grad(model, grad_clip, sync=sync)
-            opt.step()
+            # `gnorm` is the globally reduced pre-clip norm, so every rank feeds
+            # the guard the identical number and reaches the identical verdict
+            # without another collective. It must stay that way: a guard that
+            # skipped on one rank only would desynchronise the optimizer.
+            skipped = state.guard.check(gnorm)
+            if not skipped:
+                opt.step()
         state.ema.update(model.estimator)
 
         state.global_step += 1
@@ -1042,20 +1070,31 @@ def main(argv=None) -> int:
                 "global_step": state.global_step, "lr": lrs.get("estimator/decay",
                                                                 sched.lr_at(step)),
                 "grad_norm": gnorm, "frozen": is_frozen,
+                "grad_skipped": int(skipped),
+                # null, not Infinity: json.dumps emits a bare `Infinity` for the
+                # disabled/warming-up guard, which Python reads back but jq and
+                # every other JSON reader rejects.
+                "grad_thresh": (state.guard.threshold
+                                if math.isfinite(state.guard.threshold) else None),
+                **{f"gnorm/{k}": v for k, v in gparts.items()},
                 "embodiment": window["embodiment"], **metrics}) + "\n")
 
         if state.global_step % log_every == 0:
             write_heartbeat(run_dir, state.global_step, rank, last_delta)
             if rank == 0:
+                parts = " ".join(f"{k[:3]}={v:.1f}" for k, v in gparts.items())
                 print(f"[rank0] step {state.global_step} loss={metrics['loss']:.4f} "
                       f"delta_op={last_delta:+.4f} lr={sched.lr_at(step):.3e} "
-                      f"gnorm={gnorm:.3f} frozen={int(is_frozen)} "
+                      f"gnorm={gnorm:.3f}{' SKIP' if skipped else ''} "
+                      f"[{parts}] frozen={int(is_frozen)} "
                       f"emb={window['embodiment']} "
                       f"{state.global_step / max(1e-6, time.time() - t0):.2f} it/s",
                       flush=True)
             wandb_util.log(run, {
                 **metrics, "grad_norm": gnorm, "samples_seen": state.samples_seen,
                 "frozen": float(is_frozen),
+                "grad_skipped": float(skipped),
+                **{f"gnorm/{k}": v for k, v in gparts.items()},
                 "seconds_to_budget": guard.seconds_left,
                 **{f"lr/{k}": v for k, v in lrs.items()},
             }, state.global_step)

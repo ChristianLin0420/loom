@@ -67,6 +67,8 @@ def build_state(state, *, config_hash: str = "", world_size: int = 1,
         "scheduler": state.scheduler.state_dict(),
         "ema": state.ema.state_dict() if state.ema is not None else None,
         "sampler": state.sampler.state_dict() if state.sampler is not None else None,
+        "guard": (state.guard.state_dict()
+                  if getattr(state, "guard", None) is not None else None),
         # -- scalars --
         "global_step": int(state.global_step),
         "samples_seen": int(state.samples_seen),
@@ -154,6 +156,11 @@ def restore(payload: dict[str, Any], state, *, world_size: int = 1,
         state.ema.load_state_dict(payload["ema"])
     if state.sampler is not None and payload.get("sampler") is not None:
         state.sampler.load_state_dict(payload["sampler"])
+    # `.get`, not `[...]`: checkpoints written before the guard existed have no
+    # such key, and a resume off one of those must not raise. A guard restored
+    # from nothing simply re-warms, which is the honest behaviour.
+    if getattr(state, "guard", None) is not None and payload.get("guard") is not None:
+        state.guard.load_state_dict(payload["guard"])
     restore_rng_state(payload.get("rng"))
     state.global_step = int(payload["global_step"])
     state.samples_seen = int(payload["samples_seen"])

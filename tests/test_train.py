@@ -50,8 +50,8 @@ from loom.train.preempt import (
     DEFAULT_SAFETY_S, PreemptGuard, decide_local, read_heartbeat, write_heartbeat,
 )
 from loom.train.schedule import (
-    BANK_LR_MULT, CosineWithWarmup, EMATarget, FreezeSchedule, build_optimizer,
-    clip_grad, param_groups,
+    BANK_LR_MULT, CosineWithWarmup, EMATarget, FreezeSchedule, SpikeGuard,
+    build_optimizer, clip_grad, module_grad_norms, param_groups,
 )
 
 CONFIGS = ROOT / "configs"
@@ -1128,6 +1128,81 @@ def test_grad_clip_is_applied():
 
 def test_grad_clip_with_no_grads_is_a_noop():
     assert clip_grad(tiny_model(), 1.0) == 0.0
+
+
+def test_module_grad_norms_decompose_the_global_norm():
+    """The per-module norms must reproduce clip_grad's total exactly.
+
+    If they do not, the decomposition attributes a spike to the wrong module,
+    which is worse than not having it at all.
+    """
+    model = tiny_model()
+    torch.manual_seed(0)
+    for p in model.parameters():
+        p.grad = torch.randn_like(p)
+    names = tuple(n for n, _ in model.named_children())
+    parts = module_grad_norms(model, sync=None, module_names=names)
+    total = math.sqrt(sum(v * v for v in parts.values()))
+    # clip_grad mutates the grads, so compare against the pre-clip report it returns
+    assert total == pytest.approx(clip_grad(model, 1e9, sync=None), rel=1e-5)
+
+
+def test_spike_guard_is_off_by_default_and_at_mult_zero():
+    """A chain already in flight must not silently acquire a guard."""
+    assert SpikeGuard(mult=0.0).enabled is False
+    g = SpikeGuard(mult=0.0)
+    assert g.check(1e9) is False        # nothing is ever skipped when disabled
+
+
+def test_spike_guard_rejects_a_spike_but_not_the_ordinary_step():
+    g = SpikeGuard(mult=10.0, beta=0.98, warmup=50)
+    for _ in range(200):
+        assert g.check(3.0) is False    # a stationary regime is never rejected
+    assert g.check(3.5) is False
+    assert g.check(7000.0) is True
+    assert g.check(float("nan")) is True     # NaN must never reach the moments
+
+
+def test_spike_guard_does_not_deadlock_on_a_sustained_regime_shift():
+    """REGRESSION. Measured on run tdgradB, which halted for 457 steps.
+
+    Updating the reference only on ACCEPTED steps is the obvious design and it
+    deadlocks: once the gradient regime moves above the threshold nothing is
+    accepted, so nothing updates the reference, so the threshold never follows
+    and no step is ever taken again. The loss curve just goes flat -- there is
+    no error and no warning. `min(gnorm, threshold)` un-sticks it geometrically.
+    """
+    g = SpikeGuard(mult=10.0, beta=0.98, warmup=50)
+    for _ in range(200):
+        g.check(3.0)
+    stuck = [g.check(93.0) for _ in range(400)]
+    assert stuck[0] is True, "a 30x jump should be rejected at first"
+    assert False in stuck, "guard deadlocked: never re-admitted a sustained regime"
+    assert stuck.index(False) < 100, "took too long to re-admit"
+    assert stuck[-1] is False, "still rejecting a regime that is now the norm"
+
+
+def test_spike_guard_lone_spike_barely_moves_the_threshold():
+    """The other failure mode: a burst must not walk the bar up behind itself."""
+    g = SpikeGuard(mult=10.0, beta=0.98, warmup=50)
+    for _ in range(200):
+        g.check(3.0)
+    before = g.threshold
+    g.check(7e4)
+    assert g.threshold / before == pytest.approx(10.0 ** 0.02, rel=1e-6)
+
+
+def test_spike_guard_state_survives_a_link_boundary():
+    """Not persisting this makes the guard a schedule derived from wall clock:
+    the first `warmup` steps of every 4 h link would run unguarded."""
+    g = SpikeGuard(mult=10.0, beta=0.98, warmup=50)
+    for _ in range(200):
+        g.check(3.0)
+    fresh = SpikeGuard(mult=10.0, beta=0.98, warmup=50)
+    fresh.load_state_dict(g.state_dict())
+    assert fresh.threshold == pytest.approx(g.threshold)
+    assert fresh.n == g.n
+    assert fresh.check(7000.0) is True       # guarded immediately, no re-warmup
 
 
 # ═══════════════════════════════════════════════════════════════════════════

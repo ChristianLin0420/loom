@@ -23,7 +23,7 @@ from contracts import EMA_TAU
 
 __all__ = [
     "CosineWithWarmup", "BANK_LR_MULT", "param_groups", "build_optimizer",
-    "clip_grad", "EMATarget", "FreezeSchedule",
+    "clip_grad", "module_grad_norms", "SpikeGuard", "EMATarget", "FreezeSchedule",
 ]
 
 #: Bank LR is exactly this multiple of the estimator LR. Locked by a test.
@@ -182,6 +182,190 @@ def clip_grad(model: nn.Module, max_norm: float = 1.0, sync=None) -> float:
         for p in params:
             p.grad.detach().mul_(coef)
     return float(total)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PER-MODULE GRAD NORMS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def module_grad_norms(model: nn.Module, sync=None,
+                      module_names: Sequence[str] | None = None
+                      ) -> dict[str, float]:
+    """Pre-clip grad norm of every top-level child, in ONE small collective.
+
+    ``clip_grad`` reports a single global number, which is exactly the number
+    that cannot tell you anything: a run whose global norm jumps from 2 to 10252
+    has one module doing that, and the global norm is the one statistic that
+    hides which. This reduces a length-``n_modules`` vector instead of a scalar,
+    so it costs one extra all-reduce of ~7 floats per step -- the same latency
+    class as the reduce ``clip_grad`` already does, and nothing measurable
+    against a 16-GPU step.
+
+    Call it BEFORE ``clip_grad``; afterwards every number is scaled by ``coef``
+    and the decomposition is still correct but no longer in the units the spike
+    happened in.
+
+    Sharded (FSDP) parameters hold a slice of their gradient per rank, so their
+    squares must be summed across ranks; replicated parameters are bit-identical
+    on every rank after ``ReplicaSync.all_reduce_grads`` and must be counted
+    once. Same split as ``clip_grad``, so ``sqrt(sum of squares)`` over the
+    returned dict reproduces ``clip_grad``'s total.
+    """
+    if module_names is None:
+        module_names = [n for n, _ in model.named_children()]
+    names = list(module_names)
+    if "other" not in names:
+        names = names + ["other"]
+    index = {n: i for i, n in enumerate(names)}
+
+    named = [(n, p) for n, p in model.named_parameters() if p.grad is not None]
+    if not named:
+        return {}
+    dev = named[0][1].grad.device
+
+    enabled = sync is not None and getattr(sync, "enabled", False)
+    sharded_ids = {id(p) for p in sync.sharded_params()} if enabled else set()
+
+    sq_sh = torch.zeros(len(names), device=dev, dtype=torch.float32)
+    sq_rep = torch.zeros(len(names), device=dev, dtype=torch.float32)
+    for name, p in named:
+        i = index[_module_of(name, names)]
+        s = p.grad.detach().float().pow(2).sum()
+        if id(p) in sharded_ids:
+            sq_sh[i] += s
+        else:
+            sq_rep[i] += s
+
+    if enabled:
+        import torch.distributed as dist
+
+        dist.all_reduce(sq_sh, op=dist.ReduceOp.SUM)
+
+    total_sq = (sq_sh + sq_rep).cpu()
+    return {n: float(total_sq[i].clamp_min(0).sqrt()) for n, i in index.items()
+            if float(total_sq[i]) > 0.0}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SPIKE REJECTION
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class SpikeGuard:
+    """Skip the optimizer step when the pre-clip grad norm is an outlier.
+
+    WHY REJECTION AND NOT CLIPPING
+    ──────────────────────────────
+    The optimizer is AdamW, and AdamW's update is invariant to a global rescale
+    of the gradient once its moments have equilibrated: scaling every ``g`` by
+    ``s`` scales ``m`` by ``s`` and ``sqrt(v)`` by ``s``, and ``m / sqrt(v)`` is
+    unchanged. ``clip_grad(1.0)`` multiplies a norm-10252 gradient by 1e-4 and
+    hands AdamW a *unit-norm gradient pointing the same way*, which AdamW then
+    turns into a full learning-rate step. Clipping bounds the magnitude of a
+    quantity the optimizer does not use. It cannot bound the step.
+
+    What the spike actually costs is therefore (a) one full-size step along a
+    direction estimated from one pathological batch, (b) that direction retained
+    in ``m`` for ~``1/(1-beta1)`` = 10 further steps, and (c) every *other*
+    module's gradient shrunk by the same 1e-4 for that step, so the healthy
+    modules stop learning exactly while the pathological one drives. Not taking
+    the step removes all three; clipping removes none.
+
+    THE RULE
+    ────────
+    A step is rejected when ``gnorm > mult * exp(ema_log)``, i.e. when it exceeds
+    a multiple of the running *geometric* mean of the norm. Geometric, because
+    the norm is heavy-tailed and log-scaled -- on R0-A2 the per-window median
+    moves between 1.5 and 29 over 5k steps, so no absolute threshold is right
+    for the whole run, while ``log gnorm`` is comfortably stationary within a
+    window.
+
+    The reference is updated on EVERY step, but a rejected step contributes
+    ``log(threshold)`` rather than its own value: bounded influence, not
+    exclusion. Both halves of that are load bearing, and the exclusion variant
+    is not merely worse, it deadlocks -- measured, run ``tdgradB``:
+
+      * Updating only on ACCEPTED steps looks obviously right and is fatal. Once
+        the gradient regime shifts above the threshold, nothing is accepted, so
+        nothing updates the reference, so the threshold can never follow, so
+        nothing is ever accepted again. tdgradB skipped 457 consecutive steps
+        with ``gnorm`` pinned at 93 and the threshold frozen at 23.35: the
+        weights stopped changing at step ~2144 and the job burned its remaining
+        walltime doing forward and backward passes it then threw away. Nothing
+        in the loss curve says "halted" -- ``loss`` just goes flat.
+      * Updating with the RAW value on a skip is the opposite failure: a burst
+        of 10^4 spikes walks the threshold up behind itself and re-admits the
+        next one.
+
+      ``min(gnorm, threshold)`` gives a guard that un-sticks geometrically -- a
+      skipped step raises the threshold by exactly ``mult**(1-beta)`` (4.7% at
+      the defaults), so a genuine regime shift of 4x is re-admitted after ~30
+      steps, while a lone spike ratchets the bar by 4.7% and no more.
+
+    STATE, AND WHY IT IS IN THE CHECKPOINT
+    ──────────────────────────────────────
+    ``(ema_log, n)`` is optimizer state in every sense that matters, so it rides
+    in the checkpoint payload. A guard that reset at every 4 h link boundary
+    would be a schedule derived from wall clock by the back door: the first
+    ``warmup`` steps of each link would be unguarded, and the run would behave
+    differently depending on where SLURM happened to cut it.
+
+    The decision is a pure function of the *global* norm, which ``clip_grad``
+    has already all-reduced, so every rank decides identically without an extra
+    collective. It must stay that way: a guard that could skip on one rank and
+    not another desynchronises the optimizer across the world.
+    """
+
+    mult: float = 8.0
+    beta: float = 0.98
+    warmup: int = 100
+    ema_log: float = 0.0
+    n: int = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.mult > 0.0
+
+    @property
+    def threshold(self) -> float:
+        """Current rejection threshold, or ``inf`` while still warming up."""
+        if not self.enabled or self.n < self.warmup:
+            return float("inf")
+        return self.mult * math.exp(self.ema_log)
+
+    def check(self, gnorm: float) -> bool:
+        """Update the reference and return True if this step must be SKIPPED.
+
+        Non-finite norms are always rejected, and do not move the reference: a
+        NaN gradient must never reach the moments, where one step of ``m``
+        poisons every subsequent update for the rest of the run regardless of
+        what the data does, and ``log(nan)`` would destroy the reference too.
+        """
+        if not self.enabled:
+            return False
+        if not math.isfinite(gnorm):
+            return True
+        thr = self.threshold
+        skip = gnorm > thr
+        # Bounded influence: a rejected step still moves the reference, but only
+        # as far as the threshold it failed. See the class docstring -- excluding
+        # it entirely deadlocks the guard, and admitting it raw defeats it.
+        ref = min(gnorm, thr) if math.isfinite(thr) else gnorm
+        self.ema_log = (self.beta * self.ema_log
+                        + (1.0 - self.beta) * math.log(max(ref, 1e-12)))
+        self.n += 1
+        return skip
+
+    def state_dict(self) -> dict:
+        return {"mult": self.mult, "beta": self.beta, "warmup": self.warmup,
+                "ema_log": self.ema_log, "n": self.n}
+
+    def load_state_dict(self, sd: dict) -> None:
+        # mult/beta/warmup come from the config, not the checkpoint: changing the
+        # guard between links is a legitimate intervention, resuming into the old
+        # value silently is not.
+        self.ema_log = float(sd.get("ema_log", self.ema_log))
+        self.n = int(sd.get("n", self.n))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
