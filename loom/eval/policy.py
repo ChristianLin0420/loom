@@ -619,6 +619,38 @@ def load_policy(
     return LoomPolicy(modules, n_candidates=n_candidates, op_stats=op_stats)
 
 
+def _run_model_kwargs(ckpt: str | Any, module: str) -> dict:
+    """Architecture kwargs for `module`, read from the run that produced `ckpt`.
+
+    The checkpoint payload carries `config_hash` and `git_sha` but not the config
+    itself, so the source of truth is `runs/<run>/config.json` -> `model.<module>`.
+    A consolidated checkpoint lives in `runs/<run>_eval/`, so try that sibling
+    first, then the checkpoint's own directory and its parent.
+
+    Returns {} when nothing is found, which reproduces the shipped defaults --
+    correct for every checkpoint trained before these flags existed.
+    """
+    import json as _json                                     # noqa: PLC0415
+    from pathlib import Path as _Path                        # noqa: PLC0415
+
+    p = _Path(str(ckpt)).resolve()
+    d = p.parent
+    cands = []
+    if d.name.endswith("_eval"):
+        cands.append(d.parent / d.name[: -len("_eval")] / "config.json")
+    cands += [d / "config.json", d.parent / "config.json"]
+    for c in cands:
+        try:
+            if c.is_file():
+                cfg = _json.loads(c.read_text())
+                kw = ((cfg or {}).get("model") or {}).get(module) or {}
+                if isinstance(kw, dict):
+                    return dict(kw)
+        except (OSError, ValueError):
+            continue
+    return {}
+
+
 def submodule_state(state: Any, name: str) -> dict[str, Tensor] | None:
     """One submodule's `state_dict` out of a training checkpoint. Both layouts.
 
@@ -693,7 +725,18 @@ def _try_real_modules(
         # Only the body under evaluation. Building every registered embodiment
         # would make a body the checkpoint has never seen look like a *missing*
         # key, and the missing-key check below is the whole guard.
-        estimator = Estimator(embodiments=[embodiment])
+        #
+        # The estimator's architecture flags must come from the RUN, not from
+        # this file's defaults. `z_prev_residual` is not a parameter, so a
+        # checkpoint trained with it off produces NO missing and NO unexpected
+        # key -- eval would silently score a different model than the one that
+        # trained, and the per-module guard below cannot see it. (`learned_z_init`
+        # at least shows up as an unexpected `z_init`.) Measured: that difference
+        # is worth 1.0 vs 18.0 LIBERO avg between two arms of the same run.
+        est_kw = _run_model_kwargs(ckpt, "estimator")
+        if est_kw:
+            print(f"[policy] estimator kwargs from run config: {est_kw}", flush=True)
+        estimator = Estimator(embodiments=[embodiment], **est_kw)
         proposal = Proposal()
         decoder = Decoder(embodiments=[embodiment], default_embodiment=embodiment)
 

@@ -786,6 +786,57 @@ def test_estimator_z_prev_changes_output():
         assert rel > 1e-2, f"{name}: output moved by only {rel:.2e} — z_prev is ignored"
 
 
+@pytest.mark.parametrize("res,zinit", [(True, False), (False, False),
+                                       (True, True), (False, True)])
+def test_estimator_recurrence_paths(res, zinit):
+    """`z_prev` must still condition `z` with the additive residual removed.
+
+    The module docstring used to claim that dropping either path "would make the
+    recurrence a decoration". It is the opposite: the additive residual made `z`
+    an over-damped tracker, and the context path alone carries the recurrence.
+    If this fails at `res=False` the context path contributes nothing, which is a
+    finding about the model and not a licence to delete the assert.
+    """
+    torch.manual_seed(24)
+    est = _small_estimator(z_prev_residual=res, learned_z_init=zinit).eval()
+    feats = _small_feats(b=2)
+    with torch.no_grad():
+        z_a = est(feats, torch.randn(2, C.K, C.D), embodiment=BODY)
+        z_b = est(feats, torch.randn(2, C.K, C.D), embodiment=BODY)
+        z_none = est(feats, None, embodiment=BODY)
+    for name, other in (("z_prev=None vs z_prev=a", z_none), ("a vs b", z_b)):
+        rel = float((z_a - other).norm() / z_a.norm())
+        assert rel > 1e-2, f"res={res} zinit={zinit} {name}: moved {rel:.2e}"
+
+    # the residual is the ONLY thing the flag changes
+    assert (est.z_prev_residual is res) and ((est.z_init is not None) is zinit)
+    # and z_init actually runs on the z_prev=None path. The perturbation has to
+    # be random: `z_prev_ln` is a LayerNorm, so adding a CONSTANT to every
+    # element of z_init is invisible by construction (measured: 6.7e-7 relative).
+    if zinit:
+        with torch.no_grad():
+            est.z_init.add_(torch.randn_like(est.z_init))
+            z_none2 = est(feats, None, embodiment=BODY)
+        assert float((z_none2 - z_none).norm() / z_none.norm()) > 1e-3, \
+            "learned_z_init is not reaching the forward on the z_prev=None path"
+
+
+def test_estimator_z_prev_gradient_without_the_residual():
+    """`L_dyn` trains through the recurrence; removing the residual must not cut it."""
+    torch.manual_seed(25)
+    est = _small_estimator(z_prev_residual=False)
+    z_prev = torch.randn(1, C.K, C.D, requires_grad=True)
+    est(_small_feats(b=1), z_prev, embodiment=BODY).sum().backward()
+    assert z_prev.grad is not None and float(z_prev.grad.abs().max()) > 0.0
+
+
+def test_estimator_defaults_are_the_shipped_recurrence():
+    """A default build is byte-identical to the pre-flag estimator."""
+    est = _small_estimator()
+    assert est.z_prev_residual is True and est.z_init is None
+    assert "z_init" not in dict(est.named_parameters())
+
+
 def test_estimator_z_prev_receives_gradient():
     """Conditioning must be differentiable or L_dyn cannot train through it."""
     torch.manual_seed(23)

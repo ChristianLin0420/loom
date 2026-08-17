@@ -1261,3 +1261,37 @@ def test_a_named_checkpoint_never_degrades_to_stubs_by_default(tmp_path):
     # still explicitly available for anyone who wants it
     p = pol.load_policy(str(missing), allow_stub=True)
     assert p.modules.is_stub
+
+
+def test_eval_reads_estimator_flags_from_the_run_config(tmp_path):
+    """`z_prev_residual` is not a parameter, so a checkpoint trained with it off
+    loads with ZERO missing and ZERO unexpected keys into a default estimator --
+    eval would silently score a different model and the per-module key guard
+    cannot see it. Measured cost of that confusion: 1.0 vs 18.0 LIBERO avg
+    between two arms of the same run. So the flags must come from the run.
+    """
+    import json
+    from loom.eval.policy import _run_model_kwargs
+
+    # A consolidated checkpoint lives in runs/<run>_eval/; its config is the
+    # sibling runs/<run>/config.json.
+    run = tmp_path / "myrun"
+    run.mkdir()
+    (run / "config.json").write_text(json.dumps(
+        {"model": {"estimator": {"z_prev_residual": False, "learned_z_init": True}}}))
+    ev = tmp_path / "myrun_eval"
+    ev.mkdir()
+    ck = ev / "ckpt_000007000.pt"
+    ck.write_bytes(b"")
+
+    assert _run_model_kwargs(ck, "estimator") == {
+        "z_prev_residual": False, "learned_z_init": True}
+
+    # A run that predates the flags reproduces shipped defaults, not a crash.
+    plain = tmp_path / "old"
+    plain.mkdir()
+    (plain / "config.json").write_text(json.dumps({"model": {"estimator": {}}}))
+    assert _run_model_kwargs(plain / "ckpt_000000100.pt", "estimator") == {}
+
+    # No config anywhere -> defaults, never an exception.
+    assert _run_model_kwargs(tmp_path / "nowhere" / "c.pt", "estimator") == {}

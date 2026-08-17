@@ -40,12 +40,73 @@ global max dof, teaches the shared trunk that "joint 12 is always zero for
 LIBERO", which is exactly the leakage the homogeneous-batch rule exists to
 prevent.
 
-**`z_prev` enters twice.** As context tokens (so slot `i` can read slot `j`'s
-previous value — belief mixing) *and* as an additive residual on the queries
-(so slot `i` starts from its own previous value — belief persistence). With
-`z_prev=None` the queries are the learned latents alone, which is the
-episode-start case. Dropping either path would make the recurrence a decoration;
-`tests/test_model.py::test_estimator_z_prev_changes_output` guards it.
+**`z_prev` enters twice — and the additive path is a switch, not a feature.**
+`z_prev` reaches the trunk as context tokens (so slot `i` can read slot `j`'s
+previous value — belief mixing) *and*, when `z_prev_residual=True`, as an
+additive residual on the queries (so slot `i` starts from its own previous
+value — belief persistence). With `z_prev=None` the queries are the learned
+latents alone, which is the episode-start case unless `learned_z_init=True`.
+
+The additive residual was the default, and it made `z` an over-damped tracker.
+Measured on the R0-A2 checkpoint at step 5040, closed-loop LIBERO: the belief's
+step-to-step motion `1 - cos(LN z_t, LN z_{t-1})` averaged **0.0043** for `t>=5`
+while consecutive *observations* moved **0.0155** — `z` was low-passing the
+observation with a time constant longer than an episode. It is not a fixed
+point: swapping the observation still moved `z` (0.2069 at `t=1`, rising to
+0.2692 at `t=19`), so the recurrence was live, just too heavy. Ablating **only**
+the additive residual at inference on those same weights took step-motion to
+**0.02887** and collapsed `cosdist(z_t, z_0)` from 1.286 — anti-correlated with
+its own start — to 0.2298, next to a fresh-init model's 0.198. Scaling `||zp||`
+down does *not* reproduce this: at `alpha=0.02` the proposal entropy is
+unchanged from `alpha=1` (4.8444), and only `alpha=0` moves it. The regime
+switch is discontinuous in the *presence* of the residual, not graded in its
+magnitude, which is why this is a boolean and not a coefficient.
+
+The context path alone still carries the recurrence, so
+`tests/test_model.py::test_estimator_z_prev_changes_output` holds with
+`z_prev_residual=False` — `tests/test_model.py::test_estimator_recurrence_paths`
+asserts that for every combination of the two flags.
+
+`learned_z_init=True` replaces the `z_prev=None` special case with a learned
+`(K, D)` initial belief, so one code path always runs and there is no
+episode-start seam between "queries are the latents" and "queries are the
+latents plus a projection of something".
+
+**Trained from scratch, the damping story is confirmed and the fix is not.**
+Three 7000-step 16-GPU R0-A runs, same seed, same data order, differing only in
+these two flags (`teamb_ctrl` / `teamb_nores` / `teamb_zinit`), scored on 300
+closed-loop LIBERO episodes:
+
+    arm                          step-motion  x-episode cos   LIBERO @4500  @7000
+    z_prev_residual=True (ship)      0.0086         0.94          16.0      10.0
+    residual removed                 0.0438         0.56           5.3       1.0
+    residual removed + z_init        1.04           0.95          12.0      18.0
+
+Removing the residual does exactly what the inference-time ablation predicted --
+`z` moves 5x more and the beliefs of different episodes stop agreeing (0.94 ->
+0.56, the least collapsed belief measured anywhere in this repo) -- **and the
+score falls to 1.0.** Unfreezing the belief is not what the policy needed. Add
+the learned `z_init` on top and the recurrence turns into a period-3 orbit
+(`switch_frac` exactly 1.000: the operator changes at *every* replan, 3 per
+episode) which scores 18.0, the best number this repo has produced, and the only
+arm whose score rises with training. So `learned_z_init` is not a seam fix here;
+it is what makes a residual-free recurrence oscillate instead of drift, and the
+oscillation is worth 18 points. Neither arm makes the policy condition on the
+observation: all three pick ONE operator at replan 0 across all 300 episodes.
+
+**Neither flag is in `state_dict`, and both change what the weights mean.**
+`z_prev_residual` is not a parameter at all, and a checkpoint trained with
+`learned_z_init=True` carries `z_init` as an *unexpected* key for a default
+build. `loom/eval/policy.py` constructs `Estimator(embodiments=[e])` with the
+defaults and loads `strict=False`, so pointing it at one of these checkpoints
+scores a **different model** than the one that trained, with nothing in the log
+to say so: arm (i) silently regains the residual, arm (ii) silently regains it
+*and* drops `z_init`. The run's `config.json` holds `model.estimator`, and
+`loom.train.consolidate` reads it; any other reader has to be told. Adding the
+flags to `state_dict` would fix that at the cost of a missing key on every
+checkpoint written before them, which breaks `policy.py`'s "refusing to score a
+partly-loaded module" guard for the entire existing R0-A family -- so the flags
+stay out and this paragraph is the interlock.
 """
 
 from __future__ import annotations
@@ -153,6 +214,8 @@ class Estimator(nn.Module):
         max_streams: int = 8,
         embodiments: Sequence[str] | None = None,
         grad_checkpoint: bool = False,
+        z_prev_residual: bool = True,
+        learned_z_init: bool = False,
     ) -> None:
         super().__init__()
         if dim != D:
@@ -165,10 +228,16 @@ class Estimator(nn.Module):
         self.feat_dim = feat_dim
         self.lang_dim = feat_dim if lang_dim is None else lang_dim
         self.grad_checkpoint = grad_checkpoint
+        #: add `z_prev` onto the queries as well as into the context. See the
+        #: module docstring: True is the shipped over-damped tracker.
+        self.z_prev_residual = bool(z_prev_residual)
 
         # ── latents ───────────────────────────────────────────────────────
         self.latents = nn.Parameter(torch.empty(n_slots, dim))
         self.slot_embed = nn.Parameter(torch.empty(n_slots, dim))
+        #: the belief before the first observation. With it, `z_prev=None` is
+        #: not a separate code path -- the same forward runs at every t.
+        self.z_init = nn.Parameter(torch.empty(n_slots, dim)) if learned_z_init else None
 
         # ── input projections ─────────────────────────────────────────────
         self.view_proj = nn.Linear(feat_dim, dim)
@@ -203,10 +272,22 @@ class Estimator(nn.Module):
 
         self._init_weights(depth)
 
+        # `loop._try_build` catches a TypeError from `cls(**kwargs)` and retries
+        # `cls()`, so a misspelled `model.estimator.*` key silently builds the
+        # SHIPPED estimator and the whole arm is a null. Nothing else in the run
+        # would say so. One line in the log, only when the recurrence is not the
+        # default, is the difference between an ablation and a wasted 16 GPUs.
+        if not self.z_prev_residual or self.z_init is not None:
+            print(f"[estimator] recurrence: z_prev_residual={self.z_prev_residual} "
+                  f"learned_z_init={self.z_init is not None}", flush=True)
+
     # ── init ──────────────────────────────────────────────────────────────
 
     def _init_weights(self, depth: int) -> None:
-        for p in (self.latents, self.slot_embed, self.stream_embed, self.type_embed):
+        embeds = [self.latents, self.slot_embed, self.stream_embed, self.type_embed]
+        if self.z_init is not None:
+            embeds.append(self.z_init)
+        for p in embeds:
             nn.init.normal_(p, std=0.02)
         for mod in self.modules():
             if isinstance(mod, nn.Linear):
@@ -227,6 +308,12 @@ class Estimator(nn.Module):
             # std=0.02 the projection of a LayerNormed input has std
             # 0.02*sqrt(d) ~ 0.55, which would drown the learned latents by 25x
             # at step 0 and make the estimator a pass-through of z_prev.
+            #
+            # Kept unconditionally, including when `z_prev_residual=False`, so
+            # the two arms differ in exactly one line. It costs nothing on the
+            # context path: `ctx_ln` LayerNorms every token independently, so
+            # only zp's size *relative to* `type_embed[3] + slot_embed` survives,
+            # and at std 0.02 it is on par with both.
             self.z_prev_proj.weight.mul_(1.0 / math.sqrt(self.dim))
 
     # ── dispatch ──────────────────────────────────────────────────────────
@@ -298,6 +385,11 @@ class Estimator(nn.Module):
         """
         b = feats["views"].shape[0]
 
+        if z_prev is None and self.z_init is not None:
+            # no episode-start seam: t=0 runs the same forward as every other t,
+            # with a learned belief standing in for "what was there before".
+            z_prev = self.z_init.unsqueeze(0).expand(b, -1, -1)
+
         zp = None
         if z_prev is not None:
             if z_prev.shape[-2:] != (self.n_slots, self.dim):
@@ -310,7 +402,7 @@ class Estimator(nn.Module):
         ctx = self._context(feats, zp, embodiment)
 
         x = self.latents.unsqueeze(0).expand(b, -1, -1)
-        if zp is not None:
+        if zp is not None and self.z_prev_residual:
             x = x + zp                       # belief persistence, slot-aligned
         slot = self.slot_embed.unsqueeze(0)
 
@@ -325,5 +417,7 @@ class Estimator(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"feat_dim={self.feat_dim}, K={self.n_slots}, D={self.dim}, "
-            f"blocks={len(self.blocks)}, grad_checkpoint={self.grad_checkpoint}"
+            f"blocks={len(self.blocks)}, grad_checkpoint={self.grad_checkpoint}, "
+            f"z_prev_residual={self.z_prev_residual}, "
+            f"learned_z_init={self.z_init is not None}"
         )
