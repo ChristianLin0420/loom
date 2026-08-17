@@ -44,6 +44,12 @@ __all__ = [
 
 RESULTS_VERSION = 1
 
+#: How long a worker waits for its GPU off the device queue. Generous because
+#: the cost of being wrong is a silent second policy on GPU 0, and the cost of
+#: waiting is nothing — the parent has already put every item before the pool
+#: exists.
+CLAIM_TIMEOUT_S = 60.0
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CODE PROVENANCE
@@ -444,19 +450,42 @@ def claim_device(device_queue) -> str:
     results said so — the score is identical either way, which is exactly why
     it survived two evaluations.
 
+    **The claim must block.** `get_nowait()` is `get(block=False)`, which raises
+    `Empty` both when the queue's feeder thread has not yet flushed the item to
+    the pipe *and* when another worker holds the read lock at that instant —
+    and eight workers claim simultaneously by construction. Measured on the
+    login node, 8 spawn workers draining an 8-item queue: 1 trial in 6 left one
+    worker with `Empty`. Measured on the cluster, both 1200-episode LIBERO jobs
+    (32310492, 32310494) came up with **7** distinct GPUs holding a policy, GPU 7
+    idle and GPU 0 carrying two — the unclaimed worker falls through to
+    `default_device()` with neither selector pinned, so its policy *and* its EGL
+    context land on physical GPU 0. Nothing in the results says so; the score is
+    identical, which is how the original all-on-GPU-0 bug survived two
+    evaluations. A blocking `get` with a timeout removes the race, and a failed
+    claim is printed rather than swallowed.
+
     Returns the torch device string. After the pin, `cuda:0` **is** physical
     `dev`, because the process can no longer see anything else.
     """
     dev = None
     if device_queue is not None:
         try:
-            dev = device_queue.get_nowait()
-        except Exception:                                # noqa: BLE001
+            dev = device_queue.get(timeout=CLAIM_TIMEOUT_S)
+        except Exception as e:                           # noqa: BLE001
+            print(f"[runner] worker pid {os.getpid()} could not claim a device "
+                  f"({type(e).__name__}); it will share GPU 0", flush=True)
             dev = None
     if dev is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(dev)
         os.environ["MUJOCO_EGL_DEVICE_ID"] = str(dev)
-    return default_device()                              # first torch.cuda call
+    device = default_device()                            # first torch.cuda call
+    # The only record of where a worker actually landed. `store.meta["policy"]`
+    # keeps one provenance for the whole run, so without this line the placement
+    # is only recoverable by catching nvidia-smi mid-run.
+    print(f"[runner] worker pid {os.getpid()} claimed physical GPU {dev} "
+          f"-> device={device} MUJOCO_EGL_DEVICE_ID="
+          f"{os.environ.get('MUJOCO_EGL_DEVICE_ID')}", flush=True)
+    return device
 
 
 def _init_worker(device_queue, bench: str, ckpt: str | None,

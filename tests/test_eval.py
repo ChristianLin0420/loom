@@ -736,7 +736,7 @@ def test_claim_device_pins_both_selectors(monkeypatch):
     """CUDA_VISIBLE_DEVICES and MUJOCO_EGL_DEVICE_ID both name the worker's GPU."""
 
     class Q:
-        def get_nowait(self):
+        def get(self, timeout=None):
             return 3
 
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
@@ -744,6 +744,66 @@ def test_claim_device_pins_both_selectors(monkeypatch):
     runner.claim_device(Q())
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "3"
     assert os.environ["MUJOCO_EGL_DEVICE_ID"] == "3"
+
+
+def _claim_into(q):
+    """Worker-side initializer for the concurrency test below."""
+    runner.claim_device(q)
+
+
+def _report_claim(_i):
+    import os as _os
+    import time as _time
+
+    _time.sleep(0.02)
+    return (_os.getpid(), _os.environ.get("CUDA_VISIBLE_DEVICES"))
+
+
+def test_every_concurrent_worker_claims_a_distinct_device():
+    """The claim must BLOCK. `get_nowait()` is `get(block=False)`, which raises
+    `Empty` both when the queue's feeder thread has not flushed yet and when
+    another worker holds the read lock — and all eight workers claim at once by
+    construction.
+
+    Measured with `get_nowait()`: 1 login-node trial in 6 left a worker
+    unclaimed, and BOTH 1200-episode LIBERO jobs (32310492/32310494) came up
+    with 7 distinct GPUs holding a policy instead of 8, GPU 7 idle and GPU 0
+    carrying two. An unclaimed worker pins neither selector, so its policy and
+    its EGL context both land on physical GPU 0 — and the score is identical
+    either way, which is why the original all-on-GPU-0 bug survived two
+    evaluations.
+    """
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+
+    # Deterministic half of the guard: the race showed up in only ~1 trial in 6,
+    # so the loop below can pass on broken code. `get_nowait` cannot be there.
+    src = Path(runner.__file__).read_text()
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "claim_device")
+    attrs = {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)}
+    assert "get_nowait" not in attrs, (
+        "claim_device must block on the device queue; get_nowait() raises Empty "
+        "under read-lock contention and that worker silently shares GPU 0"
+    )
+
+    if torch.cuda.is_available():            # fork + CUDA is undefined, and the
+        pytest.skip("CPU-only: this exercises the queue, not the GPU")
+    n = 8
+    ctx = mp.get_context("fork" if hasattr(os, "fork") else "spawn")
+    for _ in range(3):                      # the failure was ~1 in 6
+        q = ctx.Queue()
+        for i in range(n):
+            q.put(i)
+        with ProcessPoolExecutor(max_workers=n, mp_context=ctx,
+                                 initializer=_claim_into, initargs=(q,)) as pool:
+            got = dict(pool.map(_report_claim, range(200)))
+        assert len(got) == n, f"only {len(got)} workers ran"
+        claimed = sorted(got.values(), key=str)
+        assert claimed == [str(i) for i in range(n)], (
+            f"workers claimed {claimed}; a None means that worker shares GPU 0 "
+            f"with another and one GPU sits idle"
+        )
 
 
 def test_claim_device_sets_cuda_visible_devices_before_touching_torch_cuda():
