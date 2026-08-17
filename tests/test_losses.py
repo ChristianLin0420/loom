@@ -54,6 +54,16 @@ def belief(b: int = 3) -> torch.Tensor:
     return torch.randn(b, C.K, C.D)
 
 
+def proprio(b: int = 3, dof: int = DOF_A) -> torch.Tensor:
+    """`ObsFeats["proprio"]` — ONE timestep, `(B, dof_e)`.
+
+    `L_act` runs the decoder on THIS and the coefficient, never on the belief:
+    with the belief available the decoder is a behaviour-cloning head and needs
+    nothing from `c`. See `loom/heads/decoder.py`.
+    """
+    return torch.randn(b, dof)
+
+
 def frozen_bank() -> S.StubBank:
     """A real 2x2 rotation-decay bank whose bounds genuinely hold (stubs.py)."""
     return S.StubBank().requires_grad_(False)
@@ -434,28 +444,28 @@ def test_dyn_decreases_and_delta_op_turns_positive_on_a_synthetic_task():
 def test_act_loss_is_the_decoder_loss():
     torch.manual_seed(3)
     dec = Decoder([BODY_A], **SMALL_DEC)
-    z, c = belief(4), S.sparse_simplex(4)
+    pr, c = proprio(4), S.sparse_simplex(4)
     a, x0, t = torch.randn(4, C.H_OP, DOF_A), torch.randn(4, C.H_OP, DOF_A), torch.rand(4)
-    got = act_loss(dec, z, c, a, embodiment=BODY_A, t=t, noise=x0)
-    assert torch.allclose(got, dec.loss(z, c, a, embodiment=BODY_A, t=t, noise=x0))
+    got = act_loss(dec, pr, c, a, embodiment=BODY_A, t=t, noise=x0)
+    assert torch.allclose(got, dec.loss(pr, c, a, embodiment=BODY_A, t=t, noise=x0))
 
 
 def test_act_loss_handles_action_free_data():
     """done-when 7: R1 data has actions=None. Zero, and the graph survives."""
     dec = Decoder([BODY_A], **SMALL_DEC)
-    z = belief(3).requires_grad_(True)
+    pr = proprio(3).requires_grad_(True)
     c = S.sparse_simplex(3)
-    loss = act_loss(dec, z, c, None, embodiment=BODY_A)
+    loss = act_loss(dec, pr, c, None, embodiment=BODY_A)
     assert loss.ndim == 0 and loss.item() == 0.0
     loss.backward()                                  # must not raise
-    assert torch.count_nonzero(z.grad) == 0
+    assert torch.count_nonzero(pr.grad) == 0
     assert all(p.grad is None for p in dec.parameters())
 
 
 def test_act_loss_action_free_sums_with_other_losses():
     dec = Decoder([BODY_A], **SMALL_DEC)
     z, c = belief(2), S.sparse_simplex(2)
-    total = act_loss(dec, z, c, None, embodiment=BODY_A) + balance_loss(c) \
+    total = act_loss(dec, proprio(2), c, None, embodiment=BODY_A) + balance_loss(c) \
         + dyn_loss(frozen_bank(), z, S.sparse_simplex(2, C.DEPTH),
                    torch.randn(2, C.DEPTH, C.K, C.D), negatives="none")["loss"]
     assert torch.isfinite(total)
@@ -471,7 +481,7 @@ def test_zero_loss_is_detached_when_nothing_requires_grad():
 def test_act_loss_dispatches_by_embodiment(body, dof):
     """done-when 4: two synthetic bodies, dof 7 and 14, routed by name."""
     dec = Decoder([BODY_A, BODY_B], **SMALL_DEC)
-    loss = act_loss(dec, belief(3), S.sparse_simplex(3),
+    loss = act_loss(dec, proprio(3, dof), S.sparse_simplex(3),
                     torch.randn(3, C.H_OP, dof), embodiment=body)
     assert torch.isfinite(loss) and loss.ndim == 0
     loss.backward()
@@ -482,7 +492,7 @@ def test_act_loss_dispatches_by_embodiment(body, dof):
 def test_act_loss_rejects_the_wrong_dof_for_the_body():
     dec = Decoder([BODY_A, BODY_B], **SMALL_DEC)
     with pytest.raises(ValueError):
-        act_loss(dec, belief(2), S.sparse_simplex(2),
+        act_loss(dec, proprio(2), S.sparse_simplex(2),
                  torch.randn(2, C.H_OP, DOF_B), embodiment=BODY_A)
 
 
@@ -492,13 +502,13 @@ def test_act_loss_accepts_a_whole_window_of_segments():
     torch.manual_seed(5)
     dec = Decoder([BODY_A], **SMALL_DEC)
     b = 3
-    z = torch.randn(b, C.DEPTH, C.K, C.D)
+    pr = torch.randn(b, C.DEPTH, DOF_A)
     c = S.sparse_simplex(b, C.DEPTH)
     a = torch.randn(b, C.DEPTH, C.H_OP, DOF_A)
     x0, t = torch.randn(b * C.DEPTH, C.H_OP, DOF_A), torch.rand(b * C.DEPTH)
 
-    got = act_loss(dec, z, c, a, embodiment=BODY_A, t=t, noise=x0)
-    want = dec.loss(z.flatten(0, 1), c.flatten(0, 1), a.flatten(0, 1),
+    got = act_loss(dec, pr, c, a, embodiment=BODY_A, t=t, noise=x0)
+    want = dec.loss(pr.flatten(0, 1), c.flatten(0, 1), a.flatten(0, 1),
                     embodiment=BODY_A, t=t, noise=x0)
     assert torch.allclose(got, want, atol=1e-6)
 
@@ -506,7 +516,7 @@ def test_act_loss_accepts_a_whole_window_of_segments():
 def test_act_loss_rejects_h_plan_segments():
     dec = Decoder([BODY_A], **SMALL_DEC)
     with pytest.raises(ValueError):
-        act_loss(dec, belief(2), S.sparse_simplex(2),
+        act_loss(dec, proprio(2), S.sparse_simplex(2),
                  torch.randn(2, C.H_PLAN, DOF_A), embodiment=BODY_A)
 
 
@@ -659,7 +669,11 @@ def test_balance_is_minimised_at_uniform():
 def test_balance_uses_the_contract_coefficient():
     c = S.sparse_simplex(8)
     assert torch.allclose(balance_loss(c), C.BALANCE_COEF * balance_kl(c))
-    assert C.BALANCE_COEF == 3e-3
+    # 3e-3 -> 1e-2, owner-authorised. `balance_kl` itself is unchanged and is
+    # NOT what R0-A executes any more: `loop._switch_balance` is (see that
+    # function, and `tests/test_train.py::test_switch_balance_*`). This file
+    # still pins the KL because it is the reference the Switch form replaced.
+    assert C.BALANCE_COEF == 1e-2
 
 
 def test_balance_direction_is_forward_kl_and_stays_finite_on_dead_operators():
@@ -719,9 +733,11 @@ def test_the_full_r0a_loss_sum_backpropagates(action_free):
         c_act = qa(actions[:, 0], z[0], embodiment=BODY_A)
         total = total + q_action_regression_loss(qa, actions[:, 0], z[0],
                                                  c_delta[:, 0], embodiment=BODY_A)
-        total = total + act_loss(dec, z[0], c_act, actions[:, 0], embodiment=BODY_A)
+        total = total + act_loss(dec, proprio(b), c_act, actions[:, 0],
+                                 embodiment=BODY_A)
     else:
-        total = total + act_loss(dec, z[0], c_delta[:, 0], None, embodiment=BODY_A)
+        total = total + act_loss(dec, proprio(b), c_delta[:, 0], None,
+                                 embodiment=BODY_A)
 
     assert torch.isfinite(total)
     total.backward()

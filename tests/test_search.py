@@ -478,18 +478,32 @@ class TargetPotential(nn.Module):
 
 
 class EchoDecoder(nn.Module):
-    """Records the `c` it was asked to realize so the rigged q_a can see it."""
+    """Records the `c` it was asked to realize so the rigged q_a can see it.
+
+    `contracts.Decoder` is `forward(proprio, c)` -- the belief is not an input
+    to `D_e` (see `loom/heads/decoder.py`), so the gate has to hand this a
+    `(B, dof_e)` proprio.
+    """
 
     def __init__(self, dof: int = 7) -> None:
         super().__init__()
         self.dof, self.last_c = dof, None
 
-    def forward(self, z: Tensor, c: Tensor) -> Tensor:
+    def forward(self, proprio: Tensor, c: Tensor) -> Tensor:
         self.last_c = c
-        return torch.zeros(z.shape[0], C.H_OP, self.dof, device=z.device, dtype=z.dtype)
+        assert proprio.ndim == 2 and proprio.shape[-1] == self.dof, (
+            f"D_e takes (B, dof) proprio, got {tuple(proprio.shape)}"
+        )
+        return torch.zeros(proprio.shape[0], C.H_OP, self.dof,
+                           device=proprio.device, dtype=proprio.dtype)
 
-    def loss(self, z, c, a_seg):
-        return (self.forward(z, c) - a_seg).pow(2).mean()
+    def loss(self, proprio, c, a_seg):
+        return (self.forward(proprio, c) - a_seg).pow(2).mean()
+
+
+def _proprio(b: int, dof: int = 7) -> Tensor:
+    """One timestep of body state, `(B, dof_e)`. What `D_e` conditions on."""
+    return torch.randn(b, dof)
 
 
 class RiggedQAction(nn.Module):
@@ -584,7 +598,17 @@ def test_realizability_residual_is_zero_for_a_perfect_pair():
     dec = EchoDecoder()
     qa = RiggedQAction(dec, reject=[])
     z, c = torch.randn(2, C.K, C.D), S.sparse_simplex(2)
-    assert float(realizability_residual(z, c, qa, dec).max()) < 1e-6
+    assert float(realizability_residual(z, c, qa, dec, _proprio(2)).max()) < 1e-6
+
+
+def test_gate_requires_proprio_because_d_e_does_not_take_the_belief():
+    b, n = 1, 4
+    bank, phi = PassBank(), Potential(lang_dim=32)
+    z, lang = torch.randn(b, C.K, C.D), torch.randn(b, 7, 32)
+    dec = EchoDecoder()
+    with pytest.raises(ValueError):
+        shooting(FixedProposal(_fixed_candidates(b, n)), bank, phi, z, lang,
+                 n=n, q_action=RiggedQAction(dec, reject=[]), decoder=dec)
 
 
 def test_gate_falls_through_to_the_runner_up():
@@ -600,7 +624,7 @@ def test_gate_falls_through_to_the_runner_up():
     qa = RiggedQAction(dec, reject=[top[0]])
 
     c_root, info = shooting(FixedProposal(c_seq), bank, phi, z, lang,
-                            n=n, q_action=qa, decoder=dec)
+                            n=n, q_action=qa, decoder=dec, proprio=_proprio(b))
 
     assert torch.equal(c_root, runner_up), "must fall through to the runner-up"
     assert int(info["index"]) == 1 and int(info["rank"]) == 1
@@ -621,7 +645,7 @@ def test_gate_walks_the_ranking_not_a_single_retry():
     qa = RiggedQAction(dec, reject=[c_seq[0, i, 0] for i in range(3)])
 
     c_root, info = shooting(FixedProposal(c_seq), bank, phi, z, lang,
-                            n=n, q_action=qa, decoder=dec)
+                            n=n, q_action=qa, decoder=dec, proprio=_proprio(b))
 
     assert int(info["rank"]) == 3 and int(info["n_rejected"]) == 3
     assert torch.equal(c_root, c_seq[:, 3, 0])
@@ -640,7 +664,7 @@ def test_gate_never_returns_nothing():
     qa = RiggedQAction(dec, reject=[c_seq[0, i, 0] for i in range(n)])
 
     c_root, info = shooting(FixedProposal(c_seq), bank, phi, z, lang,
-                            n=n, q_action=qa, decoder=dec)
+                            n=n, q_action=qa, decoder=dec, proprio=_proprio(b))
 
     assert bool(info["gate_exhausted"])
     assert int(info["rank"]) == 0 and int(info["n_rejected"]) == n
@@ -658,7 +682,7 @@ def test_gate_is_per_batch_element():
     dec = EchoDecoder()
     qa = RiggedQAction(dec, reject=[c_seq[0, 0, 0]])          # only element 0's top
     _, info = shooting(FixedProposal(c_seq), bank, phi, z, lang,
-                       n=n, q_action=qa, decoder=dec)
+                       n=n, q_action=qa, decoder=dec, proprio=_proprio(b))
     assert info["rank"].tolist() == [1, 0]
     assert info["n_rejected"].tolist() == [1, 0]
 
@@ -679,6 +703,7 @@ def test_gate_runs_against_the_stub_heads():
     z, lang = torch.randn(b, C.K, C.D), torch.randn(b, 7, 32)
     c_root, info = shooting(FixedProposal(_fixed_candidates(b, n)), bank, phi, z, lang,
                             n=n, q_action=S.StubQAction(), decoder=S.StubDecoder(),
+                            proprio=_proprio(b),
                             max_gate_evals=3)
     assert c_root.shape == (b, C.M)
     C.assert_simplex(c_root)

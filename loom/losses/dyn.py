@@ -90,11 +90,18 @@ NEGATIVE_MODES = ("none", "within_trajectory")
 # ═══════════════════════════════════════════════════════════════════════════
 
 def ln_cosine(a: Tensor, b: Tensor, mode: str = "per_slot") -> Tensor:
-    """cos(LN(a), LN(b)) for beliefs (..., K, D) -> (...).
+    """cos(LN(a), LN(b)) for beliefs (..., K, D) -> (...), always in float32.
 
     mode="per_slot": LN over D, cosine over D, mean over K   (default, see module doc)
     mode="flat":     LN over (K, D), cosine over the flattened vector
+
+    **The upcast is not optional.** The run is bf16, and a bf16 cosine over
+    D=768 accumulates in 8 mantissa bits: the reduction noise is of the same
+    order as the signal this loss is trying to move. It is also what the loop's
+    previous inline implementation did, so `loss/dyn` and `delta_op` stay
+    numerically comparable with every run logged before the hinge was wired in.
     """
+    a, b = a.float(), b.float()
     if mode == "per_slot":
         an = F.layer_norm(a, a.shape[-1:])
         bn = F.layer_norm(b, b.shape[-1:])
@@ -129,13 +136,28 @@ def sequential_rollout(bank: Bank, z0: Tensor, c_seq: Tensor) -> list[Tensor]:
     return out
 
 
+def _draw(*shape: int, generator: torch.Generator | None, device) -> Tensor:
+    """Uniforms drawn where `generator` lives, then moved to `device`.
+
+    `loom.train.determinism.torch_generator` returns a **CPU** generator (that
+    is what makes a step a pure function of `(seed, global_step, rank)` on any
+    device), and `torch.rand(..., device="cuda", generator=<cpu gen>)` is a hard
+    error -- "Expected a 'cuda' device type for generator but found 'cpu'". The
+    draws here are (B*DEPTH, M) at most, so making the choice on CPU and moving
+    the indices costs nothing and works with either kind of generator.
+    """
+    gen_dev = torch.device("cpu") if generator is None else generator.device
+    out = torch.rand(*shape, device=gen_dev, generator=generator)
+    return out.to(device)
+
+
 def random_simplex_like(c: Tensor, topk: int = TOPK,
                         generator: torch.Generator | None = None) -> Tensor:
     """Uniform-support random point on the top-k simplex, shaped like `c`."""
     flat = c.detach().reshape(-1, c.shape[-1]).float()
     n, m = flat.shape
-    idx = torch.rand(n, m, device=c.device, generator=generator).argsort(dim=1)[:, :topk]
-    w = torch.rand(n, topk, device=c.device, generator=generator)
+    idx = _draw(n, m, generator=generator, device=c.device).argsort(dim=1)[:, :topk]
+    w = _draw(n, topk, generator=generator, device=c.device)
     w = w / w.sum(-1, keepdim=True)
     out = torch.zeros_like(flat).scatter_(1, idx, w)
     return out.reshape(c.shape).to(c.dtype)
@@ -159,7 +181,15 @@ def sample_within_trajectory_negatives(
     if c_seq.ndim != 3:
         raise ValueError(f"expected (B, DEPTH, M), got {tuple(c_seq.shape)}")
     b, depth, m = c_seq.shape
-    offs = torch.arange(depth, device=c_seq.device)
+    # The candidate table is (DEPTH, DEPTH) of 0/1 -- it depends on nothing but
+    # `depth` and `min_gap`, so it is built where the GENERATOR lives and the
+    # resulting indices are moved to the coefficients' device. Building it on
+    # `c_seq.device` instead is the trap: `torch_generator` hands back a CPU
+    # generator and `torch.multinomial(<cuda tensor>, generator=<cpu gen>)` is a
+    # hard error, which turns the configured hinge into a crash on the first
+    # GPU step while every CPU test stays green.
+    gen_dev = torch.device("cpu") if generator is None else generator.device
+    offs = torch.arange(depth, device=gen_dev)
     valid = (offs[None, :] - offs[:, None]).abs() >= min_gap       # (DEPTH, DEPTH)
     if not bool(valid.any(-1).all()):
         # e.g. DEPTH=3 with min_gap=2: the middle segment has no partner at all.
@@ -170,7 +200,7 @@ def sample_within_trajectory_negatives(
     pick = torch.multinomial(
         valid.float().expand(b, depth, depth).reshape(b * depth, depth),
         num_samples=1, replacement=True, generator=generator,
-    ).view(b, depth)
+    ).view(b, depth).to(c_seq.device)
     return c_seq.detach().gather(1, pick[..., None].expand(b, depth, m))
 
 
@@ -266,6 +296,12 @@ def dyn_loss(
         delta_op   scalar, MUST be > 0  (build assert, detached)
         cos_pos    scalar, mean cosine of the h=1 prediction to its target
         per_h      (H,) unweighted per-horizon distances, detached
+        z_hat1     (B,K,D) the FIRST rollout state, still attached. Returned so
+                   the caller can run `fsdp.assert_bf16` on the thing the bank
+                   actually produced -- the bank casts `c` to its own parameter
+                   dtype, so an fp32 master-weight bank fed a bf16 coefficient
+                   silently promotes the whole affine rollout, and the only
+                   symptom is a memory number.
     """
     if negatives not in NEGATIVE_MODES:
         raise ValueError(f"negatives must be one of {NEGATIVE_MODES}, got {negatives!r}")
@@ -311,6 +347,7 @@ def dyn_loss(
         "delta_op": delta_op,
         "cos_pos": (1.0 - d_pos[0].detach().mean()),
         "per_h": torch.stack([d.detach().mean() for d in d_pos]),
+        "z_hat1": z_hat[0],
     }
 
 

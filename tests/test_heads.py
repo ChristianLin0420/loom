@@ -52,6 +52,16 @@ def belief(b: int = 3, dtype=torch.float32) -> torch.Tensor:
     return torch.randn(b, C.K, C.D, dtype=dtype)
 
 
+def proprio(b: int = 3, dof: int = DOF_A, dtype=torch.float32) -> torch.Tensor:
+    """`ObsFeats["proprio"]` — ONE timestep, `(B, dof_e)`.
+
+    This, and NOT the belief, is what `D_e` takes. See `loom/heads/decoder.py`:
+    given the whole `(B, K, D)` belief the decoder is a behaviour-cloning head
+    and `L_act` puts no pressure on `c` at all.
+    """
+    return torch.randn(b, dof, dtype=dtype)
+
+
 @torch.no_grad()
 def _pin_field(dec: DecoderBody, value: float) -> None:
     """Pin v_theta to a known constant so the CFM algebra can be checked exactly."""
@@ -432,7 +442,7 @@ def test_decoder_satisfies_the_protocol():
 def test_decoder_emits_one_operator_never_h_plan(body, dof):
     """done-when 6: shape[-2] == H_OP, explicitly != H_PLAN, validator passes."""
     dec = Decoder([BODY_A, BODY_B], **SMALL_DEC)
-    a = dec(belief(3), S.sparse_simplex(3), embodiment=body)
+    a = dec(proprio(3, dof), S.sparse_simplex(3), embodiment=body)
     assert a.shape == (3, C.H_OP, dof)
     assert a.shape[-2] == C.H_OP
     assert a.shape[-2] != C.H_PLAN
@@ -441,14 +451,14 @@ def test_decoder_emits_one_operator_never_h_plan(body, dof):
 
 def test_decoder_loss_is_a_finite_scalar():
     dec = Decoder([BODY_A], **SMALL_DEC)
-    loss = dec.loss(belief(4), S.sparse_simplex(4), torch.randn(4, C.H_OP, DOF_A))
+    loss = dec.loss(proprio(4), S.sparse_simplex(4), torch.randn(4, C.H_OP, DOF_A))
     assert loss.ndim == 0 and torch.isfinite(loss) and loss > 0
 
 
 def test_decoder_loss_rejects_h_plan_segments():
     dec = Decoder([BODY_A], **SMALL_DEC)
     with pytest.raises(ValueError):
-        dec.loss(belief(2), S.sparse_simplex(2), torch.randn(2, C.H_PLAN, DOF_A))
+        dec.loss(proprio(2), S.sparse_simplex(2), torch.randn(2, C.H_PLAN, DOF_A))
 
 
 def test_cfm_target_is_the_conditional_velocity():
@@ -459,11 +469,11 @@ def test_cfm_target_is_the_conditional_velocity():
     """
     dec = DecoderBody(BODY_A, **SMALL_DEC)
     _pin_field(dec, 0.25)                      # make v_theta a known constant
-    z, c = belief(4), S.sparse_simplex(4)
+    p, c = proprio(4), S.sparse_simplex(4)
     a = torch.randn(4, C.H_OP, DOF_A)
     x0 = torch.randn_like(a)
     t = torch.rand(4)
-    got = dec.loss(z, c, a, t=t, noise=x0)
+    got = dec.loss(p, c, a, t=t, noise=x0)
     want = (0.25 - (a - x0)).pow(2).flatten(1).mean(-1).mean()
     assert torch.allclose(got, want, atol=1e-5)
 
@@ -473,10 +483,10 @@ def test_cfm_loss_is_independent_of_t_for_a_constant_field():
     t, which is the defining property of the straight (rectified) path."""
     dec = DecoderBody(BODY_A, **SMALL_DEC)
     _pin_field(dec, 0.1)
-    z, c = belief(4), S.sparse_simplex(4)
+    p, c = proprio(4), S.sparse_simplex(4)
     a, x0 = torch.randn(4, C.H_OP, DOF_A), torch.randn(4, C.H_OP, DOF_A)
-    lo = dec.loss(z, c, a, t=torch.zeros(4), noise=x0)
-    hi = dec.loss(z, c, a, t=torch.ones(4), noise=x0)
+    lo = dec.loss(p, c, a, t=torch.zeros(4), noise=x0)
+    hi = dec.loss(p, c, a, t=torch.ones(4), noise=x0)
     assert torch.allclose(lo, hi, atol=1e-6)
 
 
@@ -486,7 +496,7 @@ def test_euler_integration_uses_the_requested_number_of_steps():
     dec = DecoderBody(BODY_A, clamp=False, **{**SMALL_DEC, "n_steps": 7})
     _pin_field(dec, 0.3)
     x0 = torch.randn(2, C.H_OP, DOF_A)
-    out = dec(belief(2), S.sparse_simplex(2), noise=x0)
+    out = dec(proprio(2), S.sparse_simplex(2), noise=x0)
     assert torch.allclose(out, x0 + 0.3, atol=1e-5)
     assert dec.n_steps == 7
 
@@ -500,21 +510,52 @@ def test_decoder_output_respects_the_action_bounds():
     """Clamped in forward (eval-safe); the CFM target is NOT clamped."""
     dec = Decoder([BODY_B], **SMALL_DEC)
     spec = C.EMBODIMENTS[BODY_B]
-    a = dec(belief(8), S.sparse_simplex(8), embodiment=BODY_B)
+    a = dec(proprio(8, DOF_B), S.sparse_simplex(8), embodiment=BODY_B)
     assert (a >= spec.action_low[0] - 1e-5).all() and (a <= spec.action_high[0] + 1e-5).all()
 
-    raw = dec(belief(8), S.sparse_simplex(8), embodiment=BODY_B, clamp=False,
+    raw = dec(proprio(8, DOF_B), S.sparse_simplex(8), embodiment=BODY_B, clamp=False,
               noise=torch.full((8, C.H_OP, DOF_B), 9.0))
     assert raw.abs().max() > spec.action_high[0]             # nothing clamps in the field
 
 
-def test_decoder_gradient_flows_from_loss_to_belief_and_coefficients():
+def test_decoder_gradient_flows_from_loss_to_proprio_and_coefficients():
     dec = Decoder([BODY_A], **SMALL_DEC)
-    z = belief(3).requires_grad_(True)
+    p = proprio(3).requires_grad_(True)
     c = S.sparse_simplex(3).requires_grad_(True)
-    dec.loss(z, c, torch.randn(3, C.H_OP, DOF_A)).backward()
-    assert z.grad is not None and z.grad.abs().sum() > 0
+    dec.loss(p, c, torch.randn(3, C.H_OP, DOF_A)).backward()
+    assert p.grad is not None and p.grad.abs().sum() > 0
     assert c.grad is not None and c.grad.abs().sum() > 0
+
+
+def test_decoder_refuses_the_belief_where_proprio_belongs():
+    """The whole point of the contract change: `D_e` does not take `(B,K,D)`.
+
+    A silently-broadcast belief would give a `(B, K, d)` condition and a decoder
+    that trains and scores near zero, which is the failure mode this repo keeps
+    paying for. Fail loudly instead.
+    """
+    dec = Decoder([BODY_A], **SMALL_DEC)
+    with pytest.raises(ValueError):
+        dec(belief(2), S.sparse_simplex(2))
+    with pytest.raises(ValueError):
+        dec.loss(belief(2), S.sparse_simplex(2), torch.randn(2, C.H_OP, DOF_A))
+
+
+def test_decoder_output_depends_on_the_coefficient():
+    """With `z` gone, `c` is the only channel carrying task information in.
+
+    Not a strong claim about a trained model -- an untrained field is small --
+    but it pins that the coefficient reaches the output at all, which is what
+    `L_act` needs in order to be a training signal for the operator.
+    """
+    torch.manual_seed(3)
+    dec = DecoderBody(BODY_A, clamp=False, **SMALL_DEC)
+    p = proprio(6)
+    x0 = torch.randn(6, C.H_OP, DOF_A)
+    c1, c2 = S.sparse_simplex(6), S.sparse_simplex(6)
+    a1 = dec(p, c1, noise=x0)
+    a2 = dec(p, c2, noise=x0)
+    assert (a1 - a2).abs().max() > 0, "c does not reach the action at all"
 
 
 def test_decoder_bodies_are_separate_and_dispatch_rejects_junk():
@@ -523,22 +564,28 @@ def test_decoder_bodies_are_separate_and_dispatch_rejects_junk():
     with pytest.raises(KeyError):
         dec.body("not_a_body")
     with pytest.raises(ValueError):
-        dec(belief(2), S.sparse_simplex(2))                  # ambiguous, 2 bodies
+        dec(proprio(2), S.sparse_simplex(2))                 # ambiguous, 2 bodies
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_decoder_dtype_is_preserved(dtype):
     dec = Decoder([BODY_A], **SMALL_DEC).to(dtype)
-    z, c = belief(2, dtype), S.sparse_simplex(2, dtype=dtype)
-    a = dec(z, c)
+    p, c = proprio(2, dtype=dtype), S.sparse_simplex(2, dtype=dtype)
+    a = dec(p, c)
     assert a.dtype is dtype and not a.is_complex()
-    loss = dec.loss(z, c, torch.randn(2, C.H_OP, DOF_A, dtype=dtype))
+    loss = dec.loss(p, c, torch.randn(2, C.H_OP, DOF_A, dtype=dtype))
     assert loss.dtype is dtype and torch.isfinite(loss)
 
 
 @pytest.mark.slow
 def test_decoder_parameter_budget_per_body():
-    """done-when 10: D_e ~ 20 M per body, +/- 40%."""
+    """done-when 10: D_e ~ 20 M per body, +/- 40%.
+
+    ~18 M since the belief pool left: `AttnPool` + `z_proj` were 2.7 M of the
+    20.9 M, replaced by a `Linear(dof, d)` of 4 k. Still inside the budget, and
+    deliberately NOT padded back out -- the head's capacity was never the
+    problem, its input was.
+    """
     n = n_params(Decoder([BODY_A]).body(BODY_A))
     assert 12e6 <= n <= 28e6, f"decoder is {n / 1e6:.1f} M/body, budget is 20 M"
 
@@ -557,7 +604,7 @@ def test_full_size_heads_run_end_to_end_in_bf16():
 
     c = qd(z, zn)
     C.assert_simplex(c)
-    a = dec(z, c, embodiment=BODY_A)
+    a = dec(proprio(1, dtype=torch.bfloat16), c, embodiment=BODY_A)
     C.assert_action_segment(a, BODY_A)
     c2 = qa(a, z, embodiment=BODY_A)
     C.assert_simplex(c2)

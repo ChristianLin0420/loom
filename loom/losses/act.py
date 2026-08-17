@@ -5,6 +5,10 @@ parameterisation itself lives in `loom/heads/decoder.py`). Nothing is computed
 here that a decoder could not compute — the value of this file is the
 embodiment routing and the action-free path.
 
+`D_e` takes `(proprio, c)`, not `(z, c)`: with the whole belief available the
+decoder is a behaviour-cloning head and `L_act` puts no pressure at all on the
+coefficient. See `loom/heads/decoder.py` for the measurement.
+
 ACTION-FREE DATA
 ────────────────
 R1 trains on Ego4D / Ego-Exo4D / HoloAssist, where `TransitionWindow.actions is
@@ -51,36 +55,36 @@ def zero_loss(*ref: Tensor) -> Tensor:
     return torch.zeros(())
 
 
-def _flatten_segments(z: Tensor, c: Tensor, a: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+def _flatten_segments(p: Tensor, c: Tensor, a: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     """Fold an optional DEPTH axis into the batch.
 
-    Accepts either one segment per example — z (B,K,D), c (B,M), a (B,H_OP,dof) —
-    or a whole window — z (B,DEPTH,K,D), c (B,DEPTH,M), a (B,DEPTH,H_OP,dof).
-    The second form is what `TransitionWindow.actions` looks like, with `z` the
-    beliefs at the DEPTH operator-boundary states.
+    Accepts either one segment per example — p (B,dof), c (B,M), a (B,H_OP,dof) —
+    or a whole window — p (B,DEPTH,dof), c (B,DEPTH,M), a (B,DEPTH,H_OP,dof).
+    The second form is what `TransitionWindow.actions` looks like, with `p` the
+    proprio readings at the DEPTH operator-boundary states.
     """
     if a.ndim == 4:
-        if z.ndim != 4 or c.ndim != 3:
+        if p.ndim != 3 or c.ndim != 3:
             raise ValueError(
-                "batched-window form needs z (B,DEPTH,K,D) and c (B,DEPTH,M), "
-                f"got z {tuple(z.shape)}, c {tuple(c.shape)}"
+                "batched-window form needs proprio (B,DEPTH,dof) and c (B,DEPTH,M), "
+                f"got proprio {tuple(p.shape)}, c {tuple(c.shape)}"
             )
-        if not (z.shape[1] == c.shape[1] == a.shape[1]):
+        if not (p.shape[1] == c.shape[1] == a.shape[1]):
             raise ValueError(
-                f"DEPTH mismatch: z {z.shape[1]}, c {c.shape[1]}, a {a.shape[1]}"
+                f"DEPTH mismatch: proprio {p.shape[1]}, c {c.shape[1]}, a {a.shape[1]}"
             )
-        return z.flatten(0, 1), c.flatten(0, 1), a.flatten(0, 1)
+        return p.flatten(0, 1), c.flatten(0, 1), a.flatten(0, 1)
     if a.ndim != 3 or a.shape[-2] != H_OP:
         raise ValueError(
             f"an action segment is (B, {H_OP}, dof) — one operator, never H_PLAN; "
             f"got {tuple(a.shape)}"
         )
-    return z, c, a
+    return p, c, a
 
 
 def act_loss(
     decoder,
-    z: Tensor,
+    proprio: Tensor,
     c: Tensor,
     actions: Tensor | None,
     embodiment: str | None = None,
@@ -91,7 +95,10 @@ def act_loss(
     Args:
         decoder:    anything satisfying `contracts.Decoder` (per-body module or
                     the `ModuleDict` dispatcher from `loom.heads.decoder`).
-        z:          (B,K,D) or (B,DEPTH,K,D) belief(s) at operator boundaries.
+        proprio:    (B,dof) or (B,DEPTH,dof) proprio at the operator boundaries.
+                    **Not the belief** — `D_e` takes `(proprio, c)` so that `c`
+                    is the only channel carrying task information into the
+                    action; see `loom/heads/decoder.py`.
         c:          (B,M) or (B,DEPTH,M) operator coefficients, from q_a or q_Delta.
         actions:    (B,H_OP,dof) or (B,DEPTH,H_OP,dof); **None for action-free data**.
         embodiment: routing key. Optional for a single-body decoder.
@@ -99,11 +106,11 @@ def act_loss(
     Returns a scalar. Zero (graph-safe) when `actions is None`.
     """
     if actions is None:
-        return zero_loss(z, c)
-    z_f, c_f, a_f = _flatten_segments(z, c, actions)
+        return zero_loss(proprio, c)
+    p_f, c_f, a_f = _flatten_segments(proprio, c, actions)
     if embodiment is None:
-        return decoder.loss(z_f, c_f, a_f, **decoder_kwargs)
-    return decoder.loss(z_f, c_f, a_f, embodiment=embodiment, **decoder_kwargs)
+        return decoder.loss(p_f, c_f, a_f, **decoder_kwargs)
+    return decoder.loss(p_f, c_f, a_f, embodiment=embodiment, **decoder_kwargs)
 
 
 def q_action_regression_loss(

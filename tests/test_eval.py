@@ -322,6 +322,31 @@ def test_policy_executes_the_semantics_aware_segment():
     assert set(np.unique(acted[:, 6]).tolist()) <= {-1.0, 1.0}, "gripper interpolated"
 
 
+def test_policy_hands_the_decoder_proprio_and_not_the_belief():
+    """`a <- D_e(proprio_t, c)`. The eval half of the owner's contract change.
+
+    `contracts.Decoder` is `forward(proprio, c)` (see `loom/heads/decoder.py`:
+    with the belief in there, `L_act` is behaviour cloning and `c` is
+    decorative). Eval must call it the way training trained it -- a `(1, K, D)`
+    belief here would be the classic trains-fine-scores-zero seam.
+    """
+    seen = []
+
+    class SpyDecoder:
+        def forward(self, first, c):
+            seen.append(tuple(first.shape))
+            return torch.zeros(1, C.H_OP, 7)
+
+    mods = pol._stub_modules("libero_franka", "cpu")
+    mods.decoder = SpyDecoder()
+    p = pol.LoomPolicy(mods, n_candidates=2)
+    p.reset()
+    p.act({"state": np.zeros(7, dtype=np.float32)}, "task")
+
+    assert seen == [(1, 7)], seen
+    assert seen[0] != (1, C.K, C.D), "the belief reached D_e"
+
+
 def test_policy_emits_one_action_per_env_step_with_the_right_shape():
     p = stub_loom_policy()
     p.reset()

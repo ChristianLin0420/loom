@@ -993,6 +993,276 @@ def test_every_run_config_loads_and_is_self_consistent(stage):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  8b · THE R0-A RERUN: proprio-only decoder, real hinge, Switch balance
+#
+#  Three changes the project owner authorised, and the metrics that read them.
+#  Each one has a measured failure behind it; the comments name it, because the
+#  numbers are the only reason any of this is here.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _stub_cfg(**over) -> dict:
+    cfg = {"data": {"batch_per_gpu": 4, "embodiments": ["libero_franka"]},
+           "model": {"use_stubs": True},
+           "losses": {"dyn": {"enabled": True, "negatives": "within_trajectory"},
+                      "act": {"enabled": True},
+                      "balance": {"enabled": True, "weight": C.BALANCE_COEF}}}
+    for k, v in over.items():
+        cfg[k] = {**cfg.get(k, {}), **v} if isinstance(v, dict) else v
+    return cfg
+
+
+def test_decoder_is_given_proprio_and_never_the_belief():
+    """CHANGE 1. `D_e(proprio_t, c)`, so `c` is the only channel carrying task
+    information into the action.
+
+    With the belief in there, `L_act` is behaviour cloning: R0-A measured
+    `act/decode` falling 0.2489 -> 0.0559 while `c_a` held 2-3 distinct top-4
+    supports over 64 real training windows, i.e. the term put no pressure on
+    the coefficient whatsoever.
+    """
+    cfg = _stub_cfg()
+    model = build_model(cfg)
+    sampler = WindowSampler(cfg, rank=0, world=1, seed=0)
+    w = sampler.next(0)
+
+    seen = []
+    dec = model.decoder[w["embodiment"]]
+    real_loss = dec.loss
+
+    def spy(first, c, a_seg, *a, **kw):
+        seen.append(tuple(first.shape))
+        return real_loss(first, c, a_seg, *a, **kw)
+
+    dec.loss = spy
+    model.compute_losses(w, 0, 0, 0)
+
+    dof = C.EMBODIMENTS[w["embodiment"]].dof
+    assert seen == [(4, dof)] * C.DEPTH, seen
+    assert all(sh != (4, C.K, C.D) for sh in seen), "the belief reached D_e"
+
+
+def test_decoder_gets_the_proprio_at_the_start_of_its_own_segment():
+    """`window["feats"][h]["proprio"]`, not feats[0] and not feats[h+1].
+
+    Segment `h` covers canonical frames 8h..8h+7, so the conditioning state is
+    the one at frame 8h. Off by one here trains fine and scores near zero.
+    """
+    cfg = _stub_cfg()
+    model = build_model(cfg)
+    w = WindowSampler(cfg, rank=0, world=1, seed=0).next(0)
+    for h in range(C.N_STATES):                     # make each state identifiable
+        w["feats"][h]["proprio"] = torch.full_like(w["feats"][h]["proprio"], float(h))
+
+    seen = []
+    dec = model.decoder[w["embodiment"]]
+    real_loss = dec.loss
+    dec.loss = lambda p, c, a, *x, **k: (seen.append(float(p[0, 0])),
+                                         real_loss(p, c, a, *x, **k))[1]
+    model.compute_losses(w, 0, 0, 0)
+    assert seen == [0.0, 1.0, 2.0, 3.0], seen
+
+
+def test_l_dyn_runs_the_configured_within_trajectory_hinge():
+    """CHANGE 2. The loop used to compute a bare `1 - cos(A(c)z, z+)` with NO
+    negatives, so `losses.dyn.negatives` was inert in every config that set it.
+
+    `dyn/neg` is the hinge term. It must be reported, and it must be exactly
+    zero when negatives are off -- otherwise the switch is not doing anything
+    either way and the metric cannot be read.
+    """
+    on = build_model(_stub_cfg())
+    w = WindowSampler(_stub_cfg(), rank=0, world=1, seed=0).next(0)
+    m_on = on.compute_losses(w, 0, 0, 0)[1]
+    assert "dyn/neg" in m_on
+    assert m_on["dyn/neg"] > 0.0, "the hinge is wired but never fires"
+
+    off_cfg = _stub_cfg(losses={"dyn": {"enabled": True, "negatives": "none"},
+                                "act": {"enabled": True},
+                                "balance": {"enabled": True}})
+    off = build_model(off_cfg)
+    m_off = off.compute_losses(w, 0, 0, 0)[1]
+    assert m_off["dyn/neg"] == 0.0
+
+
+def test_l_dyn_negatives_draw_on_a_cpu_generator_against_device_tensors():
+    """The trap a previous attempt at this hit.
+
+    `torch_generator` returns a CPU generator -- that is what makes a step a
+    pure function of `(seed, global_step, rank)` on any device -- and
+    `torch.multinomial(<cuda tensor>, generator=<cpu gen>)` is a hard error.
+    The choice therefore has to be made where the generator lives and the
+    indices moved. Checked on CPU by handing the sampler a generator and a
+    coefficient tensor and requiring the result to land on the tensor's device.
+    """
+    from loom.losses.dyn import sample_within_trajectory_negatives
+    from loom.train.determinism import torch_generator
+
+    c_seq = S.sparse_simplex(3, C.DEPTH)
+    g = torch_generator(0, 0, 0, tag="dyn")
+    assert g.device.type == "cpu", "the generator contract changed"
+    neg = sample_within_trajectory_negatives(c_seq, 2, g)
+    assert neg.shape == c_seq.shape and neg.device == c_seq.device
+    # min_gap=2 with DEPTH=4: 0->{2,3}, 1->{3}, 2->{0}, 3->{0,1}. Segment 1 has
+    # exactly one legal partner, so that row is checkable outright.
+    assert torch.equal(neg[:, 1], c_seq[:, 3])
+
+
+def test_switch_balance_floor_ceiling_and_direction():
+    """CHANGE 3. `M * sum_m f_m P_m`, with `f` the routing-slot fraction and `P`
+    the mean DENSE router probability.
+
+    Degenerate floor is exactly 1.0 (both uniform) -- know it before reading a
+    flat curve as progress. Ceiling is `M / TOPK = 32`, every token on the same
+    four operators with a router that is certain about it.
+    """
+    from loom.train.loop import _switch_balance
+
+    m = C.M
+    # uniform routing AND a uniform router
+    c = torch.zeros(m, m)
+    for i in range(m):
+        c[i, [(i + j) % m for j in range(C.TOPK)]] = 1.0 / C.TOPK
+    flat = torch.zeros(m, m)
+    assert float(_switch_balance(c, flat)) == pytest.approx(1.0, abs=1e-5)
+
+    # everyone on the same four, router certain about those four
+    same = torch.zeros(8, m)
+    same[:, : C.TOPK] = 1.0 / C.TOPK
+    peaked = torch.full((8, m), -30.0)
+    peaked[:, : C.TOPK] = 30.0
+    assert float(_switch_balance(same, peaked)) == pytest.approx(m / C.TOPK, abs=1e-3)
+
+    # same routing, uniform router: still above the floor is NOT claimed --
+    # the term is a product, and a flat P is exactly the floor by construction.
+    assert float(_switch_balance(same, flat)) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_switch_balance_pushes_an_operator_that_is_in_no_support_back_up():
+    """A dead operator must still get gradient, and it must point UP."""
+    from loom.heads.q_delta import topk_simplex_st
+    from loom.train.loop import _switch_balance
+
+    torch.manual_seed(0)
+    logits = torch.randn(16, C.M)
+    logits[:, 5] = -10.0                            # operator 5 is dead
+    logits = logits.requires_grad_(True)
+    c = topk_simplex_st(logits)
+    assert c[:, 5].sum() == 0.0
+    (C.BALANCE_COEF * _switch_balance(c, logits)).backward()
+    assert logits.grad[:, 5].abs().sum() > 0, "a dead operator gets no gradient"
+    assert (logits.grad[:, 5] < 0).all(), "gradient must push the dead operator UP"
+
+
+def test_switch_balance_reads_the_dense_router_and_not_only_the_hard_support():
+    """The substantive difference from the KL it replaces.
+
+    `KL(mean_batch(c) || uniform)` is a function of `c` alone, and `c` is
+    exactly zero outside the top-4 support: two routers that pick the same four
+    operators are indistinguishable to it no matter how differently confident
+    they are. The Switch form reads `P = mean_t softmax(logits)`, so moving an
+    out-of-support logit moves the loss.
+
+    Not a claim that the gradient is larger -- measured at random init it is
+    not (0.10 vs 0.12 unselected:selected). The magnitude change is
+    BALANCE_COEF 3e-3 -> 1e-2, and `grad_ratio/q_delta_logits` is logged every
+    100 steps so the real answer comes from the run rather than from here.
+    """
+    from loom.heads.q_delta import topk_simplex_st
+    from loom.losses.balance import balance_kl
+    from loom.train.loop import _switch_balance
+
+    torch.manual_seed(1)
+    base = torch.randn(16, C.M)
+    base[:, : C.TOPK] += 12.0                       # pin the support, both times
+    other = base.clone()
+    other[:, C.TOPK:] *= 3.0                        # only the LOSERS move
+
+    c_a, c_b = topk_simplex_st(base), topk_simplex_st(other)
+    assert torch.equal(c_a.topk(C.TOPK, -1).indices, c_b.topk(C.TOPK, -1).indices)
+
+    assert float(balance_kl(c_a)) == pytest.approx(float(balance_kl(c_b)), abs=1e-3)
+    assert abs(float(_switch_balance(c_a, base))
+               - float(_switch_balance(c_b, other))) > 1e-4
+
+
+def test_balance_utilization_is_reported_per_head_not_pooled():
+    """One pooled `bank/live_ops` cannot say that q_a had 7 operators alive and
+    q_Delta 19 (measured, ctrl, 64 real windows). Aggregate statistics hide the
+    structure -- CLAUDE.md, and it has cost a run before.
+    """
+    model = build_model(_stub_cfg())
+    w = WindowSampler(_stub_cfg(), rank=0, world=1, seed=0).next(0)
+    m = model.compute_losses(w, 0, 0, 0)[1]
+    for k in ("bank/live_ops", "bank/live_ops_q_delta", "bank/entropy_q_delta",
+              "bank/live_ops_q_a", "bank/entropy_q_a"):
+        assert k in m, f"{k} missing from {sorted(m)}"
+    assert 0 < m["bank/live_ops_q_delta"] <= C.M
+    assert 0.0 <= m["bank/entropy_q_delta"] <= math.log(C.M) + 1e-6
+
+
+def test_delta_sel_is_the_discrimination_guard_and_is_reported_per_horizon():
+    """`Delta_sel = d(A(c_other) z, z+) - d(A(c_true) z, z+)`, `c_other` a REAL
+    coefficient from another window in the batch.
+
+    `Delta_op` compares against a uniform random simplex point, so it only says
+    the bank is alive. This asks whether the coefficient THIS window produced
+    beats one another window produced, which is the question the method rests
+    on. On the R0-A checkpoints it was +0.0002 (ctrl) / +0.0000 (zinit).
+
+    Pinned here by construction rather than by value: with every window's `c`
+    identical, `c.roll(1)` is `c` and the gap must be exactly zero.
+    """
+    model = build_model(_stub_cfg())
+    zs = [torch.randn(4, C.K, C.D) for _ in range(C.N_STATES)]
+    zts = [torch.randn(4, C.K, C.D) for _ in range(C.N_STATES)]
+
+    one = S.sparse_simplex(1)
+    same = [one.expand(4, C.M).contiguous() for _ in range(C.DEPTH)]
+    m = model._delta_sel(zs, zts, same)
+    assert set(m) == {"delta_sel", *(f"delta_sel/h{h + 1}" for h in range(C.DEPTH))}
+    for k, v in m.items():
+        assert abs(v) < 1e-5, f"{k} = {v} with an identical c in every row"
+
+    # distinct coefficients: a real, finite, generally nonzero gap
+    m2 = model._delta_sel(zs, zts, [S.sparse_simplex(4) for _ in range(C.DEPTH)])
+    assert all(math.isfinite(v) for v in m2.values())
+
+
+def test_grad_probe_reports_the_q_delta_logit_ratio_on_its_cadence(tmp_path):
+    """The per-entry gradient ratio needs a backward, so it runs every
+    `optim.grad_probe_every` steps and not every step.
+
+    On the stub path q_Delta exposes no logits, so this exercises the cadence
+    and the "return nothing rather than something wrong" branch; the real head
+    fills the numbers in. `_probe_grad` is what `main` sets.
+    """
+    from loom.train.loop import GRAD_PROBE_EVERY
+
+    assert GRAD_PROBE_EVERY == 100
+    model = build_model(_stub_cfg())
+    assert model._probe_grad is False
+    assert model.grad_probe_metrics() == {}
+    model._probe_grad = True
+    w = WindowSampler(_stub_cfg(), rank=0, world=1, seed=0).next(0)
+    model.compute_losses(w, 0, 0, 0)
+    # stubs have no dense logits to hang retain_grad on -> nothing, not junk
+    assert model.grad_probe_metrics() == {}
+
+
+def test_a_stub_link_logs_every_new_metric(tmp_path):
+    """End to end through `main`, so the metrics really land in metrics.jsonl."""
+    cfg = write_test_config(tmp_path, run={"steps": 3, "log_every": 1},
+                            optim={"lr": 1e-3, "warmup": 2, "grad_probe_every": 1})
+    run_dir = tmp_path / "run"
+    run_link(cfg, run_dir)
+    rows = curve(run_dir)
+    assert len(rows) == 3
+    for k in ("delta_op", "delta_sel", "delta_sel/h1", "dyn/neg",
+              "bank/live_ops_q_delta", "bank/entropy_q_a", "act/decode"):
+        assert k in rows[-1], f"{k} missing from {sorted(rows[-1])}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  9 · THE THREE STOP PATHS
 # ═══════════════════════════════════════════════════════════════════════════
 

@@ -178,11 +178,13 @@ def test_real_decoder_emits_h_op_not_h_plan():
     and scores near zero."""
     dec = _instantiate(_try("loom.heads.decoder", "Decoder", "FlowDecoder"),
                        embodiments=("libero_franka",))
-    z, c = torch.randn(3, C.K, C.D), S.sparse_simplex(3)
+    # (B, dof_e) proprio, NOT the belief: `contracts.Decoder` is
+    # `forward(proprio, c)` -- see `loom/heads/decoder.py`.
+    pr, c = torch.randn(3, 7), S.sparse_simplex(3)
     try:
-        a = dec(z, c, "libero_franka")
+        a = dec(pr, c, "libero_franka")
     except TypeError:
-        a = dec(z, c)
+        a = dec(pr, c)
     assert a.shape[-2] == C.H_OP and a.shape[-2] != C.H_PLAN
     C.assert_action_segment(a, "libero_franka")
 
@@ -267,10 +269,11 @@ def test_decoder_segment_feeds_q_action_round_trip():
     q = _instantiate(_try("loom.heads.q_action", "QAction", "QActionHead"),
                      embodiments=("libero_franka",))
     z, c = torch.randn(2, C.K, C.D), S.sparse_simplex(2)
+    pr = torch.randn(2, 7)
     try:
-        a = dec(z, c, "libero_franka")
+        a = dec(pr, c, "libero_franka")
     except TypeError:
-        a = dec(z, c)
+        a = dec(pr, c)
     try:
         c_hat = q(a, z, "libero_franka")
     except TypeError:
