@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import json
 import math
+import os
 from pathlib import Path
 
 import numpy as np
@@ -729,6 +730,59 @@ def test_shard_is_a_partition():
     assert sum(len(s) for s in shards) == len(items)
     assert {i.key() for s in shards for i in s} == {i.key() for i in items}
     assert max(len(s) for s in shards) - min(len(s) for s in shards) <= 1
+
+
+def test_claim_device_pins_both_selectors(monkeypatch):
+    """CUDA_VISIBLE_DEVICES and MUJOCO_EGL_DEVICE_ID both name the worker's GPU."""
+
+    class Q:
+        def get_nowait(self):
+            return 3
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("MUJOCO_EGL_DEVICE_ID", raising=False)
+    runner.claim_device(Q())
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "3"
+    assert os.environ["MUJOCO_EGL_DEVICE_ID"] == "3"
+
+
+def test_claim_device_sets_cuda_visible_devices_before_touching_torch_cuda():
+    """The ordering, read out of the source — it cannot be observed at runtime.
+
+    `torch.cuda.is_available()` calls `cudaGetDeviceCount`, which latches
+    `CUDA_VISIBLE_DEVICES` for the life of the process; setting it afterwards is
+    a silent no-op and every worker's policy lands on physical GPU 0. Once CUDA
+    is initialised in this pytest process there is no way to detect that from
+    inside it, so the guard is the statement order in `claim_device`.
+    """
+    src = Path(runner.__file__).read_text()
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "claim_device")
+    set_line = min(
+        n.lineno for n in ast.walk(fn)
+        if isinstance(n, ast.Constant) and n.value == "CUDA_VISIBLE_DEVICES"
+    )
+    torch_cuda_line = min(
+        (n.lineno for n in ast.walk(fn)
+         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+         and n.func.id == "default_device"),
+        default=10**9,
+    )
+    assert set_line < torch_cuda_line, (
+        "claim_device must set CUDA_VISIBLE_DEVICES before the first torch.cuda "
+        "call, or the pin is a no-op and all workers share GPU 0"
+    )
+
+
+def test_init_worker_claims_its_device_first(monkeypatch):
+    """`_init_worker` must go through `claim_device`, not re-derive the device."""
+    src = Path(runner.__file__).read_text()
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "_init_worker")
+    calls = [n.func.id for n in ast.walk(fn)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    assert "claim_device" in calls
+    assert "default_device" not in calls
 
 
 def test_same_seed_gives_the_same_episode(tmp_path):

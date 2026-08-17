@@ -39,6 +39,7 @@ from loom.eval import EpisodeResult, EvalProtocol, episode_seed
 __all__ = [
     "WorkItem", "iter_work", "shard", "n_devices", "seed_fn_for",
     "ResultStore", "aggregate", "run_eval", "bench_module", "ensure_runtime",
+    "claim_device",
 ]
 
 RESULTS_VERSION = 1
@@ -379,23 +380,46 @@ def _run_item(
 _WORKER: dict[str, Any] = {}
 
 
-def _init_worker(device_queue, bench: str, ckpt: str | None,
-                 backend: str | None, policy_kw: dict) -> None:
-    """One policy per process, pinned to one device. Runs in the child."""
-    device = default_device()
+def claim_device(device_queue) -> str:
+    """Take this worker's GPU off the queue and pin **both** device selectors.
+
+    Order is the whole point, and getting it wrong is silent. The two selectors
+    are read at different moments by different libraries:
+
+    * `CUDA_VISIBLE_DEVICES` is latched by the CUDA driver at `cuInit`, which
+      `torch.cuda.is_available()` triggers via `cudaGetDeviceCount`. Setting it
+      **after** any torch.cuda call is a no-op for the rest of the process.
+    * `MUJOCO_EGL_DEVICE_ID` is read later, when the render context is created,
+      and EGL enumerates physical devices — it does not honour
+      `CUDA_VISIBLE_DEVICES`.
+
+    This function used to call `default_device()` first and set the variables
+    second, so only the EGL half took effect. Measured mid-run on an 8-worker
+    LIBERO job (`srun --overlap --jobid=32301529 nvidia-smi`): all eight worker
+    processes held 3.2 GiB each on the *same* physical GPU, which sat at 100%
+    while GPUs 1-7 carried only their 277 MiB EGL context. Nothing in the
+    results said so — the score is identical either way, which is exactly why
+    it survived two evaluations.
+
+    Returns the torch device string. After the pin, `cuda:0` **is** physical
+    `dev`, because the process can no longer see anything else.
+    """
+    dev = None
     if device_queue is not None:
         try:
             dev = device_queue.get_nowait()
-            if dev is not None:
-                os.environ["CUDA_VISIBLE_DEVICES"] = str(dev)
-                # EGL enumerates physical devices and does NOT honour
-                # CUDA_VISIBLE_DEVICES, so without this every worker renders on
-                # GPU 0 while its policy runs on GPU k. The run still completes;
-                # it just serialises the sim behind one device.
-                os.environ["MUJOCO_EGL_DEVICE_ID"] = str(dev)
-                device = "cuda:0"
         except Exception:                                # noqa: BLE001
-            pass
+            dev = None
+    if dev is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(dev)
+        os.environ["MUJOCO_EGL_DEVICE_ID"] = str(dev)
+    return default_device()                              # first torch.cuda call
+
+
+def _init_worker(device_queue, bench: str, ckpt: str | None,
+                 backend: str | None, policy_kw: dict) -> None:
+    """One policy per process, pinned to one device. Runs in the child."""
+    device = claim_device(device_queue)
     from loom.eval.policy import make_policy, policy_provenance  # noqa: PLC0415
 
     mod = bench_module(bench)
