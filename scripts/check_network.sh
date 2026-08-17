@@ -5,8 +5,11 @@
 # means 20 unsynced W&B directories, and discovering the wheel mismatch after 20
 # links means 20 links of CPU training that held 8 A100s each.
 #
-# Measured 2026-08: compute nodes have NO outbound route to api.wandb.ai, and the
-# driver is CUDA 12.2 (so torch must be 2.6.0+cu124, not a +cu13x wheel).
+# Re-measured 2026-08-17 on batch-block5-04009: compute nodes DO have an outbound
+# route (api.wandb.ai in 0.22 s; a real wandb.init in 1.8 s), so the sbatch files
+# use WANDB_MODE=online. An earlier measurement said otherwise. Re-run this before
+# a long chain rather than trusting either answer. Driver is CUDA 12.2, so torch
+# must be 2.6.0+cu124, not a +cu13x wheel.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

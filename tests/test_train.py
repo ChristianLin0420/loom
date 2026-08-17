@@ -1360,10 +1360,22 @@ def test_n_links_covers_the_planned_wall_time(stage, hours):
     assert n >= math.ceil(hours / 4), f"{stage}: {n} links cannot cover {hours} h"
 
 
-def test_sbatch_is_offline_and_carries_the_stable_wandb_id():
+def test_sbatch_sets_an_overridable_wandb_mode_and_the_stable_id():
+    """Mode is online (compute nodes have a route, re-measured 2026-08-17) but must
+    stay overridable; the stable id is what makes chained links one run.
+
+    This used to assert `WANDB_MODE=offline` outright, encoding a measurement that
+    had gone stale -- api.wandb.ai now answers from a compute node in 0.22 s and a
+    real `wandb.init` completes in 1.8 s. Assert the *rule* instead: a mode is set,
+    and `LOOM_WANDB_MODE` can override it without editing five files. Whether it
+    resolves to online or offline is a cluster fact, not an invariant, and
+    `wandb_util.init` degrades to offline by itself if the route disappears.
+    """
     for stage in STAGES:
         text = (SLURM / f"{stage}.sbatch").read_text()
-        assert "WANDB_MODE=offline" in text, "compute nodes have no route to api.wandb.ai"
+        assert 'WANDB_MODE="${LOOM_WANDB_MODE:-' in text, (
+            f"{stage}.sbatch must set WANDB_MODE with a LOOM_WANDB_MODE override"
+        )
         assert "wandb_id" in text and "WANDB_RUN_ID" in text
         assert 'WANDB_DIR="$RUN_DIR"' in text, "wandb appends wandb/ itself"
         assert "RANK=\"$SLURM_PROCID\"" in text, "rank must come from SLURM, not torchrun"

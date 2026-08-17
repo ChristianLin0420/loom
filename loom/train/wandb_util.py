@@ -49,7 +49,7 @@ def init(run_dir: str | Path, project: str, config: dict, rank: int = 0,
         print("[wandb] not installed; running without logging", flush=True)
         return None
 
-    run = wandb.init(
+    kw = dict(
         project=project or os.environ.get("WANDB_PROJECT", "loom"),
         id=stable_run_id(run_dir),
         name=name,
@@ -57,8 +57,35 @@ def init(run_dir: str | Path, project: str, config: dict, rank: int = 0,
         dir=str(run_dir),          # wandb appends wandb/ itself
         config=config,
     )
+
+    # Online mode reaches the network at init. Compute nodes DO have a route
+    # (measured: api.wandb.ai in 0.22 s, a real run inits in 1.8 s), but a blip
+    # at the wrong moment must never take down a 4 h link -- logging is a
+    # convenience and training is the deliverable. So: bound the init, and on
+    # any failure fall back to offline for this link. The stable run id means an
+    # offline link still merges into the same run once `wandb_sync.sh` runs.
+    mode = os.environ.get("WANDB_MODE", "online")
+    try:
+        run = wandb.init(settings=wandb.Settings(init_timeout=90), **kw)
+    except Exception as e:                                  # noqa: BLE001
+        print(f"[wandb] {mode} init failed ({type(e).__name__}: {e}); "
+              f"falling back to offline for this link. Sync later with "
+              f"`bash scripts/wandb_sync.sh <run>`.", flush=True)
+        os.environ["WANDB_MODE"] = "offline"
+        try:
+            run = wandb.init(settings=wandb.Settings(init_timeout=90), **kw)
+        except Exception as e2:                             # noqa: BLE001
+            print(f"[wandb] offline init also failed ({type(e2).__name__}: {e2}); "
+                  f"training continues without logging.", flush=True)
+            return None
+
+    print(f"[wandb] mode={os.environ.get('WANDB_MODE', mode)} id={kw['id']} "
+          f"url={getattr(run, 'url', None)}", flush=True)
     run.define_metric("*", step_metric="global_step")
     return run
+
+
+_LOG_FAILURES = 0
 
 
 def log(run, metrics: dict, global_step: int) -> None:
@@ -67,7 +94,20 @@ def log(run, metrics: dict, global_step: int) -> None:
     payload = dict(metrics)
     payload["global_step"] = global_step
     payload.setdefault("restart_count", int(os.environ.get("LOOM_RESTART_COUNT", 0)))
-    run.log(payload, step=global_step)
+    # Online mode talks to the network on every call. wandb buffers and retries
+    # internally, but an exception escaping here would kill training for a
+    # logging failure, which is the wrong trade at 16 GPUs. Warn a few times so
+    # it is visible in the log, then stay quiet rather than flooding it --
+    # metrics.jsonl on Lustre is the durable record either way.
+    global _LOG_FAILURES
+    try:
+        run.log(payload, step=global_step)
+    except Exception as e:                                  # noqa: BLE001
+        _LOG_FAILURES += 1
+        if _LOG_FAILURES <= 3:
+            print(f"[wandb] log failed at step {global_step} "
+                  f"({type(e).__name__}: {e}); training continues, "
+                  f"metrics.jsonl is unaffected.", flush=True)
 
 
 def finish(run) -> None:

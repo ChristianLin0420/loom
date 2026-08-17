@@ -71,8 +71,13 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 - Hard **4 h** walltime cap on every partition, 8×A100-80GB per node. An "8 h" run in
   PLAN §7 means ≥2 chained links; "6 d" means ~40.
 - **No container, no enroot, no `module load`.** A plain `.venv` activated in the sbatch.
-- Compute nodes have **no outbound network**. `WANDB_MODE=offline` is set in every sbatch;
-  sync from a login node with `bash scripts/wandb_sync.sh <run>`.
+- Compute nodes **do** have outbound network (re-measured on batch-block5-04009:
+  `api.wandb.ai` in 0.22 s, a real `wandb.init` in 1.8 s, run synced). An earlier note here
+  said otherwise and was stale. Every sbatch now sets `WANDB_MODE=online`, overridable with
+  `LOOM_WANDB_MODE=offline`. `wandb_util.init` bounds the init and falls back to offline on
+  failure, and `log` swallows errors, so a network blip costs live logging and never a 4 h
+  link. A link that fell back still lands on the same run id — recover it from a login node
+  with `bash scripts/wandb_sync.sh <run>`.
 - The login node has **no GPU** and no `nvidia-smi`. Every correctness test must pass on
   CPU; perf and multi-GPU tests go behind `@pytest.mark.gpu` / `@pytest.mark.multigpu`.
 - Credentials live in `.env.local` (gitignored), sourced by the sbatch. Never echo them.

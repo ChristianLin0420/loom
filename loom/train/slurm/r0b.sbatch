@@ -47,9 +47,16 @@ fi
 export WANDB_RUN_ID="$(cat "$RUN_DIR/wandb_id")"
 export WANDB_RESUME=allow
 export WANDB_DIR="$RUN_DIR"          # wandb appends wandb/ itself
-# Compute nodes have NO route to api.wandb.ai (scripts/check_network.sh).
-# Sync from a LOGIN node after each link:  bash scripts/wandb_sync.sh $RUN_NAME
-export WANDB_MODE=offline
+# Compute nodes DO have an outbound route -- re-measured on batch-block5-04009:
+# api.wandb.ai answered in 0.22 s and a real `wandb.init` completed in 1.8 s and
+# synced. (An older note in CLAUDE.md said otherwise; it was stale.) So log
+# ONLINE and watch the run live. `LOOM_WANDB_MODE` overrides for a node that
+# turns out to be walled off.
+# wandb_util.init bounds the init and falls back to offline on any failure, so a
+# network blip costs live logging, never a 4 h link. If that happens the link
+# still lands on the same run id -- recover it with:
+#     bash scripts/wandb_sync.sh $RUN_NAME        # from a login node
+export WANDB_MODE="${LOOM_WANDB_MODE:-online}"
 
 # Link budget. The separate 420 s safety margin lives in the loop and must equal
 # the --signal=USR1@420 above.
