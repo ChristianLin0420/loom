@@ -109,6 +109,35 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
   or duplicate, and converges once the link exits. Safe to run repeatedly mid-chain.
 - `torch.load(map_location="cuda")` drags saved RNG ByteTensors onto the GPU and
   `set_rng_state` requires CPU. GPU resume breaks while CPU tests stay green.
+
+### Reading the metrics — three traps that each cost a run
+
+- **`Δ_op` reads as a dead operator when the *coefficients* die.** It compares a true
+  operator against a negative, so a collapsed `c` makes the comparison vacuous. R0-A2's
+  `delta_op → 0.0002` looked like a bank collapse; the bank had not moved at all
+  (`r_mean` 0.7902 → 0.7899, `gnorm/bank` 0.01 at every step including a 71535 spike).
+  Check `gnorm/bank` and `bank/live_ops` before blaming the bank.
+- **Aggregate operator statistics hide the structure. Always split by replan *index*.**
+  Run-wide entropy said "the policy picks one operator". Per-replan-index entropy said
+  why: 2.47 at replan 0 (varying by task) then ~4.74 — near the `ln 128 = 4.852` ceiling —
+  for every replan after. `z` stops depending on the observation after one recurrent
+  update, and the policy runs one open-loop primitive per episode. `--op-stats` emits this.
+- **Know each loss's degenerate floor before reading it as progress.** Uniform
+  Plackett–Luce is `Σ log(128−i) = 19.361`; `act/align`'s disjoint-support MSE floor is
+  `8·0.25² = 0.500`. A head pinned at exactly its floor looks like a plateau, not a
+  failure. R0-A sat on both for 7004 steps.
+
+### Gradient clipping does not protect an AdamW run
+
+`clip_grad` bounds the norm, but **AdamW's update is invariant to a global rescale of the
+gradient** — scaling `g` by `s` scales `m` by `s` and `√v` by `s`, so `m/√v` is unchanged.
+A norm-71535 gradient clipped to 1.0 still takes a full LR step in the spike's direction,
+holds it in momentum for ~1/(1−β₁) = 10 steps, and shrinks every *other* module's update by
+that same 1e-4. Only skipping the step helps — `optim.spike_mult` (SpikeGuard), off by
+default. Its threshold must be a **geometric** mean (the per-window median moves 1.5→29
+over a run) and must update on skipped steps too via `min(gnorm, thresh)`: updating only on
+accepted steps deadlocks, and one arm silently skipped 457 consecutive steps with nothing
+in the loss curve to show it.
 - Rank plumbing is `RANK=$SLURM_PROCID`, not torchrun. Without it every task reads rank 0
   and eight processes train the same shard while the loss curve looks fine.
 - `scontrol` blocks indefinitely if slurmctld is unreachable from the node. Only call it
