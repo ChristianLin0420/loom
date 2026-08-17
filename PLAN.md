@@ -390,7 +390,10 @@ Three tables. Baseline rows are already filled and **copied from a single source
 | Fast-WAM | 6 B | ✗ | 97.0 | 99.4 | 96.6 | 94.8 | 97.0 |
 | Motus | 8 B | ✓ | 96.8 | 99.8 | 96.6 | 97.6 | 97.7 |
 | LingBot-VA | 5.3 B | ✓ | 98.5 | 99.6 | 97.2 | 98.5 | 98.5 |
-| **LOOM · R0-A** | 0.3 B | ✗ | | | | | |
+| **LOOM · R0-A** (belief decoder, no hinge, KL balance) | 0.3 B | ✗ | 5.3 | 15.0 | 13.3 | 0.0 | 8.4 |
+| **LOOM · R0-A** (belief decoder, no hinge, KL balance, learned z₀) | 0.3 B | ✗ | 15.7 | 15.0 | 19.7 | 1.0 | 12.8 |
+| **LOOM · R0-A** · ctrl, three fixes | 0.3 B | ✗ | 0.7 | 8.0 | 0.0 | 0.0 | 2.2 |
+| **LOOM · R0-A** · zinit, three fixes | 0.3 B | ✗ | 1.0 | 2.7 | 0.3 | 0.0 | 1.0 |
 | **LOOM · R2** | 0.3 B | ✓ | | | | | |
 
 **RoboTwin 2.0** (source: Fast-WAM Table 1 + per-task appendix, randomized column) — fill `R0-B`, `R2`, `R3`.
@@ -419,6 +422,10 @@ Three tables. Baseline rows are already filled and **copied from a single source
 | **LOOM · R3** | | | | | | | | | |
 
 Light and background sit at ~96 and are solved. Camera and robot-init at 60–80 are where the headroom is.
+
+**R0-A, all four rows: 1200 episodes each** (10 ep/task × 10 tasks × 4 suites × 3 seeds, max 512 env steps, real LIBERO, `--require-real --op-stats`). The three seeds are **replicates, not new scenes** — `LiberoEnv` selects its init state by `init_states[episode % 50]` and `set_init_state` overrides `env.seed()` — so there are **400 distinct conditions**, and the interval to quote is `sqrt(p(1−p)/400)`, not `/1200`. Measured replication: 94.5% (ctrl) / 97.0% (zinit) of conditions give a byte-identical step count across all three seeds, against 80.2% / 73.0% on the two rows above.
+
+The "three fixes" rows are `D_e(proprio, c)`, the live `within_trajectory` hinge, and the Switch balance at `BALANCE_COEF = 1e-2`; git `d87f805`. They are **lower**, and the reason is not ambiguous: `Δ_sel`, the only test of whether `c` names *this* window's transition rather than *a* transition, sits at 7e-08 (ctrl) / −1e-07 (zinit) at step 7000, two orders of magnitude BELOW its value at initialisation (~1e-04). `π_c` then selects one operator for the entire benchmark — selection entropy 0.000 nats at every replan index, over 1200 episodes and 40 tasks, against the `ln 128 = 4.852` ceiling.
 
 ---
 
