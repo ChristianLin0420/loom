@@ -8,6 +8,8 @@ Covers PLAN 4.C done-when items 3, 4, 5, 6, 10, 11.
 
 from __future__ import annotations
 
+import importlib
+
 import pytest
 import torch
 
@@ -382,6 +384,11 @@ def test_the_align_objective_pays_to_shrink_free_logits_and_pays_nothing_pinned(
 
 
 def test_action_rms_table_is_registered_and_well_formed():
+    # `libero_franka` is registered by contracts itself; every other row's body
+    # is registered by its adapter's import side effect, and whether some other
+    # test file already triggered that is a test-order accident. Import it here
+    # so this assertion means what it says.
+    importlib.import_module("loom.data.adapters.robotwin")
     for name, rms in ACTION_RMS.items():
         assert name in C.EMBODIMENTS, f"{name} is not a registered embodiment"
         assert len(rms) == C.EMBODIMENTS[name].dof

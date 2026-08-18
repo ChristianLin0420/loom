@@ -5,39 +5,126 @@
 # inference: pi_c -> D_e
 # GPUs:      16 = 2 nodes x 8      time: ~1 d
 #
-# 4 h cap: "~1 d" is 6 links of compute; budget 7.
 #     bash scripts/submit.sh r0b 7
 #
 #   < 55    KILL. The operator formulation is not competitive as a policy class.
 #   55-75   proceed to R1/R2 (pi0 from scratch is 65.9 clean)
 #   >= 75   strong pass
 #
-# `robotwin_aloha` is registered by loom/data/adapters/robotwin.py at import
-# (Team A, Phase 1B). Until that lands this config raises at startup by design —
-# an unregistered embodiment means no dof, no action bounds and no head dispatch.
+# `robotwin_aloha` is registered by loom/data/adapters/robotwin.py at import.
+# `loom.train.loop.build_model` imports that adapter when `data.source` names a
+# body contracts.py does not register itself; without it every rank died at
+# startup with "unregistered embodiment 'robotwin_aloha'" (job 32394843).
 
 extends: base.yaml
 
 run:
   name: r0b
-  steps: 180000
+  # SCHEDULE HORIZON, and therefore the cosine curve at EVERY step -- not a
+  # stopping rule. Sized from a measured 16-GPU rate on the real RoboTwin cache
+  # (job 32394882: 1.283 it/s over steps 300-600, 1.324 it/s excluding the
+  # checkpoint stalls; V=4's 1217 context tokens cost nothing against LIBERO's
+  # 705 -- r0a_flip read 1.20/1.23/1.20 it/s at steps 200/400/600, this read
+  # 1.18/1.23/1.24). One link is `LOOM_TIME_BUDGET_S - safety_s` = 13800 - 420 =
+  # 13380 s of loop time, so at ckpt_every 500 it is 13380 * 1.309 = 17516 steps.
+  #
+  # 6 links of compute = 105 094; 105 000 is that, rounded. PLAN 7 budgets R0-B
+  # at "~1 d" = 6 links, with a 7th for a preempted one, and 6 * 3.79 h = 22.7 h.
+  # 105 000 steps is 117.6 epochs of the 114 375 cached windows at a 128-window
+  # global batch.
+  #
+  # It was 180 000, which 7 links cannot reach: they deliver 122 610. The cosine
+  # is a function of `run.steps`, so the run would have ENDED at lr 8.21e-05,
+  # 27.4% of peak, never annealed -- the same shape R0-A has been running, where
+  # no link has yet passed step 16 317 of its nominal 60 000 horizon.
+  #
+  # 105 000 -> 95 000: the 1.309 above is a 600-step extrapolation and the real
+  # 3000-step rate is lower. runs/r0b_sanity (job 32396622, same 16 GPUs, same
+  # config, 3000 steps) measured **1.211 it/s** steady (steps 1000->3000; 1.222
+  # over 500->3000, cumulative 1.23 at step 3000, loop time 2439 s). At 1.21 that
+  # is 13380 * 1.21 = 16 190 steps/link, so 6 links = 97 140 and 95 000 is the
+  # horizon 6 links actually reach, with the 7th still a preemption spare.
+  # This IS the cosine horizon: vs 105 000 the LR is 1.000x at step 5000, 0.984x
+  # at 20 000, 0.922x at 40 000, 0.800x at 60 000, and both end at min_lr.
+  steps: 95000
   log_every: 20
   ckpt_every: 500
 
 data:
   source: robotwin
   embodiments: [robotwin_aloha]
+  # 8 is the R0-A value, kept so R0-B changes one thing at a time. It is NOT the
+  # efficient point: measured on 16 GPUs (job 32395505, 150 steps per arm),
+  # batch_per_gpu 16 runs at 1.294 it/s and 24 at 1.213 it/s against 8's 1.283 --
+  # 2.02x and 2.84x the windows/s for 1.009x and 0.946x the step rate. The step
+  # is dominated by a batch-independent cost (100 FSDP all-gathers per step: 10
+  # blocks x 5 states x online+EMA) and neither memory (8.85 / 10.50 / 12.20 GiB
+  # of 80) nor Lustre (115 / 233 / 328 MiB/s per GPU) is close to binding.
+  # Raising it changes the effective batch and wants an LR rescale with it.
   batch_per_gpu: 8
   action_free: false
 
 optim:
   lr: 3.0e-4
   warmup: 2000
+  # Spike rejection, as on R0-A's best arm. RoboTwin's gradient tail is much
+  # heavier than LIBERO's relative to its own scale: over the first 600 steps
+  # (job 32394882) the norm ran median 8.55, geometric mean 10.13, max 1903.7 =
+  # 188x the geometric mean, against r0a_flip's 521.6 = 12.7x over the same
+  # window. Replaying those norms through SpikeGuard(mult=10) skips 12 of 600
+  # steps (2.0%), including a 7-step burst at 361-373; the same replay on
+  # r0a_flip skips 0. clip_grad does not substitute -- AdamW's update is
+  # invariant to a global rescale of the gradient.
+  spike_mult: 10
+
+model:
+  estimator:
+    # The pair R0-A's best LIBERO arm trains with. Absent, the estimator defaults
+    # to z_prev_residual=True / learned_z_init=False, which is the OTHER arm.
+    learned_z_init: true
+    z_prev_residual: false
+  decoder:
+    # THE ROBOTWIN-ONLY FIX. `a_seg ~ proprio_t` repeated explains 99.03% of the
+    # action's variance on this body (all 458 560 segments; libero_franka's
+    # semantics are delta+hold, so it has no such shortcut), so `D_e(proprio, c)`
+    # reaches 99% of its target with zero information from `c` and `L_act` stops
+    # constraining the coefficient -- the same disease that dropping `z` cured.
+    # With this on, the flow's data side is (a_seg - proprio_t)/residual_rms.
+    # Both halves live in loom/heads/decoder.py and eval rebuilds the body from
+    # THIS key (policy._run_model_kwargs), so eval still sees absolute radians.
+    residual: true
 
 losses:
   dyn:      {enabled: true, weight: 1.0, negatives: within_trajectory}
-  act:      {enabled: true, weight: 1.0}
+  # align_to: q_a -- q_Delta regresses onto sg(q_a), not the reverse. The loop's
+  # DEFAULT is "q_delta" (loop.py: `loss_cfg["act"].get("align_to", "q_delta")`),
+  # i.e. the direction that turned `c` into a phase clock on LIBERO, so leaving
+  # this key out is a choice, not a no-op. At step 600 the probe run took the
+  # default and read act/c_delta_spread 0.018 with 11 of 128 live q_Delta
+  # operators; r0a_flip at the same step read 0.396 and 22. (Not a controlled
+  # A/B -- different corpus, and r0a_flip also carries the estimator flags above.)
+  act:      {enabled: true, weight: 1.0, align_to: q_a}
   proposal: {enabled: true, weight: 1.0}
+  # contracts.BALANCE_COEF, Switch form. See base.yaml. 1.0e-2 is LIBERO's value
+  # and contracts.BALANCE_COEF is UNCHANGED -- this is a per-run reweighting of an
+  # existing term, for robotwin_aloha only.
+  #
+  # Why: on RoboTwin the load-balance objective was the only thing still shaping
+  # `c_a`. `loss/balance` sat at 1.05 against its perfectly-uniform floor of 1.0
+  # (LIBERO: 1.9-4.3), i.e. the router was assigning operators to balance load
+  # rather than to describe the action -- and a uniformly-routed `c_a` is exactly
+  # unpredictable from (z, l), which is why `loss/proposal` pinned at the uniform
+  # Plackett-Luce value 19.3608 for 2600 straight steps in runs/r0b_sanity.
+  # Measured A/B at 1e-3 (jobs 32401406-32401607, 6 arms x 1200 steps, 8 GPUs,
+  # global batch 128, same LR curve): loss/proposal over steps 900-1200 was
+  # 18.80 control / 10.23 with this alone / 7.75 with this + decoder.residual,
+  # against LIBERO r0a_flip's 7.83 at the same steps. live_ops_q_a stayed 22-26,
+  # so this does not kill operators on the horizon it was measured over.
+  #
+  # NOT APPLIED. `contracts.BALANCE_COEF = 1e-2` is in the FROZEN file,
+  # tests/test_contracts.py:52 asserts it, and tests/test_train.py:982 asserts
+  # every run config equals it. Lowering it is an OWNER decision, not this file's.
+  # If it is authorised, launch with `--set losses.balance.weight=1.0e-3`.
   balance:  {enabled: true, weight: 1.0e-2}
 
 train_modules: [estimator, bank, q_delta, q_action, decoder, proposal]
@@ -45,4 +132,6 @@ train_modules: [estimator, bank, q_delta, q_action, decoder, proposal]
 slurm:
   nodes: 2
   gpus_per_node: 8
+  # 6 links reach `run.steps`; the 7th is the spare for a preempted link and
+  # exits immediately if the chain already finished (`while global_step < steps`).
   n_links: 7

@@ -91,6 +91,54 @@ changes, the seam is `DecoderBody.loss` (divide `a_seg`) and `DecoderBody.forwar
 (multiply back BEFORE the `action_low/high` clamp), both inside this package, so
 `loom/eval/policy.py` still never sees normalised units.
 
+`robotwin_aloha` HAS THE SAME PROBLEM, FOR A DIFFERENT REASON
+─────────────────────────────────────────────────────────────
+Its 14 channels are ABSOLUTE servo targets -- 12 joint angles in radians and 2
+normalised gripper widths -- not deltas, so the spread comes from the reachable
+joint range rather than from a per-step magnitude. Measured over all 2500
+`demo_clean` trajectories on the canonical 30 Hz grid (988 391 frames,
+458 560 segments), the per-dof rms spans 0.258 (wrist roll) to 1.509 (shoulder
+pitch), a variance ratio of 34.3x, and the same measurement as above gives a
+participation ratio of **2.99 / 1024** with the per-dof deviation share running
+0.66% (R_j5) to 23.9% (R_j2) -- 36x -- against a uniform 7.14%. The failure is
+not the gripper this time: the two shoulder/elbow joints are 40% of the
+embedding between them and the two wrist rolls are 1.9%. With the row below the
+participation ratio is 5.55 and the share ratio 4.0x, which is where LIBERO sits
+after its own row (measured on real windows with the shipped table: 1.58 -> 6.18,
+3267x -> 4.3x).
+
+rms and not std for this body too, for table coherence rather than for the
+LIBERO reason -- an absolute joint target has no meaningful zero. Per-dof std
+was measured as the alternative and is slightly flatter on share (2.8x) and
+slightly worse on the headline metric (participation ratio 4.74), because it
+pumps the two correlated gripper channels from 7.6% to 16.4% of the deviation
+and they then share one direction.
+
+AND THE ROBOTWIN DECODER STILL DOES NOT NEED IT -- MEASURED, NOT ASSUMED
+────────────────────────────────────────────────────────────────────────
+The obvious worry is that 14 absolute channels spanning 0.26-1.51 rms would let
+the wide shoulder joints eat the CFM regression and starve the grippers. They do
+not, and the reason is structural: the flow's source is N(0, I), so the per-dof
+loss at `v_theta = 0` is `rms_d^2 + 1` and that `+1` compresses the dynamic
+range from the data's 34.3x in variance to **3.07x** in loss share (4.31% to
+13.24% against a uniform 7.14%; the grippers sit at 6.69% each). LIBERO's same
+number is 2.00x, and LIBERO's decoder was fine.
+
+Run directly (`logs/rt_actstats/dec_norm_probe.py`, one A100, 8000 steps,
+batch 256, all 458 560 real segments, held-out every 10th episode, identical
+seed and coefficient stream per arm): the UNCHANGED decoder emits per-dof
+standard deviations 0.9989x the data's on average and within 1.6% on every one
+of the 14 dofs, correlates 0.998-0.9997 per dof with the absolute target and
+0.81-0.99 (mean 0.911) with the proprio-relative residual, calls the gripper on
+the right side of 0.5 in 99.43% / 99.71% of held-out steps, and puts 0.000% of
+its samples outside the action box. Dividing `a_seg` by the row above and
+multiplying back in `forward` moves mean residual correlation by +0.005, makes
+mean residual RMSE 5% WORSE (0.02288 -> 0.02413 rad), and specifically makes the
+gripper -- the channel that decides success -- 37% worse (0.0116 -> 0.0159 rad).
+Normalising the conditioning proprio too changes nothing further. With an
+uninformative coefficient all four arms land inside 3% of each other. So the
+seam below stays exactly where it is, and eval keeps seeing radians.
+
 A body with no entry in `ACTION_RMS` gets ones, i.e. exactly the previous
 behaviour. Add a row when its corpus statistics have actually been measured, not
 before.
@@ -113,8 +161,13 @@ __all__ = ["ACTION_RMS", "LOGIT_RMS", "QActionBody", "QAction"]
 #: guessed: `libero_franka` is all 507 363 canonical frames of the 2000
 #: trajectories the R0-A loader serves. A body that is absent is not normalised.
 #: See the module docstring.
+#: `robotwin_aloha` is all 988 391 canonical frames of the 2500 demo_clean
+#: trajectories the R0-B loader serves, in the layout
+#: [L_arm j1..j6 | L_grip | R_arm j1..j6 | R_grip].
 ACTION_RMS: dict[str, tuple[float, ...]] = {
     "libero_franka": (0.22594, 0.25572, 0.29705, 0.02697, 0.04227, 0.05330, 1.0),
+    "robotwin_aloha": (0.43019, 1.47891, 1.12173, 0.75236, 0.25784, 0.56114, 0.80985,
+                       0.39910, 1.50929, 1.15780, 0.80002, 0.26210, 0.61682, 0.80965),
 }
 
 #: Operator-axis rms every q_a logit row is pinned to. A constant, never learned.

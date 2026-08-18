@@ -102,6 +102,46 @@ __all__ = ["DecoderBody", "Decoder"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  RESIDUAL TARGET  (`residual=True`, OFF by default)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# On a body whose action semantics are ABSOLUTE, `a_seg ~ proprio` repeated is
+# already most of the answer: measured on all 458 560 RoboTwin segments, copying
+# `proprio_t` across the 8 steps explains **99.03%** of `a_seg`'s variance
+# (per-dof R^2 97.91-99.23%; 1 - mean(a_seg - proprio_t)^2 / var(a_seg), from
+# logs/rt_actstats/raw.json). The decoder therefore reaches 99% of its target with
+# ZERO information from `c`, which is the same disease that dropping `z` cured --
+# `L_act` stops putting pressure on the coefficient. Measured on RoboTwin
+# (runs/r0b_sanity, 16 GPUs): `act/decode` 0.85 -> 0.026 by step 3000 while
+# `gnorm/q_action` fell to 0.0031 (LIBERO's r0a_flip: 0.044, 14x higher), the
+# routing collapsed onto the load-balance objective (`loss/balance` 1.05 against
+# its perfectly-uniform floor of 1.0) and `loss/proposal` pinned at the uniform
+# Plackett-Luce value 19.3608 -- i.e. `pi_c`, the only head that runs at
+# inference, learned nothing at all. `libero_franka` does not have this problem:
+# its semantics are `('delta',)*6 + ('hold',)`, so proprio predicts nothing.
+#
+# With `residual=True` the flow's data side is `(a_seg - proprio_t) / rms`, so
+# 100% of what the field has to explain must arrive through `c`. Both halves are
+# here and only here: `loss` subtracts and divides, `forward` multiplies and adds
+# back BEFORE the action_low/high clamp, so `loom/eval/policy.py` still receives
+# absolute radians and nothing outside this file changes units. Half of this
+# change is far worse than none -- an eval that rebuilds the body without the
+# flag would read residuals as joint targets.
+#
+# `RESIDUAL_RMS` is the per-dof rms of `a_seg - proprio_t` over the whole cache
+# (2500 demo_clean trajectories resampled to 30 Hz, 458 560 segments;
+# logs/rt_actstats/raw.json, sqrt(res_sumsq / (nseg * H_OP))). An unregistered
+# body gets 1.0 -- a plain residual with no rescale.
+RESIDUAL_RMS: dict[str, tuple[float, ...]] = {
+    # [L_j1..L_j6, L_grip | R_j1..R_j6, R_grip]
+    "robotwin_aloha": (0.035389, 0.091560, 0.078513, 0.069049, 0.025436,
+                       0.053096, 0.065479,
+                       0.032432, 0.089284, 0.078586, 0.065594, 0.025165,
+                       0.054703, 0.066018),
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  BUILDING BLOCKS
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -180,6 +220,7 @@ class DecoderBody(nn.Module):
         pool_heads: int = 8,
         n_steps: int = 10,
         clamp: bool = True,
+        residual: bool = False,
         d_belief: int = D,
         n_ops: int = M,
         n_slots: int = K,
@@ -195,6 +236,16 @@ class DecoderBody(nn.Module):
 
         self.register_buffer("action_low", torch.tensor(spec.action_low), persistent=False)
         self.register_buffer("action_high", torch.tensor(spec.action_high), persistent=False)
+
+        # Residual target. See RESIDUAL_RMS above. Non-persistent, like the
+        # action box: a fixed reparameterisation, never carried in a checkpoint,
+        # so `residual` must come from the run config on BOTH sides.
+        self.residual = bool(residual)
+        rms = RESIDUAL_RMS.get(embodiment, (1.0,) * spec.dof)
+        if len(rms) != spec.dof:
+            raise ValueError(
+                f"RESIDUAL_RMS[{embodiment!r}] has {len(rms)} entries, dof is {spec.dof}")
+        self.register_buffer("residual_rms", torch.tensor(rms), persistent=False)
 
         # ── conditioning: proprio, coefficient, time ─────────────────────
         # No belief pooling. See the module docstring: with `z` in here the
@@ -276,6 +327,9 @@ class DecoderBody(nn.Module):
         for i in range(n):
             t = torch.full((x.shape[0],), i * dt, device=x.device, dtype=x.dtype)
             x = x + dt * self.velocity(x, t, cond)
+        if self.residual:
+            # BEFORE the clamp: the box is in absolute action units.
+            x = x * self.residual_rms.to(x) + proprio.unsqueeze(1).to(x)
         if self.clamp if clamp is None else clamp:
             x = torch.max(torch.min(x, self.action_high.to(x)), self.action_low.to(x))
         return x
@@ -297,6 +351,8 @@ class DecoderBody(nn.Module):
                 f"{self.embodiment}: action segment must be (..., {self.h_op}, "
                 f"{self.dof}), got {tuple(a_seg.shape)}"
             )
+        if self.residual:
+            a_seg = (a_seg - proprio.unsqueeze(1)) / self.residual_rms.to(a_seg)
         b = a_seg.shape[0]
         x0 = self._noise(b, a_seg, noise, generator)
         if t is None:

@@ -748,7 +748,16 @@ def _try_real_modules(
             print(f"[policy] estimator kwargs from run config: {est_kw}", flush=True)
         estimator = Estimator(embodiments=[embodiment], **est_kw)
         proposal = Proposal()
-        decoder = Decoder(embodiments=[embodiment], default_embodiment=embodiment)
+        # Same argument for the decoder, and it is sharper here: `residual` is
+        # not a parameter either, so a body trained on the proprio-relative
+        # target and rebuilt without the flag loads with 0 missing and 0
+        # unexpected keys and then emits ~0.03 rad residuals as ABSOLUTE joint
+        # targets. Half of that change is far worse than none.
+        dec_kw = _run_model_kwargs(ckpt, "decoder")
+        if dec_kw:
+            print(f"[policy] decoder kwargs from run config: {dec_kw}", flush=True)
+        decoder = Decoder(embodiments=[embodiment], default_embodiment=embodiment,
+                          **dec_kw)
 
         loaded: dict[str, Any] = {}
         for name, mod in (("estimator", estimator), ("proposal", proposal),

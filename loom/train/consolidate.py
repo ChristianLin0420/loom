@@ -622,10 +622,15 @@ def _verify_policy(out: Path, embodiment: str, *, verbose: bool = True) -> dict[
     # `make_policy` loaded in the same breath with 339 tensors and 0 unexpected.
     # A verify that disagrees with the loader it is verifying is worse than none.
     est_kw = _run_model_kwargs(out, "estimator")
+    # Same for the decoder: `residual` is not a parameter either, so a mismatch
+    # is invisible in missing/unexpected keys and only shows up as an eval that
+    # feeds ~0.03 rad residuals to the robot as absolute joint targets.
+    dec_kw = _run_model_kwargs(out, "decoder")
     mods = {
         "estimator": Estimator(embodiments=[embodiment], **est_kw),
         "proposal": Proposal(),
-        "decoder": Decoder(embodiments=[embodiment], default_embodiment=embodiment),
+        "decoder": Decoder(embodiments=[embodiment], default_embodiment=embodiment,
+                           **dec_kw),
     }
     detail: dict[str, Any] = {}
     ok = True

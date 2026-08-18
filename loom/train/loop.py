@@ -69,6 +69,14 @@ __all__ = [
 MODULE_NAMES = ("estimator", "bank", "q_delta", "q_action", "decoder",
                 "proposal", "potential")
 
+#: ``data.source`` -> the module whose import registers that source's
+#: embodiment(s) in ``contracts.EMBODIMENTS``. Adapters register at import time
+#: and nothing in the training path imports one before ``build_model``.
+ADAPTER_MODULES = {
+    "libero": "loom.data.adapters.libero",
+    "robotwin": "loom.data.adapters.robotwin",
+}
+
 #: Knobs describing *this link*, not the experiment. Never in the config hash.
 LINK_LOCAL_KEYS = ("run_dir", "stop_at", "budget_s", "safety_s", "no_wandb",
                    "allow_reshard", "config_path")
@@ -377,6 +385,16 @@ def build_model(cfg: dict) -> "LoomModel":
     mcfg = dict(cfg.get("model", {}))
     mode = mcfg.get("use_stubs", "auto")
     embodiments = list(cfg.get("data", {}).get("embodiments", ["libero_franka"]))
+    # contracts.py registers `libero_franka` itself; every other body is
+    # registered by its adapter's import side effect. build_model runs BEFORE
+    # build_sampler, which is the only other thing that imports an adapter, so
+    # configs/r0b.yaml died at startup on all 16 ranks with "unregistered
+    # embodiment 'robotwin_aloha'" (job 32394843). Guarded on the miss so the
+    # LIBERO path imports nothing new and its behaviour is bit-identical.
+    if any(e not in C.EMBODIMENTS for e in embodiments):
+        mod = ADAPTER_MODULES.get(str(cfg.get("data", {}).get("source", "")))
+        if mod:
+            importlib.import_module(mod)
     for e in embodiments:
         if e not in C.EMBODIMENTS:
             raise ValueError(f"unregistered embodiment {e!r}; adapters register at import")
