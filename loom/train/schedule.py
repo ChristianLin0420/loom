@@ -321,6 +321,14 @@ class SpikeGuard:
     warmup: int = 100
     ema_log: float = 0.0
     n: int = 0
+    #: Cap on how far the reference may climb within ONE unbroken run of skipped
+    #: steps, relative to where it stood when the burst began. See `check`.
+    #: 10x is generous against the legitimate case the class docstring names --
+    #: a genuine 4x regime shift is re-admitted after ~30 skips -- while ruling
+    #: out the 171x runaway R0-B measured.
+    burst_cap: float = 10.0
+    #: Reference at the start of the current skip run; None when not in one.
+    _burst_ref: float | None = None
 
     @property
     def enabled(self) -> bool:
@@ -353,12 +361,39 @@ class SpikeGuard:
         ref = min(gnorm, thr) if math.isfinite(thr) else gnorm
         self.ema_log = (self.beta * self.ema_log
                         + (1.0 - self.beta) * math.log(max(ref, 1e-12)))
+
+        # BURST CAP. `min(gnorm, thr)` bounds what ONE skipped step contributes,
+        # but not what a sustained burst does: each skip raises the threshold by
+        # mult**(1-beta) = 4.7% at the defaults, and 1.047**170 is ~2600x. R0-B
+        # measured a 171x ratchet (threshold 136 -> 23334) across a single burst
+        # near step 1000, after which 25 steps with gnorm > 1000 were ACCEPTED,
+        # the largest at 15958, in a run whose healthy gnorm is 10-40. The guard
+        # did not fail to fire; it adapted until the explosion was inside its own
+        # definition of normal, and the coefficient space never recovered
+        # (live_ops_q_a 29 -> 13, loss/proposal pinned at the 19.361 uniform
+        # floor).
+        #
+        # So the reference may still climb during a burst -- that is what stops
+        # the deadlock the class docstring documents (tdgradB, 457 consecutive
+        # skips) -- but not without bound. `burst_cap` is generous against the
+        # legitimate case the docstring names: a genuine 4x regime shift is
+        # re-admitted after ~30 skips, i.e. 4x, well inside the cap.
+        if skip:
+            if self._burst_ref is None:
+                self._burst_ref = math.exp(self.ema_log)
+            ceiling = math.log(self._burst_ref * self.burst_cap)
+            if self.ema_log > ceiling:
+                self.ema_log = ceiling
+        else:
+            self._burst_ref = None
+
         self.n += 1
         return skip
 
     def state_dict(self) -> dict:
         return {"mult": self.mult, "beta": self.beta, "warmup": self.warmup,
-                "ema_log": self.ema_log, "n": self.n}
+                "ema_log": self.ema_log, "n": self.n,
+                "burst_ref": self._burst_ref}
 
     def load_state_dict(self, sd: dict) -> None:
         # mult/beta/warmup come from the config, not the checkpoint: changing the
@@ -366,6 +401,8 @@ class SpikeGuard:
         # value silently is not.
         self.ema_log = float(sd.get("ema_log", self.ema_log))
         self.n = int(sd.get("n", self.n))
+        br = sd.get("burst_ref")
+        self._burst_ref = None if br is None else float(br)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

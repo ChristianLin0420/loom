@@ -1666,3 +1666,56 @@ def test_submit_uses_singleton_chaining_not_self_requeue():
     text = (ROOT / "scripts" / "submit.sh").read_text()
     assert "--dependency=singleton" in text
     assert "LOOM_RUN_NAME" in text and "--export=ALL" in text
+
+
+def test_spike_guard_burst_cap_blocks_the_ratchet():
+    """A sustained burst must not walk the threshold up behind itself.
+
+    `min(gnorm, thresh)` bounds what ONE skipped step contributes, but each skip
+    still raises the threshold by mult**(1-beta) = 4.7% at the defaults, and
+    1.047**170 is ~2600x. R0-B measured a 171x ratchet (136 -> 23334) across a
+    single burst near step 1000, after which 25 steps with gnorm > 1000 were
+    ACCEPTED -- the largest at 15958, in a run whose healthy gnorm is 10-40.
+    """
+    from loom.train.schedule import SpikeGuard
+
+    burst = [4.1e5, 1.2e5, 1.9e4, 8.7e4, 6.6e6, 2.3e7, 3.9e6, 1.1e6]
+
+    def run(cap):
+        g = SpikeGuard(mult=10.0, beta=0.98, warmup=100, burst_cap=cap)
+        for _ in range(300):
+            g.check(20.0)
+        t0, admitted = g.threshold, 0
+        for i in range(220):
+            if not g.check(burst[i % len(burst)]):
+                admitted += 1
+        return t0, g.threshold, admitted
+
+    t0_un, t1_un, admitted_un = run(float("inf"))
+    t0_cap, t1_cap, admitted_cap = run(10.0)
+
+    # the bug, pinned so it cannot come back silently
+    assert t1_un / t0_un > 100.0, "uncapped guard should ratchet; test is not exercising it"
+    assert admitted_un > 0
+
+    # the fix
+    assert t1_cap / t0_cap <= 11.0, f"burst cap leaked: {t1_cap / t0_cap:.1f}x"
+    assert admitted_cap == 0, f"{admitted_cap} spike steps admitted under the cap"
+
+
+def test_spike_guard_burst_cap_still_unsticks_on_a_real_regime_shift():
+    """The cap must not reintroduce tdgradB's 457-consecutive-skip deadlock.
+
+    The class docstring's own worked example: a genuine 4x shift should be
+    re-admitted after roughly 30 skips. The cap is 10x, so it must not bind here.
+    """
+    from loom.train.schedule import SpikeGuard
+
+    for shift, limit in ((4.0, 60), (8.0, 120)):
+        g = SpikeGuard(mult=10.0, beta=0.98, warmup=100, burst_cap=10.0)
+        for _ in range(300):
+            g.check(20.0)
+        level, n = 20.0 * shift * 10, 0
+        while g.check(level) and n < 5000:
+            n += 1
+        assert n < limit, f"{shift}x shift took {n} skips to re-admit (deadlock risk)"
