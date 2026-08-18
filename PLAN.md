@@ -396,6 +396,7 @@ Three tables. Baseline rows are already filled and **copied from a single source
 | **LOOM · R0-A** · zinit, three fixes | 0.3 B | ✗ | 1.0 | 2.7 | 0.3 | 0.0 | 1.0 |
 | **LOOM · R0-A** · align-flip @4000 | 0.3 B | ✗ | 11.7 | 44.7 | 22.0 | 2.0 | 20.1 |
 | **LOOM · R0-A** · align-flip @7500 | 0.3 B | ✗ | **20.3** | **51.0** | **25.3** | **1.7** | **24.6** |
+| **LOOM · R0-A** · align-flip @25000 | 0.3 B | ✗ | **33.3** | **26.0** | **32.0** | **15.0** | **26.6** |
 | **LOOM · R2** | 0.3 B | ✓ | | | | | |
 
 **RoboTwin 2.0** (source: Fast-WAM Table 1 + per-task appendix, randomized column) — fill `R0-B`, `R2`, `R3`.
