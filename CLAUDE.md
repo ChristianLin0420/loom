@@ -132,6 +132,33 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
   `8·0.25² = 0.500`. A head pinned at exactly its floor looks like a plateau, not a
   failure. R0-A sat on both for 7004 steps.
 
+### The coefficient `c` collapses to a phase clock unless the ACTION says otherwise
+
+`L_act`'s align term is `(c_a - sg(c_Delta))^2` by default (`losses.act.align_to: q_delta`), so
+`q_a` regresses onto a FROZEN `q_Delta`. Once `q_Delta` drifts into being a function of the
+horizon index `h`, `q_a` copies that clock and `pi_c` — which is BC'd onto `sg(c_a)` — clones it
+in turn. Measured at the bottom: I(c_a;h)/H(c_a) = 99.8%, 3 of 128 operators ever selected,
+selection entropy 0.000 nats against a `ln 128 = 4.852` ceiling, and a period-2 limit cycle at
+eval because training only ever exposes h in {0..3} while an episode runs ~96 replans.
+
+**`losses.act.align_to: q_a`** reverses the direction — `q_Delta` regresses onto `sg(q_a)` — so
+the action-conditioned coefficient teaches. LIBERO went 12.8 -> 24.6 avg on the full 1200-episode
+protocol, with 106 of 128 operators, entropy 3.759 nats, and 64.7% of replans switching.
+
+**It only works if `a_seg` actually varies WITHIN a window**, and that is a per-body property:
+
+    body              within-window action std   between-window std   ratio
+    libero_franka             0.3911                   0.8097         0.483
+    robotwin_aloha            0.0512                   0.8003         0.064
+
+LIBERO's actions are deltas and move across the DEPTH=4 horizons. RoboTwin's are 14 ABSOLUTE
+joint targets in a slow trajectory (`action[t] == state[t+1]` bitwise), so `a_seg` is nearly
+constant across a window — 7.6x less signal — while between-window variation is identical. With
+nothing in the action distinguishing h=0 from h=3, phase is the only thing left and the clock
+returns even with the flip on. Symptom: `bank/live_ops_q_a` collapsing toward TOPK=4 and
+`loss/proposal` pinned at the 19.361 uniform floor while `act/decode` falls healthily — the
+decoder is fine and `c` is dead.
+
 ### Gradient clipping does not protect an AdamW run
 
 `clip_grad` bounds the norm, but **AdamW's update is invariant to a global rescale of the
