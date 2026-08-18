@@ -142,6 +142,89 @@ seam below stays exactly where it is, and eval keeps seeing radians.
 A body with no entry in `ACTION_RMS` gets ones, i.e. exactly the previous
 behaviour. Add a row when its corpus statistics have actually been measured, not
 before.
+
+
+THE SEGMENT-ANCHORED DELTA BRANCH  (`DELTA_RMS`, ABSOLUTE bodies only)
+─────────────────────────────────────────────────────────────────────
+`ACTION_RMS` fixes which dof the head can see. It does NOT fix *when*: this head
+must emit a DIFFERENT `c` for each of the DEPTH=4 horizons in a window, and on
+`robotwin_aloha` there is almost nothing in `a_seg` to tell them apart.
+
+Measured on real windows cut exactly as the loader cuts them (per-segment means
+over `H_OP`, divided by `ACTION_RMS`; 18 360 RoboTwin / 9 082 LIBERO windows,
+`logs/dual_gate/gate.py`):
+
+    body              within-window   between-window   ratio
+    libero_franka        0.4816           0.8494        0.567
+    robotwin_aloha       0.1215           0.8451        0.144
+
+Between-window variation is identical -- both bodies discriminate windows fine.
+WITHIN a window RoboTwin's action moves 4x less. LIBERO's actions are deltas and
+genuinely differ across horizons; RoboTwin's are 14 absolute joint targets in a
+slow trajectory, so `a_seg` is nearly constant across the window. With nothing
+in the action distinguishing h=0 from h=3, phase is the only thing left, and `c`
+becomes a clock even with `losses.act.align_to: q_a` on -- which is what
+`runs/r0b2` did (`bank/live_ops_q_a` 29 -> 15, `loss/proposal` back to 18.96
+against the 19.361 uniform Plackett-Luce floor, while `act/decode` fell healthily
+0.91 -> 0.23; the decoder was never the problem).
+
+So ABSOLUTE-semantics bodies get a SECOND input branch into the same `d_act`
+space: `(a_seg - a_seg[:, :1, :]) / DELTA_RMS`, the displacement of the segment
+from its own first step, over the dims registered ABSOLUTE in
+`loom/data/canonical.py`. `a_seg[0]` is the anchor and not proprio because q_a's
+`(a_seg, z)` signature is frozen (PLAN 4.C) -- and on this body
+`action[t] == state[t+1]` bitwise, so `a_seg[0]` IS a proprio reading one control
+step ahead. What this anchor drops against `decoder.residual`'s
+`(a_seg - proprio_t)` is a per-segment CONSTANT, which the absolute branch still
+carries in full.
+
+WHY ANCHORED PER SEGMENT AND NOT CENTRED PER WINDOW. The encoding is a function
+of `a_seg` ALONE, so the same physical 8-step segment appearing at h=0 in one
+window and h=3 in another encodes identically. Verified exactly, not by probe:
+over 2091 physical segments that occur at more than one horizon index, the
+max absolute difference in the delta branch's output is 0.000e+00
+(`logs/dual_gate/encgate.py`). Window-centring would need the other three
+segments, so the same segment would encode differently depending on its
+neighbours -- irreducible label noise for both the align target and pi_c's BC
+target.
+
+WHY BOTH BRANCHES AND NOT A DELTA REPLACEMENT. A linear probe recovering the
+segment's own absolute pose from the encoding (fp32, rank-truncated, held out,
+`logs/dual_gate/probes.py`) gives R^2 0.974 today, 0.956 for DUAL, and 0.156 for
+delta-only -- with the two gripper channels, which the decoder docstring above
+calls the channel that decides success, at 0.975/0.973, 0.953/0.945 and
+0.191/0.208. A pure-delta replacement throws the pose away; keeping both does
+not.
+
+WHAT IT BUYS, AT THE ONLY LEVEL THAT MATTERS -- the 1024-d `encode_action` output
+the trunk actually receives, real module at fresh init, bf16, 2048 real windows:
+
+    LIBERO today     within/between 0.644   within-window VARIANCE SHARE 29.3%
+    robotwin today   within/between 0.165   within-window VARIANCE SHARE  2.66%
+    robotwin DUAL    within/between 0.427   within-window VARIANCE SHARE 15.41%
+
+a 5.8x increase, landing at ~half of LIBERO's, with `between` untouched
+(0.4343 -> 0.4527) -- the healthy axis is not traded away.
+
+AND IT IS NOT A CLOCK. A 4-way linear probe for the horizon index from the
+encoding (chance 0.250) reads 0.201 today and 0.200 for DUAL on held-out data,
+against 0.202 for the raw `a_seg` itself: `h` is not linearly decodable from one
+segment on this body under ANY of these encodings, and the branch does not make
+it so.
+
+This is a reparameterisation, not a capacity change. `act_out` is a Linear over
+the flattened `(H_OP, d_act)`, so `a[t] - a[0]` is already inside its span; what
+changes is that the difference arrives pre-normalised at O(1) instead of as a
+2.66%-of-variance direction -- exactly the argument `ACTION_RMS` is justified by
+above.
+
+A BODY ABSENT FROM `DELTA_RMS` GETS NO BRANCH: no parameters, no state_dict keys,
+and an `encode_action` that is byte-identical to the one before this existed
+(`torch.equal`, fp32 and bf16, verified against the module at the previous commit
+in `logs/dual_gate/identity.py`). `libero_franka` is deliberately absent and is
+doubly excluded -- its semantics are `(delta,)*6 + (hold,)`, i.e. ZERO absolute
+dims. Differencing a delta channel gives acceleration; differencing a latched
+gripper gives a spike train.
 """
 
 from __future__ import annotations
@@ -152,9 +235,11 @@ import torch
 from torch import Tensor, nn
 
 from contracts import D, EMBODIMENTS, H_OP, K, M, TOPK
+from loom.data.canonical import ABSOLUTE, action_semantics
 from loom.heads.q_delta import AttnPool, mlp_trunk, topk_simplex_st
 
-__all__ = ["ACTION_RMS", "LOGIT_RMS", "QActionBody", "QAction"]
+__all__ = ["ACTION_RMS", "DELTA_RMS", "DELTA_GAIN", "LOGIT_RMS",
+           "QActionBody", "QAction", "absolute_dims"]
 
 
 #: Per-dof rms of an action at `FPS_CANONICAL`, per embodiment. Measured, not
@@ -175,6 +260,48 @@ ACTION_RMS: dict[str, tuple[float, ...]] = {
 #: real windows), so this changes the scale of nothing at step 0 -- it only stops
 #: the scale from being driven to zero afterwards.
 LOGIT_RMS = 1.0
+
+
+#: Per-dof rms of the SEGMENT-ANCHORED displacement `a_seg - a_seg[:, :1, :]` on
+#: the canonical 30 Hz grid. Measured over all 2500 demo_clean trajectories,
+#: 458 560 segments cut exactly as canonical.segment cuts them -- the same corpus
+#: and the same segment set as decoder.RESIDUAL_RMS (logs/qa_dual/drms.py).
+#: A BODY ABSENT FROM THIS TABLE GETS NO DELTA BRANCH: zero new parameters, zero
+#: new state_dict keys, byte-identical `encode_action`. `libero_franka` is
+#: deliberately absent and is doubly excluded -- its semantics are
+#: (delta,)*6 + (hold,), i.e. ZERO absolute dims. Differencing a delta channel
+#: gives acceleration; differencing a latched gripper gives a spike train.
+DELTA_RMS: dict[str, tuple[float, ...]] = {
+    # [L_j1..L_j6, L_grip | R_j1..R_j6, R_grip]
+    "robotwin_aloha": (0.025717, 0.066233, 0.056913, 0.050135, 0.018478,
+                       0.038535, 0.048000,
+                       0.023919, 0.064609, 0.057042, 0.047655, 0.018305,
+                       0.039700, 0.048444),
+}
+
+#: Multiplier on the delta branch. 1.0 = both branches enter at unit rms through
+#: Linears of identical fan_in and init family, i.e. NO free parameter. The
+#: pre-measured sweep, if it ever has to move (within-window variance share of
+#: `encode_action`, bf16, real windows; LIBERO today is 29.34%):
+#:   gain 0.0 -> 2.49%   1.0 -> 15.41%   1.5 -> 20.31%
+#:        2.0 -> 23.73%  3.0 -> 27.99%   4.0 -> 30.43%
+DELTA_GAIN = 1.0
+
+
+def absolute_dims(embodiment: str | None, dof: int) -> tuple[int, ...]:
+    """Which action dims are ABSOLUTE servo targets, hence worth differencing.
+
+    `()` unless the body has a MEASURED row in DELTA_RMS -- that membership, and
+    not a config key, is the opt-in, exactly as for ACTION_RMS. A body that has
+    the row but no registered semantics raises: that combination is a bug, not a
+    default.
+    """
+    if not embodiment or embodiment not in DELTA_RMS:
+        return ()
+    kinds = action_semantics(embodiment)
+    if len(kinds) != dof:
+        raise ValueError(f"{embodiment}: {len(kinds)} action kinds for dof {dof}")
+    return tuple(i for i, k in enumerate(kinds) if k == ABSOLUTE)
 
 
 class QActionBody(nn.Module):
@@ -199,6 +326,9 @@ class QActionBody(nn.Module):
         d_kv: int | None = None,
         action_rms: Sequence[float] | None = None,
         logit_rms: float | None = LOGIT_RMS,
+        delta_dims: Sequence[int] | None = None,
+        delta_rms: Sequence[float] | None = None,
+        delta_gain: float = DELTA_GAIN,
     ) -> None:
         super().__init__()
         self.dof, self.h_op = dof, h_op
@@ -237,6 +367,30 @@ class QActionBody(nn.Module):
         self.trunk = mlp_trunk(n_queries * d + d_act_out, hidden, n_ops,
                                n_hidden=n_hidden, logit_rms=logit_rms)
 
+        # ── the within-window branch (ABSOLUTE-semantics bodies only) ─────
+        # Deliberately constructed LAST, so a body that has no delta branch
+        # draws an identical module-init RNG stream to the one it drew before
+        # this branch existed, and so does every module built after q_action.
+        if delta_dims is None:
+            delta_dims = absolute_dims(embodiment, dof)
+        self.delta_dims = tuple(int(i) for i in delta_dims)
+        self.delta_gain = float(delta_gain)
+        self.delta_in = None
+        if self.delta_dims:
+            if any(i < 0 or i >= dof for i in self.delta_dims):
+                raise ValueError(
+                    f"delta_dims {self.delta_dims} out of range for dof {dof}"
+                )
+            src = delta_rms if delta_rms is not None else DELTA_RMS[embodiment]
+            vals = tuple(float(src[i]) for i in self.delta_dims)
+            if any(v <= 0.0 for v in vals):
+                raise ValueError(f"delta_rms must be positive elementwise, got {vals}")
+            self.register_buffer("delta_idx",
+                                 torch.tensor(self.delta_dims, dtype=torch.long),
+                                 persistent=False)
+            self.register_buffer("delta_rms", torch.tensor(vals), persistent=False)
+            self.delta_in = nn.Linear(len(self.delta_dims), d_act)
+
     def encode_action(self, a_seg: Tensor) -> Tensor:
         if a_seg.shape[-2:] != (self.h_op, self.dof):
             raise ValueError(
@@ -244,6 +398,15 @@ class QActionBody(nn.Module):
                 f"got {tuple(a_seg.shape)}"
             )
         x = self.step_in(a_seg / self.action_rms.to(a_seg)) + self.step_emb.to(a_seg.dtype)
+        if self.delta_in is not None:
+            # `a_seg[0]` and not proprio: q_a's signature is (a_seg, z), PLAN 4.C,
+            # frozen. On this body action[t] == state[t+1] bitwise, so a_seg[0]
+            # IS a proprio reading one control step ahead. What this anchor drops
+            # against decoder.residual's (a_seg - proprio_t) is a per-segment
+            # CONSTANT, which the absolute branch above still carries in full.
+            g = a_seg.index_select(-1, self.delta_idx)
+            g = (g - g[..., :1, :]) / self.delta_rms.to(g)
+            x = x + self.delta_gain * self.delta_in(g)
         x = x.flatten(-2)
         return self.act_out(self.act_norm(x))
 

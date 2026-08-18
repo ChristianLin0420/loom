@@ -9,15 +9,21 @@ Covers PLAN 4.C done-when items 3, 4, 5, 6, 10, 11.
 from __future__ import annotations
 
 import importlib
+import pathlib
+import sys
 
 import pytest
 import torch
 
 import contracts as C
 import stubs as S
+from loom.data.canonical import ABSOLUTE, action_semantics
 from loom.heads.decoder import Decoder, DecoderBody
-from loom.heads.q_action import ACTION_RMS, LOGIT_RMS, QAction
+from loom.heads.q_action import (ACTION_RMS, DELTA_RMS, LOGIT_RMS, QAction,
+                                 QActionBody, absolute_dims)
 from loom.heads.q_delta import AttnPool, CenteredReadout, QDelta, topk_simplex_st
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 torch.manual_seed(0)
 
@@ -435,6 +441,176 @@ def test_action_rms_brings_the_rotation_dofs_into_view():
     assert share_plain[3:6].sum() < 0.02, share_plain         # rotation is invisible
     assert share_scaled.max() < 0.25, share_scaled            # no dof dominates
     assert share_scaled[3:6].sum() > 0.30, share_scaled       # rotation is now real
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  THE SEGMENT-ANCHORED DELTA BRANCH   (ABSOLUTE-semantics bodies only)
+#
+#  `q_a` must emit a DIFFERENT c per horizon h. On a body whose actions are
+#  ABSOLUTE servo targets in a slow trajectory, `a_seg` is nearly constant
+#  across a window, so the only thing left that varies with h is phase and `c`
+#  becomes a clock. The delta branch puts the within-window displacement back
+#  in. LIBERO must be untouched, byte for byte: `r0a_flip` is live and its
+#  remaining links re-import this file from disk.
+# ═══════════════════════════════════════════════════════════════════════════
+
+#: q_a's state_dict on the shipping LIBERO body, before the delta branch existed.
+#: Both new buffers are `persistent=False`, so a body WITH the branch adds
+#: exactly the two `delta_in` parameters and nothing else.
+_LIBERO_QA_KEYS = 27
+
+
+def _robotwin_dof() -> int:
+    """Import the adapter for its registration side effects and return its dof.
+
+    Deliberately NOT via `contracts.EMBODIMENTS`: conftest's autouse fixture
+    restores that dict after every test while the adapter stays in
+    `sys.modules`, so the second test in a session to ask would find the body
+    missing. `canonical._ACTION_SEMANTICS` is not restored, which is why the
+    delta branch keys off semantics and this helper reads dof off the module.
+    """
+    mod = importlib.import_module("loom.data.adapters.robotwin")
+    return mod.DOF
+
+
+def test_absolute_dims_excludes_libero_and_every_unmeasured_body():
+    """The DELTA_RMS row is the opt-in, exactly as for ACTION_RMS."""
+    assert "libero_franka" not in DELTA_RMS          # gate 1: no measured row
+    # gate 2: even if the row existed, LIBERO has ZERO absolute dims
+    assert ABSOLUTE not in action_semantics("libero_franka")
+    assert absolute_dims("libero_franka", 7) == ()
+    assert absolute_dims(None, 7) == ()
+    assert absolute_dims("teamc_toy7", DOF_A) == ()  # synthetic, no semantics
+    assert absolute_dims("teamc_toy14", DOF_B) == ()
+
+
+def test_libero_body_has_no_delta_branch_and_todays_state_dict():
+    b = QActionBody(7, embodiment="libero_franka")
+    assert b.delta_dims == ()
+    assert b.delta_in is None
+    assert len(b.state_dict()) == _LIBERO_QA_KEYS
+    assert not any("delta" in k for k in b.state_dict())
+
+
+def test_a_body_with_no_registered_semantics_gets_no_branch():
+    """BODY_A / BODY_B are in `contracts.EMBODIMENTS` but have no action
+    semantics. They must fall out on the DELTA_RMS gate, before
+    `action_semantics` is ever consulted -- not raise."""
+    for body, dof in ((BODY_A, DOF_A), (BODY_B, DOF_B)):
+        b = QAction([body], **SMALL_QA).body(body)
+        assert b.delta_in is None and b.delta_dims == ()
+        assert not any("delta" in k for k in b.state_dict())
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_libero_encode_action_is_byte_identical(dtype):
+    """The executed statement is unchanged character for character; the branch is
+    guarded. Not `allclose` -- `torch.equal`, in the training dtype."""
+    b = QActionBody(7, embodiment="libero_franka").to(dtype).eval()
+    a = torch.randn(16, C.H_OP, 7, dtype=dtype)
+    with torch.no_grad():
+        x = b.step_in(a / b.action_rms.to(a)) + b.step_emb.to(dtype)
+        expected = b.act_out(b.act_norm(x.flatten(-2)))
+        assert torch.equal(b.encode_action(a), expected)
+
+
+def test_robotwin_body_gets_every_dim_and_exactly_two_new_keys():
+    dof = _robotwin_dof()
+    b = QActionBody(dof, embodiment="robotwin_aloha")
+    assert b.delta_dims == tuple(range(dof))          # all 14 are ABSOLUTE
+    assert isinstance(b.delta_in, torch.nn.Linear)
+    new_keys = set(b.state_dict()) - set(QActionBody(dof).state_dict())
+    assert new_keys == {"delta_in.weight", "delta_in.bias"}
+    # the measured constants must NOT ride in a checkpoint
+    assert not any("delta_rms" in k or "delta_idx" in k for k in b.state_dict())
+    d_act = b.step_in.out_features
+    assert (sum(p.numel() for p in b.parameters())
+            - sum(p.numel() for p in QActionBody(dof).parameters())
+            == dof * d_act + d_act)
+
+
+def test_delta_branch_is_invariant_to_a_constant_offset():
+    """`a_seg + k` moves the ABSOLUTE branch's input and leaves the delta
+    branch's alone -- that is what makes it a within-window signal rather than
+    another copy of the pose.
+
+    Invariance to `+k` is exact in real arithmetic but NOT bitwise in floating
+    point: `(a+k) - (a+k)[0]` rounds differently from `a - a[0]`. Measured
+    below at ~1e-6 relative against a signal of order 10, i.e. six orders down
+    and irrelevant beside bf16's own 3e-3. The claim that IS bit-exact is the
+    one the design rests on -- the SAME physical segment at a different horizon
+    index encodes identically, because it is literally the same input bytes,
+    with no offset added anywhere (measured on real windows in
+    logs/dual_gate/encgate.py, max |diff| exactly 0).
+    """
+    dof = _robotwin_dof()
+    b = QActionBody(dof, embodiment="robotwin_aloha").eval()
+    a = torch.randn(8, C.H_OP, dof)
+    k = torch.randn(8, 1, dof)                        # per-window constant offset
+
+    def branches(x):
+        g = x.index_select(-1, b.delta_idx)
+        return (x / b.action_rms.to(x), (g - g[..., :1, :]) / b.delta_rms.to(g))
+
+    abs0, d0 = branches(a)
+    abs1, d1 = branches(a + k)
+    assert torch.allclose(d0, d1, rtol=1e-4, atol=1e-4)   # delta branch: unmoved
+    rel = (d0 - d1).abs().max() / d0.abs().max()
+    assert rel < 1e-5, rel
+    # and the absolute branch really does see the offset -- otherwise the test
+    # would pass on an encoding that ignores its input
+    assert not torch.allclose(abs0, abs1)
+    assert (abs0 - abs1).abs().max() > 1e-3
+
+
+def test_delta_branch_actually_changes_the_encoding_and_the_gain_scales_it():
+    dof = _robotwin_dof()
+    torch.manual_seed(0)
+    on = QActionBody(dof, embodiment="robotwin_aloha").eval()
+    torch.manual_seed(0)
+    off = QActionBody(dof, embodiment="robotwin_aloha", delta_dims=[]).eval()
+    assert off.delta_in is None
+    off.load_state_dict(off.state_dict())
+    a = torch.randn(8, C.H_OP, dof)
+    with torch.no_grad():
+        assert not torch.allclose(on.encode_action(a), off.encode_action(a))
+        # `delta_gain=0` reproduces the kill switch exactly
+        torch.manual_seed(0)
+        zero = QActionBody(dof, embodiment="robotwin_aloha", delta_gain=0.0).eval()
+        assert torch.allclose(zero.encode_action(a), off.encode_action(a), atol=1e-6)
+
+
+def test_delta_branch_is_drawn_last_so_it_cannot_perturb_the_shared_init():
+    """The kill switch must not reshuffle any other weight -- otherwise an
+    ablation is not an ablation, and neither is a resume."""
+    dof = _robotwin_dof()
+    torch.manual_seed(0)
+    on = QActionBody(dof, embodiment="robotwin_aloha")
+    torch.manual_seed(0)
+    off = QActionBody(dof, embodiment="robotwin_aloha", delta_dims=[])
+    for k, v in off.state_dict().items():
+        assert torch.equal(v, on.state_dict()[k]), k
+
+
+def test_delta_rms_table_is_registered_and_well_formed():
+    _robotwin_dof()                       # import for the registration side effect
+    for name, rms in DELTA_RMS.items():
+        kinds = action_semantics(name)    # raises if the body never declared any
+        assert len(rms) == len(kinds), name
+        assert all(v > 0 for v in rms), name
+        # a measured row only makes sense where some dim is an absolute target
+        assert ABSOLUTE in kinds, name
+        # the two per-dof tables must describe the same body
+        assert name in ACTION_RMS and len(ACTION_RMS[name]) == len(kinds), name
+
+
+def test_q_action_module_imports_in_a_fresh_interpreter():
+    """The one new import edge is `loom.heads.q_action -> loom.data.canonical`.
+    Import it FIRST, with nothing else loaded, so a cycle would show up here."""
+    import subprocess
+    r = subprocess.run([sys.executable, "-c", "import loom.heads.q_action"],
+                       capture_output=True, text=True, cwd=str(_REPO_ROOT))
+    assert r.returncode == 0, r.stderr
 
 
 # ═══════════════════════════════════════════════════════════════════════════
