@@ -45,7 +45,7 @@ losses:
   dyn:       {enabled: false, weight: 0.0}
   act:       {enabled: false, weight: 0.0}
   proposal:  {enabled: false, weight: 0.0}
-  balance:   {enabled: true,  weight: 3.0e-3}   # still needed: RL kills operators
+  balance:   {enabled: true,  weight: 1.0e-2}   # still needed: RL kills operators
   potential: {enabled: true,  weight: 1.0}
   grpo:      {enabled: true,  weight: 1.0, group: 8}
 

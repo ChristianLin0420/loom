@@ -5,15 +5,28 @@
 Held in a `ModuleDict` keyed by embodiment name. Batches are
 embodiment-homogeneous (PLAN 9), so `forward` takes the name and routes once.
 
-WHY THERE IS NO ALIGNMENT LOSS
-──────────────────────────────
-`q_a^e` is trained by plain regression onto `sg(q_Delta(z_t, z_{t+8}))` — see
-`loom/losses/act.py::q_action_regression_loss`. That single stop-gradded
-regression is what puts both encoders in *one* coefficient space, by
-construction. No KL, no adversarial term, no separate alignment loss (PLAN 9:
-do not add losses). The head below is imported from `q_delta.py` rather than
-re-implemented for exactly the same reason: two encoders that discretise
-differently do not share a space no matter what loss you put between them.
+WHY THERE IS NO ALIGNMENT LOSS  (and which way the one that exists points)
+─────────────────────────────────────────────────────────────────────────
+There is exactly ONE stop-gradded regression between the two encoders — the
+align half of `L_act`, `loom/losses/act.py::q_action_regression_loss`. That is
+what puts both encoders in *one* coefficient space, by construction. No KL, no
+adversarial term, no fifth loss (PLAN 9: do not add losses). The head below is
+imported from `q_delta.py` rather than re-implemented for exactly the same
+reason: two encoders that discretise differently do not share a space no matter
+what loss you put between them.
+
+**Since ALIGN-FLIP this head is NOT the one that moves.** `configs/r0a.yaml`
+ships `losses.act.align_to: q_a`, i.e. `q_Delta` regresses onto `sg(q_a)`, and
+`q_a`'s only gradient is `D_e`'s reconstruction of `a_{t:t+7}` from
+`(proprio_t, c)`. The paragraph below diagnoses why the old direction had to
+go: with the align term pointed *at* this head it rewards flat coefficients
+whenever the two supports are disjoint, which is the state R0-A sat in for 7004
+steps (`act/align` pinned at the 0.500 disjoint floor). Read it as the record of
+the failure, not as a description of the shipping configuration — with
+`align_to: q_a` the align gradient no longer reaches this head at all, and the
+`logit_rms` pin still matters for the same reason (an unpredictable target is
+now `D_e`'s reconstruction target, and this head still switches itself off while
+one is unpredictable).
 
 The action encoder is deliberately tiny relative to the trunk. `a_seg` is only
 `H_OP * dof_e` = 56 numbers for LIBERO; the hard part is not reading the action,

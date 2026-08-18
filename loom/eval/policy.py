@@ -2,8 +2,12 @@
 
     z <- E(o, l, z_prev)
     c <- argmax pi_c(. | z, l)
-    a <- D_e(z, c)                 # (H_OP, dof) at FPS_CANONICAL
+    a <- D_e(proprio_t, c)         # (H_OP, dof) at FPS_CANONICAL
     execute the segment, re-filter                                  (PLAN 4.F)
+
+`D_e` takes the body's proprio and the coefficient — **not** the belief. See
+`loom/heads/decoder.py`; the belief made `L_act` a behaviour-cloning objective
+that put no pressure on `c` at all.
 
 No search in R0.
 
@@ -405,7 +409,13 @@ class LoomPolicy:
         if self.op_stats:
             self._log_operator(m.proposal, z, feats["lang"], c)
 
-        a = _call(m.decoder, z, c)                                   # (1, H_OP, dof)
+        # D_e(proprio_t, c), NOT D_e(z, c). The belief is deliberately not an
+        # input to the realizer -- with it the decoder is a behaviour-cloning
+        # head and `c` is decorative (loom/heads/decoder.py). `feats["proprio"]`
+        # is (1, dof_e) here, already on the estimator's device and dtype via
+        # `feats_to` above, and it is the same quantity training reads out of
+        # `window["feats"][h]["proprio"]`.
+        a = _call(m.decoder, feats["proprio"], c)                    # (1, H_OP, dof)
         a = a.detach().to(torch.float32).cpu().numpy()
         if a.ndim == 3:
             a = a[0]

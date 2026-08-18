@@ -40,6 +40,18 @@ def test_topk_valid():
     assert 1 <= C.TOPK <= C.M
 
 
+def test_balance_coef_is_the_owner_authorised_value():
+    """The second owner-authorised contract change, pinned.
+
+    3e-3 with the old KL-of-batch-mean form left an unselected operator at
+    0.0006 (ctrl) / 0.0001 (zinit) of a selected one's per-entry gradient at
+    q_Delta's logits. `configs/*.yaml` must agree -- `losses.balance.weight` is
+    what the loop actually multiplies by, and
+    `tests/test_train.py::test_r0a_config_matches_the_plan` pins the pair.
+    """
+    assert C.BALANCE_COEF == 1e-2
+
+
 def test_operator_duration_is_reasonable():
     """One operator should be a plausible linearization interval."""
     ms = 1000.0 * C.H_OP / C.FPS_CANONICAL
@@ -169,12 +181,37 @@ def test_rollout_matches_sequential_step():
 
 
 def test_decoder_emits_h_op_not_h_plan():
-    """A Decoder emits ONE operator's worth of action. Never H_PLAN."""
+    """A Decoder emits ONE operator's worth of action. Never H_PLAN.
+
+    First argument is `(B, dof_e)` PROPRIO, not the belief: `contracts.Decoder`
+    is `forward(proprio, c)`. `stubs.StubDecoder` is frozen and predates that,
+    but it only ever reads `shape[0]` / `device` / `dtype` off its first
+    argument, so it satisfies the new signature unchanged.
+    """
     dec = S.StubDecoder()
-    a = dec(torch.randn(3, C.K, C.D), S.sparse_simplex(3))
+    a = dec(torch.randn(3, 7), S.sparse_simplex(3))
     assert a.shape == (3, C.H_OP, 7)
     assert a.shape[1] != C.H_PLAN
     C.assert_action_segment(a, "libero_franka")
+
+
+def test_decoder_protocol_takes_proprio_and_not_the_belief():
+    """The owner-authorised contract change, pinned.
+
+    `D_e(z, c)` made `L_act` behaviour cloning: with the whole belief available
+    the decoder needs nothing from `c`, and R0-A measured `act/decode` falling
+    0.2489 -> 0.0559 while `c_a` held 2-3 distinct top-4 supports over 64 real
+    training windows. Dropping `z` makes `c` the only channel carrying task
+    information into the action.
+    """
+    import inspect
+
+    for name in ("forward", "loss"):
+        params = list(inspect.signature(getattr(C.Decoder, name)).parameters)
+        assert params[1] == "proprio", (
+            f"contracts.Decoder.{name} must take proprio first, got {params}"
+        )
+        assert "z" not in params, f"the belief is not an input to D_e: {params}"
 
 
 def test_q_delta_returns_simplex():

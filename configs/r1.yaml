@@ -35,7 +35,7 @@ losses:
   dyn:      {enabled: true,  weight: 1.0, negatives: within_trajectory}
   act:      {enabled: false, weight: 0.0}
   proposal: {enabled: false, weight: 0.0}
-  balance:  {enabled: true,  weight: 3.0e-3}
+  balance:  {enabled: true,  weight: 1.0e-2}
 
 train_modules: [estimator, bank, q_delta]
 

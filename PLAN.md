@@ -22,7 +22,8 @@ OPERATOR      c       = q_Δ(z_t, z_{t+8})     action-free
 DYNAMICS      ẑ_{t+8} = A(c) z_t + b(c),      A(c) = Σ_m c_m A_m
                         ‖A(c)‖₂ ≤ ρ,  ‖b(c)‖ ≤ B_max      (both by convexity)
 
-REALIZE       â       = D_e(z_t, c) → (H_OP, dof_e)       8 control steps
+REALIZE       â       = D_e(p_t, c) → (H_OP, dof_e)       8 control steps
+                        p_t = proprio at t. NOT z: see 4.C.
 
 POLICY        c       ~ π_c(c | z_t, ℓ)                   inference path
 
@@ -101,8 +102,8 @@ class QAction(Protocol):                                  # ONE PER EMBODIMENT
     def forward(self, a_seg: Tensor, z: Tensor) -> Tensor: ...  # a_seg (B,H_OP,dof_e)
 
 class Decoder(Protocol):                                  # ONE PER EMBODIMENT
-    def forward(self, z: Tensor, c: Tensor) -> Tensor: ...      # -> (B,H_OP,dof_e)
-    def loss(self, z: Tensor, c: Tensor, a_seg: Tensor) -> Tensor: ...
+    def forward(self, proprio: Tensor, c: Tensor) -> Tensor: ...   # -> (B,H_OP,dof_e)
+    def loss(self, proprio: Tensor, c: Tensor, a_seg: Tensor) -> Tensor: ...
 
 class Proposal(Protocol):                                 # shared
     def sample(self, z: Tensor, lang: Tensor, n: int) -> Tensor: ...   # -> (B,n,M)
@@ -234,7 +235,9 @@ Everything here is required for R0-A. Nothing else is. Teams do 1A items before 
 >
 > **`q_action.py`** — **`ModuleDict` keyed by embodiment.** `(a_seg (B,H_OP,dof_e), z) → Coeff`, same top-4 head. Trained by regression onto `sg(q_Δ(z_t, z_{t+8}))`, so both encoders write into one coefficient space by construction. No KL, no adversarial term, no separate alignment loss.
 >
-> **`decoder.py`** — **`ModuleDict` keyed by embodiment.** `D_e(z, c) → (B, H_OP, dof_e)`. **One operator = one 8-step segment. Never 32.** Conditional flow matching.
+> **`decoder.py`** — **`ModuleDict` keyed by embodiment.** `D_e(proprio, c) → (B, H_OP, dof_e)`. **One operator = one 8-step segment. Never 32.** Conditional flow matching.
+>
+> **The belief is NOT an input** (owner-authorised contract change, after R0-A). Given the full `(K, D)` belief, predicting an 8-step segment is behaviour cloning, and behaviour cloning needs nothing from `c`: R0-A measured `act/decode` falling 0.2489 → 0.0559 while `c_a` held 2–3 distinct top-4 supports over 64 real training windows, i.e. `L_act` put no pressure on the coefficient at all. `proprio` is `ObsFeats["proprio"]`, `(B, dof_e)` — one timestep of the body's own state. It says where the arm is; it cannot say where the target is, so it cannot substitute for `c`.
 >
 > **`losses/dyn.py`**
 > ```
@@ -243,13 +246,17 @@ Everything here is required for R0-A. Nothing else is. Teams do 1A items before 
 > ```
 > `ẑ` from sequential `bank.step`; targets from the EMA estimator (`τ = 0.996`) under stop-grad.
 >
-> Expose `dyn.negatives ∈ {none, within_trajectory}`, default **`within_trajectory`**. Negatives are `c` from another segment of the **same trajectory, ≥2 segments away** — same scene, same body, genuinely different effect. Do **not** use uncurated in-batch negatives: two bodies producing the same world effect would become negatives for each other, which is precisely the opposite of what a shared operator bank should learn.
+> Expose `dyn.negatives ∈ {none, within_trajectory}`, default **`within_trajectory`**. `loom/train/loop.py` calls `dyn_loss` directly — it used to compute a bare `1 − cos(A(c)z, z⁺)` inline with no negatives at all, so every config's `negatives:` key was inert.
+>
+> Log **`Δ_sel = d(A(c_other) z, z⁺) − d(A(c_true) z, z⁺)`** with `c_other = c.roll(1, dims=0)`, i.e. a *real* coefficient from another window. This, and not `Δ_op`, is the discrimination test: `Δ_op` compares against a uniform random simplex point and only says the bank is alive. R0-A measured `Δ_sel` at +0.0002 (ctrl) / +0.0000 (zinit). Negatives are `c` from another segment of the **same trajectory, ≥2 segments away** — same scene, same body, genuinely different effect. Do **not** use uncurated in-batch negatives: two bodies producing the same world effect would become negatives for each other, which is precisely the opposite of what a shared operator bank should learn.
 >
 > Log every step: **`Δ_op = d(A(c_rand)z, z⁺) − d(A(c_true)z, z⁺)`, which must be > 0.** Mind the sign: for a distance, the true operator should be *closer*. Latent states 8 steps apart are ~0.95 cosine-similar before training, so `A(c) ≈ I` nearly satisfies `L_dyn` while `c` carries nothing. If `Δ_op` flatlines in the first few thousand steps, the model has collapsed to a plain latent policy — flip `negatives` to `within_trajectory` before burning the full run. This is a build assert, not a metric.
 >
 > **`losses/act.py`** — wrapper over `Decoder.loss`, dispatched by embodiment.
 > **`losses/proposal_bc.py`** — `−log π_c(sg(c_a) | z, ℓ)`. Not loss creep: this is the only thing that makes the model executable.
-> **`losses/balance.py`** — `KL(mean_batch(c) ‖ uniform(M))`, coefficient `3e-3`. Hard top-k already provides sparsity; this only prevents dead operators.
+> **`losses/balance.py`** — coefficient `contracts.BALANCE_COEF`. Hard top-k already provides sparsity; this only prevents dead operators.
+>
+> The executed form is the **Switch auxiliary** `M · Σ_m f_m P_m` (`loom/train/loop.py::_switch_balance`), with `f_m` the fraction of routing slots that went to `m` and `P_m` the mean **dense** router probability — floor 1.0, ceiling `M/TOPK = 32`. It replaced `KL(mean_batch(c) ‖ uniform(M))`, which is a function of `c` alone and therefore blind to how nearly an unselected operator was chosen; the coefficient went `3e-3 → 1e-2` with it. `losses/balance.py` still holds the KL as the reference.
 >
 > **Done when** `tests/test_losses.py` passes: `L_dyn` decreases on a synthetic task where `c` is the only informative input; `Δ_op > 0` on that task; top-4 output verified on-simplex; per-embodiment dispatch verified with two different `dof`.
 

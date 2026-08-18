@@ -47,6 +47,7 @@ from torch import Tensor, nn
 
 import contracts as C
 import stubs as S
+from loom.losses.dyn import dyn_loss, ln_cosine_distance
 from loom.train import ckpt as ckpt_mod
 from loom.train import fsdp as fsdp_mod
 from loom.train import wandb_util
@@ -71,6 +72,12 @@ MODULE_NAMES = ("estimator", "bank", "q_delta", "q_action", "decoder",
 #: Knobs describing *this link*, not the experiment. Never in the config hash.
 LINK_LOCAL_KEYS = ("run_dir", "stop_at", "budget_s", "safety_s", "no_wandb",
                    "allow_reshard", "config_path")
+
+#: How often to measure the per-entry gradient ratio at q_Delta's logits
+#: (unselected : selected). It needs the backward pass to have run, so it is not
+#: free the way a forward-only statistic is; `optim.grad_probe_every` overrides,
+#: 0 turns it off.
+GRAD_PROBE_EVERY = 100
 
 _CONFIG_DIR = _ROOT / "configs"
 
@@ -202,12 +209,21 @@ class _StubEstimator(S.StubEstimator):
 
 
 class _StubDecoder(S.StubDecoder):
+    """`stubs.StubDecoder` is frozen and predates the `(proprio, c)` contract.
+
+    It never reads its first argument beyond `shape[0]` / `device` / `dtype`, so
+    handing it `(B, dof_e)` proprio instead of `(B, K, D)` belief works
+    unchanged; only the names here move, so the shape the loop passes matches
+    what the REAL decoder now takes.
+    """
+
     def __init__(self, embodiment: str) -> None:
         super().__init__(embodiment)
         self.scale = nn.Parameter(torch.ones(self.dof))
 
-    def loss(self, z: Tensor, c: Tensor, a_seg: Tensor) -> Tensor:
-        return ((self.forward(z, c) * self.scale.to(z.dtype) - a_seg) ** 2).mean()
+    def loss(self, proprio: Tensor, c: Tensor, a_seg: Tensor) -> Tensor:
+        return ((self.forward(proprio, c) * self.scale.to(proprio.dtype)
+                 - a_seg) ** 2).mean()
 
 
 class _StubQAction(S.StubQAction):
@@ -351,10 +367,12 @@ def build_model(cfg: dict) -> "LoomModel":
                  random-output stub for eight hours.
 
     The four loss terms are computed in :meth:`LoomModel.compute_losses` straight
-    from PLAN 4.C. ``loom/losses/{dyn,act,proposal_bc,balance}.py`` (Team C) has
-    since landed with an equivalent API (``dyn_loss``, ``act_loss``,
-    ``proposal_bc_loss``, ``balance_loss``); swapping to it is the remaining
-    integration step and belongs in this function.
+    from PLAN 4.C. ``L_dyn`` now calls Team C's ``loom/losses/dyn.py::dyn_loss``
+    -- the inline version it replaced had no negatives at all, so the configured
+    ``dyn.negatives: within_trajectory`` was inert and a constant ``z`` drove the
+    term to zero for free. ``L_act`` / ``L_proposal`` stay inline: they are one
+    call to ``Decoder.loss`` and one to ``Proposal.log_prob`` respectively, and
+    the loop needs the per-horizon decomposition that the wrappers hide.
     """
     mcfg = dict(cfg.get("model", {}))
     mode = mcfg.get("use_stubs", "auto")
@@ -412,10 +430,95 @@ def _accepts(module, name: str) -> bool:
 
 
 def _cos_dist(a: Tensor, b: Tensor) -> Tensor:
-    """1 - cos(LN(a), LN(b)), averaged over slots and batch. PLAN 4.C."""
-    a = F.layer_norm(a.float(), (a.shape[-1],))
-    b = F.layer_norm(b.float(), (b.shape[-1],))
-    return (1.0 - F.cosine_similarity(a, b, dim=-1)).mean()
+    """1 - cos(LN(a), LN(b)), averaged over slots and batch. PLAN 4.C.
+
+    Exactly `losses.dyn.ln_cosine_distance(a, b, "per_slot").mean()`, kept as a
+    local so the diagnostics below read the same as they did before `L_dyn`
+    itself moved into `loom/losses/dyn.py`, and so `delta_op` stays comparable
+    with every run logged before that.
+    """
+    return ln_cosine_distance(a, b, "per_slot").mean()
+
+
+def _coeff_and_logits(head, *args, **kw) -> tuple[Tensor, Tensor | None]:
+    """`c` and, when the head exposes them, the DENSE logits behind it.
+
+    Team C's `QDelta` / `QAction` take `return_logits=True`; the frozen stubs do
+    not. The Switch load-balancing term needs the dense router distribution
+    (`P_m`), not the sparse `c` -- with `P_m` read off `c` the gradient on an
+    operator that is in no support is exactly zero, which is the closed path the
+    term exists to open. `None` here means "stub", and `_switch_balance` falls
+    back to `c`.
+    """
+    try:
+        out = head(*args, return_logits=True, **kw)
+    except TypeError:
+        return head(*args, **kw), None
+    if isinstance(out, tuple):
+        return out[0], out[1]
+    return out, None
+
+
+def _switch_balance(c: Tensor, logits: Tensor | None, topk: int = C.TOPK) -> Tensor:
+    """The Switch auxiliary load-balancing loss,  `M * sum_m f_m P_m`.
+
+    * `f_m` -- the fraction of ROUTING SLOTS that went to operator `m`. One
+      token contributes `TOPK` slots (its hard top-4 support), so `sum_m f_m`
+      is 1 by construction and this reduces to Switch's own definition at
+      `TOPK = 1`. Non-differentiable and detached; it is a count.
+    * `P_m` -- the mean DENSE router probability for `m`, `softmax(logits)`
+      averaged over tokens. `sum_m P_m == 1`.
+
+    Range: `1.0` when both are uniform (the degenerate floor -- read it as a
+    plateau, not as progress) up to `M / TOPK = 32` when every token routes to
+    the same four operators and the router is certain about it.
+
+    What it replaces and why (owner's call; the measurement behind it):
+    `KL(mean_batch(c) || uniform(M))` is a function of `c` alone, and `c` is
+    exactly zero for every operator outside the top-4 support -- so the whole
+    term sees only the hard routing decision, never how nearly an operator was
+    chosen. Its gradient still reaches an unselected logit (`topk_simplex_st`
+    returns `hard + soft - soft.detach()`, so the backward is dense) but
+    measured on the R0-A checkpoints it arrived at 0.0006 (ctrl) / 0.0001
+    (zinit) of a selected operator's per-entry size. The Switch form is a
+    function of the DENSE router as well as of the routing, so the loss changes
+    when an out-of-support logit moves at all -- and its coefficient went
+    3e-3 -> 1e-2 with it, which is the part that is unambiguously a magnitude
+    change. `grad_ratio/q_delta_logits` is logged so this is read and not
+    assumed.
+
+    Gradient, for the record:
+        dL/dl_{t,m} = (M/T) * (f_m - sum_j f_j P_{t,j}) * P_{t,m}
+    negative -- i.e. pushing the logit UP -- for every operator whose load is
+    below the load-weighted average, including the ones at exactly zero.
+    """
+    m = c.shape[-1]
+    k = min(topk, m)
+    cf = c.detach().float().reshape(-1, m)          # `f` is a count: detached
+    t = cf.shape[0]
+    idx = cf.topk(k, dim=-1).indices
+    f = torch.zeros_like(cf).scatter_(1, idx, 1.0).sum(0) / float(t * k)
+    # `P` carries the gradient. The stub path has no dense router to read, so
+    # it falls back to `c` -- which is the OLD behaviour and is why the real
+    # heads are asked for `return_logits`.
+    dense = (torch.softmax(logits.float().reshape(-1, m), dim=-1)
+             if logits is not None else c.float().reshape(-1, m))
+    return float(m) * (f * dense.mean(0)).sum()
+
+
+def _usage(cs: Sequence[Tensor]) -> tuple[float, float]:
+    """(operators used, usage entropy in nats) for one head's coefficients.
+
+    Aggregate statistics hide structure (CLAUDE.md), which is why this is
+    reported per HEAD rather than pooled: `q_a` and `q_Delta` had 7 and 19
+    operators alive respectively on the R0-A checkpoints, and one pooled number
+    cannot say that. `1e-4` is the same liveness threshold the pooled
+    `bank/live_ops` used, so the two stay comparable.
+    """
+    u = torch.stack(list(cs), 0).detach().float().flatten(0, -2).mean(0)
+    u = u / u.sum().clamp_min(1e-12)
+    return (float((u > 1e-4).sum()),
+            float(-(u * u.clamp_min(1e-12).log()).sum()))
 
 
 class LoomModel(nn.Module):
@@ -443,6 +546,14 @@ class LoomModel(nn.Module):
         lc = cfg.get("losses", {})
         self.loss_cfg = {k: dict(v) for k, v in lc.items()}
         self.negatives = self.loss_cfg.get("dyn", {}).get("negatives", "within_trajectory")
+        #: which side of ``L_act``'s align term carries the gradient.
+        #: ``"q_delta"`` (the original) -- ``q_a`` regresses onto ``sg(q_Delta)``.
+        #: ``"q_a"``     (ALIGN-FLIP)   -- ``q_Delta`` regresses onto ``sg(q_a)``,
+        #: so ``c_a``'s only gradient is ``D_e``'s reconstruction of the action.
+        self.align_to = str(self.loss_cfg.get("act", {}).get("align_to", "q_delta"))
+        if self.align_to not in ("q_delta", "q_a"):
+            raise ValueError(
+                f"losses.act.align_to must be 'q_delta' or 'q_a', got {self.align_to!r}")
         # Team B's estimator holds per-embodiment proprio projections and infers
         # the body from proprio.shape[-1] when not told. Two registered bodies
         # already share dof=7, so inference is ambiguous and picking the wrong
@@ -453,6 +564,11 @@ class LoomModel(nn.Module):
         self.check_bf16 = False
         #: bf16 on CUDA, None on CPU. See `_cast`.
         self.compute_dtype: torch.dtype | None = None
+        #: set by main() on the steps that measure the q_Delta logit-grad ratio
+        self._probe_grad = False
+        #: this step's dense q_Delta logits, one per horizon (None on the stub
+        #: path). Rebuilt every `compute_losses`, read once after `backward`.
+        self._qd_logits: list[Tensor | None] = []
 
     # ── beliefs ────────────────────────────────────────────────────────────
     def _cast(self, z: Tensor) -> Tensor:
@@ -517,36 +633,104 @@ class LoomModel(nn.Module):
         terms: dict[str, Tensor] = {}
         zero = torch.zeros((), device=dev)
 
-        # coefficients from q_Delta -- action-free, available on every dataset
-        c_delta = [self.q_delta(zs[h], zts[h + 1]) for h in range(C.DEPTH)]
+        # coefficients from q_Delta -- action-free, available on every dataset.
+        # The dense logits come back too: `L_balance` needs the router
+        # distribution, and the grad probe needs a tensor to hang `retain_grad`
+        # on. `_qd_logits` is cleared every step so a stale graph cannot be read.
+        self._qd_logits = []
+        c_delta = []
+        for h in range(C.DEPTH):
+            c_h, lg_h = _coeff_and_logits(self.q_delta, zs[h], zts[h + 1])
+            c_delta.append(c_h)
+            self._qd_logits.append(lg_h)
+        if self._probe_grad and all(lg is not None for lg in self._qd_logits):
+            for lg in self._qd_logits:
+                lg.retain_grad()
 
         # ── L_dyn ──────────────────────────────────────────────────────────
+        #
+        # `loom/losses/dyn.py`, not an inline cosine. The inline version had NO
+        # negatives at all: a plain `1 - cos(A(c)z, z+)` that a constant `z` and
+        # `A(c) ~ I` drive to zero for free while `c` carries nothing. Every
+        # config has asked for `negatives: within_trajectory` since R0-A and
+        # nothing was reading it.
         if self._on("dyn"):
-            zhat, l_dyn = zs[0], zero
-            for h in range(C.DEPTH):
-                zhat = self.bank.step(c_delta[h], zhat)
-                if h == 0 and self.check_bf16:
-                    fsdp_mod.assert_bf16(zhat, "bank.step output (L_dyn rollout)")
-                l_dyn = l_dyn + C.DYN_WEIGHTS[h] * _cos_dist(zhat, zts[h + 1])
-            terms["dyn"] = l_dyn
+            dcfg = self.loss_cfg.get("dyn", {})
+            c_seq = torch.stack(c_delta, dim=1)                       # (B,DEPTH,M)
+            z_tgt = torch.stack([zts[h + 1] for h in range(C.DEPTH)], dim=1)
+            out = dyn_loss(
+                self.bank, zs[0], c_seq, z_tgt,
+                negatives=self.negatives,
+                min_gap=int(dcfg.get("min_gap", 2)),
+                neg_weight=float(dcfg.get("neg_weight", 1.0)),
+                neg_margin=float(dcfg.get("neg_margin", 0.1)),
+                weights=C.DYN_WEIGHTS,
+                cosine=str(dcfg.get("cosine", "per_slot")),
+                # CPU generator: the negatives' multinomial and the delta_op
+                # draw both happen where it lives and the indices move to the
+                # coefficients' device. See `losses.dyn._draw`.
+                generator=torch_generator(seed, step, rank, tag="dyn"),
+            )
+            if self.check_bf16:
+                fsdp_mod.assert_bf16(out["z_hat1"], "bank.step output (L_dyn rollout)")
+            terms["dyn"] = out["loss"]
+            metrics["dyn/pos"] = float(out["dyn"])
+            metrics["dyn/neg"] = float(out["neg"])
+            metrics["dyn/cos_pos"] = float(out["cos_pos"])
+            # The build assert, unchanged, so the number stays comparable with
+            # every prior run. Delta_op says the BANK is alive; it is not the
+            # discrimination test -- `Delta_sel` below is.
             metrics["delta_op"] = self._delta_op(zs, zts, c_delta, step, rank, seed)
+            metrics.update(self._delta_sel(zs, zts, c_delta))
 
         # ── L_act ──────────────────────────────────────────────────────────
         c_act: list[Tensor] | None = None
+        c_act_lg: list[Tensor | None] = []
         if self._on("act") and window.get("actions") is not None:
             qa, dec = self.q_action[emb], self.decoder[emb]
-            c_act, l_act, l_align = [], zero, zero
+            c_act, c_act_lg, l_act, l_align = [], [], zero, zero
             for h in range(C.DEPTH):
                 a_seg = window["actions"][:, h]                 # (B, H_OP, dof_e)
-                c_a = qa(a_seg, zs[h])
+                c_a, lg_a = _coeff_and_logits(qa, a_seg, zs[h])
                 c_act.append(c_a)
-                l_act = l_act + dec.loss(zs[h], c_a, a_seg)
-                # q_a regresses onto sg(q_Delta) -- one coefficient space by
-                # construction, which is why there is no separate alignment loss.
-                l_align = l_align + ((c_a - c_delta[h].detach()) ** 2).sum(-1).mean()
+                c_act_lg.append(lg_a)
+                # D_e(proprio_t, c) -- NOT D_e(z, c). Given the whole belief the
+                # decoder is a behaviour-cloning head and needs nothing from `c`,
+                # so `L_act` exerts no pressure on the coefficient (measured:
+                # act/decode 0.2489 -> 0.0559 while c_a held 2-3 distinct top-4
+                # supports over 64 real windows). `feats[h]["proprio"]` is
+                # (B, dof_e) -- ONE timestep, at the START of segment h.
+                proprio = window["feats"][h]["proprio"]
+                l_act = l_act + dec.loss(proprio, c_a, a_seg)
+                # ALIGN. One term, one direction, chosen by `losses.act.align_to`.
+                #
+                # "q_delta" (original): q_a regresses onto sg(q_Delta) -- one
+                #   coefficient space by construction, q_Delta defines it.
+                # "q_a" (ALIGN-FLIP): q_Delta regresses onto sg(q_a) instead, so
+                #   `c_a`'s only gradient is `dec.loss` -- the reconstruction of
+                #   a_{t:t+7} from (p_t, c), the one optimum in this objective a
+                #   batch-constant `c` cannot reach. The original direction
+                #   transmits q_Delta's phase clock INTO q_a: at the observed
+                #   plateau the align gradient on c_a has norm 2*sqrt(0.500) =
+                #   1.415 and is 100% common-mode, against decode's 0.179 of
+                #   which 94% is example-dependent, and q_a duly went blind
+                #   (frac_var_a 0.988 fresh -> 0.0015 trained).
+                if self.align_to == "q_a":
+                    l_align = l_align + ((c_delta[h] - c_a.detach()) ** 2).sum(-1).mean()
+                else:
+                    l_align = l_align + ((c_a - c_delta[h].detach()) ** 2).sum(-1).mean()
             terms["act"] = (l_act + l_align) / C.DEPTH
             metrics["act/decode"] = float(l_act.detach()) / C.DEPTH
             metrics["act/align"] = float(l_align.detach()) / C.DEPTH
+            # Did the flip engage? `c_a` batch-constant reads ~0 here. One
+            # scalar under no_grad; nothing below enters the training graph.
+            with torch.no_grad():
+                ca = torch.stack(c_act, 1).float()                  # (B,DEPTH,M)
+                metrics["act/c_a_spread"] = float(
+                    (ca - ca.mean(0, keepdim=True)).norm(dim=-1).mean())
+                cd = torch.stack(c_delta, 1).float()
+                metrics["act/c_delta_spread"] = float(
+                    (cd - cd.mean(0, keepdim=True)).norm(dim=-1).mean())
 
         # ── L_proposal ─────────────────────────────────────────────────────
         if self._on("proposal"):
@@ -559,11 +743,20 @@ class LoomModel(nn.Module):
         # ── L_balance ──────────────────────────────────────────────────────
         if self._on("balance"):
             allc = torch.stack(c_delta + (c_act or []), dim=0).flatten(0, -2)
-            cbar = allc.float().mean(0).clamp_min(1e-9)
+            all_lg = self._qd_logits + (c_act_lg if c_act is not None else [])
+            lg = (torch.stack(all_lg, 0).flatten(0, -2)
+                  if all(x is not None for x in all_lg) else None)
+            terms["balance"] = _switch_balance(allc, lg)
+            # pooled, unchanged, so it stays comparable with the prior runs
+            cbar = allc.detach().float().mean(0).clamp_min(1e-9)
             cbar = cbar / cbar.sum()
-            terms["balance"] = (cbar * (cbar.log() + float(torch.log(torch.tensor(
-                float(C.M)))))).sum()
             metrics["bank/live_ops"] = float((cbar > 1e-4).sum())
+            # ...and split by head, which is the number that carries information
+            ops, ent = _usage(c_delta)
+            metrics["bank/live_ops_q_delta"], metrics["bank/entropy_q_delta"] = ops, ent
+            if c_act is not None:
+                ops, ent = _usage(c_act)
+                metrics["bank/live_ops_q_a"], metrics["bank/entropy_q_a"] = ops, ent
 
         # ── R3: potential + GRPO ───────────────────────────────────────────
         if self._on("potential") and getattr(self, "potential", None) is not None:
@@ -592,9 +785,12 @@ class LoomModel(nn.Module):
 
         A build assert, not a metric (PLAN 4.C). Latent states 8 steps apart are
         ~0.95 cosine-similar before training, so ``A(c) ~ I`` nearly satisfies
-        ``L_dyn`` while ``c`` carries nothing. If this flatlines in the first few
-        thousand steps the model has collapsed to a plain latent policy: flip
-        ``losses.dyn.negatives`` to ``within_trajectory`` before burning the run.
+        ``L_dyn`` while ``c`` carries nothing.
+
+        **This is NOT the discrimination test.** It compares the true operator
+        against a *uniform random* simplex point, so it says the bank is alive
+        and nothing more; a collapsed ``c`` makes the comparison vacuous in the
+        other direction too (CLAUDE.md). ``_delta_sel`` is the real guard.
 
         ``within_trajectory`` negatives are ``c`` from another segment of the SAME
         trajectory at least 2 segments away -- same scene, same body, genuinely
@@ -619,6 +815,75 @@ class LoomModel(nn.Module):
         out = self.bank.step(torch.cat(c_true + negs, 0), torch.cat([z_in, z_in], 0))
         n = z_in.shape[0]
         return float(_cos_dist(out[n:], z_tgt) - _cos_dist(out[:n], z_tgt))
+
+    @torch.no_grad()
+    def _delta_sel(self, zs, zts, c_true) -> dict[str, float]:
+        """THE discrimination guard.  `Delta_sel > 0` or the coefficient is decoration.
+
+            c_other   = c.roll(1, dims=0)          # a REAL c, from another window
+            Delta_sel = d(A(c_other) z, z+) - d(A(c_true) z, z+)
+
+        Same distance `L_dyn` uses, same batched single `bank.step` as
+        `_delta_op`, reported per horizon and as the mean.
+
+        `Delta_op` compares the true operator against a *uniform random* point
+        on the simplex, so it answers "is the bank alive". This asks the only
+        question that matters for the method: does the coefficient this window
+        produced predict this window's transition BETTER THAN a coefficient a
+        different window produced? On the R0-A checkpoints the answer was
+        +0.0002 (ctrl) / +0.0000 (zinit) -- any other window's operator
+        predicted the transition exactly as well, which means `c` was not
+        carrying the transition at all.
+
+        `roll(1, dims=0)` needs B >= 2 to be a different window; at B=1 it is the
+        identity and this is identically zero by construction.
+        """
+        z_in = torch.cat([zs[h] for h in range(C.DEPTH)], 0)
+        z_tgt = torch.cat([zts[h + 1] for h in range(C.DEPTH)], 0)
+        c_pos = torch.cat(list(c_true), 0)
+        c_oth = torch.cat([c.roll(1, dims=0) for c in c_true], 0)
+        out = self.bank.step(torch.cat([c_pos, c_oth], 0), torch.cat([z_in, z_in], 0))
+        n = z_in.shape[0]
+        gap = (ln_cosine_distance(out[n:], z_tgt)
+               - ln_cosine_distance(out[:n], z_tgt)).view(C.DEPTH, -1).mean(1)
+        m = {f"delta_sel/h{h + 1}": float(gap[h]) for h in range(C.DEPTH)}
+        m["delta_sel"] = float(gap.mean())
+        return m
+
+    def grad_probe_metrics(self) -> dict[str, float]:
+        """Per-entry |grad| at q_Delta's logits, unselected : selected.
+
+        Called by `main` AFTER `loss.backward()` and BEFORE `zero_grad`, on the
+        steps `_probe_grad` marked. Returns `{}` on every other step and on the
+        stub path.
+
+        This is the number `L_balance` exists to move. `topk_simplex_st` returns
+        `hard + soft - soft.detach()`, so the backward into an out-of-support
+        logit is not blocked -- it is simply small, and a ratio near zero means
+        an operator that has fallen out of every support is receiving no useful
+        signal to come back with.
+        """
+        if not self._probe_grad:
+            return {}
+        num = den = 0.0
+        n_num = n_den = 0
+        for lg in self._qd_logits:
+            g = None if lg is None else lg.grad
+            if g is None:
+                continue
+            g = g.detach().float().abs()
+            # selected == in the hard top-4 support, read off the logits
+            # themselves so this does not depend on `c` still being alive.
+            sel = torch.zeros_like(g).scatter_(
+                -1, lg.detach().float().topk(C.TOPK, dim=-1).indices, 1.0).bool()
+            num += float(g[~sel].sum()); n_num += int((~sel).sum())
+            den += float(g[sel].sum()); n_den += int(sel.sum())
+        if n_num == 0 or n_den == 0 or den == 0.0:
+            return {}
+        per_unsel, per_sel = num / n_num, den / n_den
+        return {"grad_ratio/q_delta_logits": per_unsel / per_sel if per_sel else 0.0,
+                "grad_per_entry/q_delta_unselected": per_unsel,
+                "grad_per_entry/q_delta_selected": per_sel}
 
     def _grpo(self, z: Tensor, window: dict, dev) -> Tensor:
         """Group-relative advantage on pi_c, scored by Phi. R3 only.
@@ -1013,7 +1278,8 @@ def main(argv=None) -> int:
     batch = int(dcfg.get("batch_per_gpu", 2))
     grad_clip = float(ocfg.get("grad_clip", 1.0))
     grad_report = bool(ocfg.get("grad_report", True))
-    t0, last_delta = time.time(), float("nan")
+    probe_every = int(ocfg.get("grad_probe_every", GRAD_PROBE_EVERY))
+    t0, last_delta, last_sel = time.time(), float("nan"), float("nan")
 
     def _save(step: int, stop_reason: str = "") -> None:
         # stop_reason rides in the payload so a chain of 38 links can be triaged
@@ -1035,6 +1301,10 @@ def main(argv=None) -> int:
         lrs = sched.apply(opt, step)
 
         window = _to_device(sampler.next(step), device, model.compute_dtype)
+        # `retain_grad` on q_Delta's logits, on this step only. Cheap (a (B, M)
+        # tensor per horizon) but it is still a diagnostic, and it needs the
+        # backward to have run, so it is not on every step.
+        model._probe_grad = probe_every > 0 and step % probe_every == 0
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
             loss, metrics = model.compute_losses(window, step, rank, seed)
 
@@ -1042,6 +1312,9 @@ def main(argv=None) -> int:
         gnorm, skipped, gparts = 0.0, False, {}
         if loss.requires_grad:
             loss.backward()
+            # BEFORE any all-reduce or clip: these are activation gradients on
+            # THIS rank's own logits, and the question is their relative size.
+            metrics.update(model.grad_probe_metrics())
             # Replicated modules are invoked through step()/log_prob()/loss(), not
             # forward(), so no DDP/FSDP hook ever fires for them. Sync by hand.
             sync.all_reduce_grads()
@@ -1064,6 +1337,7 @@ def main(argv=None) -> int:
         state.global_step += 1
         state.samples_seen += batch * world
         last_delta = metrics.get("delta_op", last_delta)
+        last_sel = metrics.get("delta_sel", last_sel)
 
         if rank == 0 and metrics_fp is not None:
             metrics_fp.write(json.dumps({
@@ -1084,7 +1358,8 @@ def main(argv=None) -> int:
             if rank == 0:
                 parts = " ".join(f"{k[:3]}={v:.1f}" for k, v in gparts.items())
                 print(f"[rank0] step {state.global_step} loss={metrics['loss']:.4f} "
-                      f"delta_op={last_delta:+.4f} lr={sched.lr_at(step):.3e} "
+                      f"delta_op={last_delta:+.4f} delta_sel={last_sel:+.4f} "
+                      f"lr={sched.lr_at(step):.3e} "
                       f"gnorm={gnorm:.3f}{' SKIP' if skipped else ''} "
                       f"[{parts}] frozen={int(is_frozen)} "
                       f"emb={window['embodiment']} "

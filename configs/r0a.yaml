@@ -45,10 +45,19 @@ optim:
   spike_mult: 0.0
 
 losses:
+  # The hinge knobs live in base.yaml; dyn here only names what R0-A changes.
   dyn:      {enabled: true, weight: 1.0, negatives: within_trajectory}
-  act:      {enabled: true, weight: 1.0}
+  # align_to: q_a -- q_Delta regresses onto sg(q_a), not the reverse. The old
+  # direction let a 1.415-norm, 100%-common-mode align gradient
+  # (2*sqrt(act/align) = 2*sqrt(0.500), the disjoint-support floor) overrun
+  # decode's 0.179-norm, 94%-example-dependent one, and q_a went blind:
+  # frac_var_a 0.988 at fresh init -> 0.0015 trained. With the flip, c_a's only
+  # gradient is D_e's reconstruction of the action -- the one optimum in this
+  # objective that a batch-constant c cannot reach.
+  act:      {enabled: true, weight: 1.0, align_to: q_a}
   proposal: {enabled: true, weight: 1.0}
-  balance:  {enabled: true, weight: 3.0e-3}
+  # contracts.BALANCE_COEF, Switch form. See base.yaml.
+  balance:  {enabled: true, weight: 1.0e-2}
 
 train_modules: [estimator, bank, q_delta, q_action, decoder, proposal]
 

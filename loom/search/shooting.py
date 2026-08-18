@@ -36,7 +36,10 @@ Realizability gate
 A candidate that scores well in belief space is useless if this body cannot
 produce it.  Reject root `c` when
 
-    || q_a(D_e(z, c), z) - c ||_2  >  REALIZABILITY_TAU
+    || q_a(D_e(p, c), z) - c ||_2  >  REALIZABILITY_TAU
+
+`p` is the `(B, dof_e)` proprio at the planning instant: `D_e` takes
+`(proprio, c)` and not the belief (`loom/heads/decoder.py`).
 
 and **fall through to the runner-up** — a proper ranked walk down the sorted
 candidates, not a single retry, because the failure mode is correlated: if the
@@ -61,10 +64,17 @@ __all__ = ["shooting", "realizability_residual"]
 
 
 def realizability_residual(
-    z: Tensor, c: Tensor, q_action: QAction, decoder: Decoder
+    z: Tensor, c: Tensor, q_action: QAction, decoder: Decoder, proprio: Tensor
 ) -> Tensor:
-    """`|| q_a(D_e(z, c), z) - c ||_2` per batch element.  (B, K, D), (B, M) -> (B,)."""
-    a_seg = decoder(z, c)                        # (B, H_OP, dof_e)
+    """`|| q_a(D_e(p, c), z) - c ||_2` per batch element.  -> (B,).
+
+    `D_e` takes `(proprio, c)` and not the belief (see `loom/heads/decoder.py`),
+    so the gate needs the current `(B, dof_e)` proprio as well as the belief
+    `q_a` reads. `proprio` is required rather than defaulted: silently passing
+    `z` where a `(B, dof)` is expected is exactly the kind of substitution that
+    would make the gate reject everything and look like an unconverged model.
+    """
+    a_seg = decoder(proprio, c)                  # (B, H_OP, dof_e)
     c_hat = q_action(a_seg, z)                   # (B, M)
     return (c_hat.float() - c.float()).norm(dim=-1)
 
@@ -81,6 +91,7 @@ def shooting(
     depth: int = DEPTH,
     q_action: QAction | None = None,
     decoder: Decoder | None = None,
+    proprio: Tensor | None = None,
     tau: float = REALIZABILITY_TAU,
     max_gate_evals: int | None = None,
     generator: torch.Generator | None = None,
@@ -98,6 +109,8 @@ def shooting(
         q_action, decoder: the *current embodiment's* heads.  Pass both to arm
             the realizability gate; pass neither to disable it (R3 ablations,
             and any caller that has not got per-body heads wired yet).
+        proprio:   `(B, dof_e)` proprio at the planning instant.  REQUIRED when
+            the gate is armed: `D_e` takes `(proprio, c)`, not the belief.
         tau:       gate threshold, `contracts.REALIZABILITY_TAU`.
         max_gate_evals: cap on how far down the ranking to walk.  `None` walks
             the whole ranking; the loop exits early once every batch element is
@@ -115,7 +128,12 @@ def shooting(
     if (q_action is None) != (decoder is None):
         raise ValueError(
             "the realizability gate needs both q_action and decoder "
-            "(it evaluates ||q_a(D_e(z, c), z) - c||); pass both or neither"
+            "(it evaluates ||q_a(D_e(p, c), z) - c||); pass both or neither"
+        )
+    if q_action is not None and proprio is None:
+        raise ValueError(
+            "the realizability gate needs proprio (B, dof_e): D_e takes "
+            "(proprio, c), not the belief"
         )
 
     b = z.shape[0]
@@ -141,7 +159,7 @@ def shooting(
         budget = n if max_gate_evals is None else min(n, max_gate_evals)
         for r in range(budget):
             cand = c_seq[rows, order[:, r], 0]                            # (B,M)
-            ok = realizability_residual(z, cand, q_action, decoder) <= tau
+            ok = realizability_residual(z, cand, q_action, decoder, proprio) <= tau
             active = ~resolved
             n_rejected = n_rejected + (active & ~ok).long()
             accept = active & ok
