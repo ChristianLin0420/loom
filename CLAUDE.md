@@ -159,6 +159,30 @@ returns even with the flip on. Symptom: `bank/live_ops_q_a` collapsing toward TO
 `loss/proposal` pinned at the 19.361 uniform floor while `act/decode` falls healthily — the
 decoder is fine and `c` is dead.
 
+### pi_c detonates at a reproducible step, and no spike guard prevents it
+
+On the `align_to: q_a` configuration the run improves monotonically to ~step 25000 and then
+`loss/proposal` jumps from ~4.6 to the 19.361 uniform floor within a few hundred steps, while
+`bank/live_ops_q_a` stays healthy (66-68) and `act/decode` keeps falling. The coefficient space
+survives; only pi_c's prediction dies.
+
+Reproduced twice from the SAME step-25000 checkpoint with different guards:
+
+    run         spike_mult   first loss/proposal > 10   triggering gnorm   skipped?
+    r0a_flip        10              step 26146                1656            no
+    r0a_cont         4              step 26426                2253            no
+
+Tightening the guard 2.5x delayed it by 280 steps and did not prevent it, and the triggering
+gradients are ~1600-2250 -- unremarkable, and accepted by both. The 10^4-10^5 norms that follow
+are the SYMPTOM. The cause is a discrete top-4 support flip in `q_a`: `L_proposal`'s BC target
+is `sg(c_a)`, a hard top-4 SET, so when that set moves discretely the head's loss jumps to
+ln-uniform and its gradient (run median ~2, here 4000+) becomes the whole optimisation budget.
+`gnorm/proposal` is 99.99% of the global norm across the event.
+
+Practical consequence: on this configuration the useful signal saturates near step 25000 and the
+run then self-destructs. Score the best checkpoint by `loss/proposal`, not the last one, and do
+not spend links past the collapse hoping for recovery -- neither run recovered in 6000+ steps.
+
 ### Gradient clipping does not protect an AdamW run
 
 `clip_grad` bounds the norm, but **AdamW's update is invariant to a global rescale of the
