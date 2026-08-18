@@ -606,15 +606,24 @@ def _verify_policy(out: Path, embodiment: str, *, verbose: bool = True) -> dict[
     counts unexpected ones and moves on. Here both are surfaced, because an
     unexpected key means eval built a different module than training saved.
     """
-    from loom.eval.policy import make_policy, policy_provenance, submodule_state  # noqa: PLC0415
+    from loom.eval.policy import (                        # noqa: PLC0415
+        _run_model_kwargs, make_policy, policy_provenance, submodule_state,
+    )
     from loom.heads.decoder import Decoder                 # noqa: PLC0415
     from loom.heads.proposal import Proposal               # noqa: PLC0415
     from loom.model.estimator import Estimator             # noqa: PLC0415
 
     payload = torch.load(str(out), map_location="cpu", weights_only=False)
     state = payload["model"]
+    # The estimator's architecture flags are NOT in state_dict, so they must come
+    # from the run config -- exactly as `make_policy` does a few lines below.
+    # Building the default here instead reported `unexpected_keys: ["z_init"]` and
+    # failed a checkpoint whose structure and numeric checks both passed and which
+    # `make_policy` loaded in the same breath with 339 tensors and 0 unexpected.
+    # A verify that disagrees with the loader it is verifying is worse than none.
+    est_kw = _run_model_kwargs(out, "estimator")
     mods = {
-        "estimator": Estimator(embodiments=[embodiment]),
+        "estimator": Estimator(embodiments=[embodiment], **est_kw),
         "proposal": Proposal(),
         "decoder": Decoder(embodiments=[embodiment], default_embodiment=embodiment),
     }
