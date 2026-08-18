@@ -3,17 +3,9 @@
     L_balance = BALANCE_COEF * KL( mean_batch(c) || uniform(M) )
               = BALANCE_COEF * ( sum_m p_m log p_m + log M ),   p = mean_batch(c)
 
-**This is not the form R0-A executes any more.** The owner replaced it with the
-Switch auxiliary `M * sum_m f_m P_m`, which lives in
-`loom.train.loop._switch_balance` because it needs the heads' DENSE logits and
-this module only ever sees `c`. The KL below is unchanged, still tested, and is
-the reference the Switch form replaced; `contracts.BALANCE_COEF` is now 1e-2 for
-both. See `_switch_balance` for the measurement that motivated the swap.
-
-`contracts.BALANCE_COEF` was 3e-3 and is now 1e-2. Still small: hard top-k
-already provides all the sparsity this model needs, so this term exists ONLY to
-stop operators from dying. Turn it up far enough and it fights the task loss for
-control of the support.
+`contracts.BALANCE_COEF = 3e-3`. Deliberately tiny: hard top-k already provides
+all the sparsity this model needs, so this term exists ONLY to stop operators
+from dying. Turn it up and it fights the task loss for control of the support.
 
 
 KL DIRECTION — this is the part that is easy to get backwards

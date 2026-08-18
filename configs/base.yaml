@@ -58,22 +58,10 @@ optim:
 
 losses:
   # PLAN 9: never add a loss beyond these, plus potential + RL in R3.
-  #
-  # dyn is `loom/losses/dyn.py::dyn_loss`. `negatives: within_trajectory` draws
-  # a negative `c` from another segment of the SAME trajectory >= min_gap
-  # segments away and adds a hinge on `d_neg - d_pos`; neg_weight/neg_margin are
-  # dyn.py's own defaults, written out here because they are part of the
-  # objective and belong in the config hash rather than in a function signature.
-  dyn:       {enabled: true,  weight: 1.0, negatives: within_trajectory,
-              min_gap: 2, neg_weight: 1.0, neg_margin: 0.1, cosine: per_slot}
+  dyn:       {enabled: true,  weight: 1.0, negatives: within_trajectory}
   act:       {enabled: true,  weight: 1.0}
   proposal:  {enabled: true,  weight: 1.0}
-  # contracts.BALANCE_COEF. The term is the Switch auxiliary M * sum_m f_m P_m
-  # (loop._switch_balance), NOT the old KL of the batch mean: the KL's only path
-  # to an unselected operator is the straight-through Jacobian, which measured
-  # 0.0006 (ctrl) / 0.0001 (zinit) of a selected operator's per-entry gradient
-  # at q_Delta's logits. Degenerate floor is 1.0, ceiling M/TOPK = 32.
-  balance:   {enabled: true,  weight: 1.0e-2}
+  balance:   {enabled: true,  weight: 3.0e-3}   # contracts.BALANCE_COEF
   potential: {enabled: false, weight: 1.0}      # R3 only
   grpo:      {enabled: false, weight: 1.0, group: 8}   # R3 only
 

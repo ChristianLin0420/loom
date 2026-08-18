@@ -1,6 +1,6 @@
-"""LOOM — D_e: the body-specific realizer.  ONE PER EMBODIMENT, ~18 M each.
+"""LOOM — D_e: the body-specific realizer.  ONE PER EMBODIMENT, ~20 M each.
 
-`D_e(proprio (B,dof_e), c (B,M)) -> (B, H_OP, dof_e)`.
+`D_e(z (B,K,D), c (B,M)) -> (B, H_OP, dof_e)`.
 
 ONE OPERATOR = ONE 8-STEP SEGMENT. NEVER H_PLAN=32. The plan emits DEPTH
 operators; only the root one is ever decoded and executed, and it is decoded
@@ -8,32 +8,6 @@ into `H_OP` control steps. `contracts.assert_action_segment` is the guard.
 
 No pixel decoding, no VAE, no video DiT (PLAN 9). The only generative object in
 this repo is this 56-number action segment.
-
-
-THE BELIEF IS NOT AN INPUT  (owner-authorised contract change)
-─────────────────────────────────────────────────────────────
-This head used to take `(z (B,K,D), c (B,M))`. It does not any more, and the
-reason is the whole point of the architecture rather than a capacity tweak.
-
-Given the full 128x768 belief, predicting an 8x7 action segment is behaviour
-cloning — and behaviour cloning needs nothing whatsoever from `c`. Measured on
-R0-A: `act/decode` fell 0.2489 -> 0.0559 (4.5x) over 7000 steps while `c_a`
-held only 2-3 distinct top-4 supports across 64 real training windows. `L_act`
-was descending entirely through the belief path and exerting no pressure on the
-coefficient at all, which is exactly the failure `L_act` exists to prevent.
-
-With `z` gone, `c` is the ONLY channel carrying task information into the
-action. `proprio` is `ObsFeats["proprio"]`, `(B, dof_e)` — ONE timestep of the
-body's own state (for `libero_franka`: ee position, ee orientation as an
-axis-angle, one gripper coordinate). It tells the realizer where the arm *is*;
-it cannot tell it where the target is, so it cannot substitute for `c`.
-
-**Expect `L_act` to rise.** LIBERO is OSC end-effector delta control and the
-target position lives only in the image, so a proprio-only decoder genuinely
-loses information a belief-conditioned one had. `act/decode` plateauing well
-above 0.0559 *while* `c_a` diversifies is the bottleneck being tight, not the
-idea failing. Do not restore the belief and do not open a visual channel here
-on your own initiative.
 
 
 CONDITIONAL FLOW MATCHING — exact parameterisation
@@ -46,13 +20,13 @@ Rectified-flow / optimal-transport CFM with a Gaussian source:
     x_t = (1 - t) * x_0 + t * x_1       straight conditional path
     u_t = x_1 - x_0                     conditional target velocity (constant in t)
 
-    L_act = E_{t,x_0,(p,c)} || v_theta(x_t, t, p, c) - u_t ||^2      (mean over H_OP*dof)
+    L_act = E_{t,x_0,(z,c)} || v_theta(x_t, t, z, c) - u_t ||^2      (mean over H_OP*dof)
 
-`forward` integrates the probability-flow ODE `dx/dt = v_theta(x, t, p, c)` from
+`forward` integrates the probability-flow ODE `dx/dt = v_theta(x, t, z, c)` from
 `x(0) = x_0 ~ N(0,I)` to `x(1)` with `n_steps` *fixed* forward-Euler steps
 (default 10, constructor arg `n_steps`):
 
-    x <- x + (1/n) * v_theta(x, i/n, p, c),   i = 0 .. n-1
+    x <- x + (1/n) * v_theta(x, i/n, z, c),   i = 0 .. n-1
 
 Euler and not Heun/midpoint: with a straight conditional path the learned field
 is close to constant along a trajectory, the error is O(1/n) on a 56-dim state,
@@ -74,11 +48,7 @@ ACTION RANGE
 * Inputs (`a_seg` in `loss`) are ASSUMED PRE-NORMALISED by the data pipeline
   into that range. We do NOT clamp or rescale the target: clamping the data
   side of a flow-matching pair biases the velocity target and quietly teaches
-  the field to push out of the box near the boundary. `q_action.py` records the
-  seam where a per-dof rescale would have to go (`loss` divides, `forward`
-  multiplies back BEFORE the clamp) and why it is deliberately not taken here —
-  dropping `z` does not change that, and nothing in this file normalises
-  `a_seg`, so `loom/eval/policy.py` still never sees normalised units.
+  the field to push out of the box near the boundary.
 * Outputs of `forward` ARE clamped to `[low, high]` by default (`clamp=True`).
   The ODE integrates a Gaussian source, so a few percent of samples land
   outside the box; the environment would clip them anyway, and clipping in a
@@ -93,10 +63,8 @@ import math
 import torch
 from torch import Tensor, nn
 
-# `D` / `K` survive only as the defaults of the two accepted-and-ignored belief
-# kwargs (`d_belief`, `n_slots`). There is no belief pooling in this head any
-# more, so `q_delta.AttnPool` is no longer imported.
 from contracts import D, EMBODIMENTS, H_OP, K, M
+from loom.heads.q_delta import AttnPool
 
 __all__ = ["DecoderBody", "Decoder"]
 
@@ -160,14 +128,7 @@ class DiTBlock(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class DecoderBody(nn.Module):
-    """CFM velocity field + Euler sampler for one body. ~18 M.
-
-    `n_queries` / `pool_heads` / `d_belief` / `n_slots` / `d_kv` are accepted
-    and ignored. They described the belief pooling that this head no longer
-    has; they stay in the signature so a `model.decoder:` block in an existing
-    config still constructs, rather than dying with an opaque TypeError inside
-    `loop._try_build`'s fallback path.
-    """
+    """CFM velocity field + Euler sampler for one body. ~20 M."""
 
     def __init__(
         self,
@@ -196,14 +157,10 @@ class DecoderBody(nn.Module):
         self.register_buffer("action_low", torch.tensor(spec.action_low), persistent=False)
         self.register_buffer("action_high", torch.tensor(spec.action_high), persistent=False)
 
-        # ── conditioning: proprio, coefficient, time ─────────────────────
-        # No belief pooling. See the module docstring: with `z` in here the
-        # decoder is a behaviour-cloning head and `c` is decorative.
-        # A plain Linear, no LayerNorm: the 7 dofs of `proprio` are
-        # heterogeneous (metres, radians, a gripper coordinate) and normalising
-        # ACROSS them would subtract a mean with no physical meaning and throw
-        # away the absolute ee position, which is the one thing this input has.
-        self.p_proj = nn.Linear(self.dof, d)
+        # ── conditioning: belief, coefficient, time ──────────────────────
+        self.pool = AttnPool(d=d_belief, n_queries=n_queries, n_heads=pool_heads,
+                             d_out=d, n_slots=n_slots, d_kv=d_kv)
+        self.z_proj = nn.Linear(n_queries * d, d)
         self.c_proj = nn.Linear(n_ops, d)
         self.t_mlp = nn.Sequential(nn.Linear(d, d), nn.SiLU(), nn.Linear(d, d))
         self.cond_mlp = nn.Sequential(nn.LayerNorm(d), nn.SiLU(), nn.Linear(d, d))
@@ -214,7 +171,6 @@ class DecoderBody(nn.Module):
         # tokens, which is permutation-equivariant, so a zero step embedding
         # would leave "control step 3" and "control step 5" indistinguishable
         # except by their noise content.
-        # NOT weight-decayed: `schedule.build_optimizer` excludes it by name.
         self.step_emb = nn.Parameter(torch.randn(h_op, d) * 0.02)
         self.blocks = nn.ModuleList(DiTBlock(d, n_heads, mlp_ratio) for _ in range(n_blocks))
         self.norm_out = nn.LayerNorm(d, elementwise_affine=False)
@@ -232,24 +188,13 @@ class DecoderBody(nn.Module):
 
     # ── conditioning / field ─────────────────────────────────────────────
 
-    def condition(self, proprio: Tensor, c: Tensor) -> Tensor:
-        """(B,dof), (B,M) -> (B,d). Time-independent part; hoisted out of the
-        Euler loop so it is built once per segment, not once per Euler step.
-
-        `proprio` must be ONE timestep — `ObsFeats["proprio"]`, `(B, dof_e)`.
-        A `(B, H_OP, dof)` argument is an action segment that has been handed
-        in by mistake, and it would broadcast into a `(B, H_OP, d)` condition
-        that `_modulate`'s `unsqueeze(1)` then silently mis-shapes.
-        """
-        if proprio.ndim != 2 or proprio.shape[-1] != self.dof:
-            raise ValueError(
-                f"{self.embodiment}: proprio must be (B, {self.dof}) — one "
-                f"timestep of ObsFeats['proprio'] — got {tuple(proprio.shape)}"
-            )
-        return self.p_proj(proprio) + self.c_proj(c.to(proprio.dtype))
+    def condition(self, z: Tensor, c: Tensor) -> Tensor:
+        """(B,K,D), (B,M) -> (B,d). Time-independent part; hoisted out of the
+        Euler loop so the belief is pooled once per segment, not once per step."""
+        return self.z_proj(self.pool(z)) + self.c_proj(c.to(z.dtype))
 
     def velocity(self, x: Tensor, t: Tensor, cond: Tensor) -> Tensor:
-        """v_theta(x_t, t, proprio, c). x (B,H_OP,dof), t (B,), cond (B,d)."""
+        """v_theta(x_t, t, z, c). x (B,H_OP,dof), t (B,), cond (B,d)."""
         cond = self.cond_mlp(cond + self.t_mlp(timestep_embedding(t, self.d)))
         h = self.x_in(x) + self.step_emb.to(x.dtype)
         for blk in self.blocks:
@@ -261,7 +206,7 @@ class DecoderBody(nn.Module):
 
     def forward(
         self,
-        proprio: Tensor,
+        z: Tensor,
         c: Tensor,
         n_steps: int | None = None,
         clamp: bool | None = None,
@@ -270,8 +215,8 @@ class DecoderBody(nn.Module):
     ) -> Tensor:
         """Integrate the flow from noise. -> (B, H_OP, dof_e). Never H_PLAN."""
         n = int(n_steps or self.n_steps)
-        cond = self.condition(proprio, c)
-        x = self._noise(proprio.shape[0], proprio, noise, generator)
+        cond = self.condition(z, c)
+        x = self._noise(z.shape[0], z, noise, generator)
         dt = 1.0 / n
         for i in range(n):
             t = torch.full((x.shape[0],), i * dt, device=x.device, dtype=x.dtype)
@@ -282,7 +227,7 @@ class DecoderBody(nn.Module):
 
     def loss(
         self,
-        proprio: Tensor,
+        z: Tensor,
         c: Tensor,
         a_seg: Tensor,
         t: Tensor | None = None,
@@ -291,7 +236,7 @@ class DecoderBody(nn.Module):
         reduction: str = "mean",
     ) -> Tensor:
         """Conditional flow-matching regression. See the module docstring."""
-        a_seg = a_seg.to(proprio.dtype)
+        a_seg = a_seg.to(z.dtype)
         if a_seg.shape[-2:] != (self.h_op, self.dof):
             raise ValueError(
                 f"{self.embodiment}: action segment must be (..., {self.h_op}, "
@@ -306,7 +251,7 @@ class DecoderBody(nn.Module):
         tt = t.view(b, 1, 1)
         x_t = (1 - tt) * x0 + tt * a_seg
         target = a_seg - x0                        # constant-in-t conditional velocity
-        v = self.velocity(x_t, t, self.condition(proprio, c))
+        v = self.velocity(x_t, t, self.condition(z, c))
         per_sample = (v - target).pow(2).flatten(1).mean(-1)
         if reduction == "none":
             return per_sample
@@ -369,10 +314,9 @@ class Decoder(nn.Module):
             raise KeyError(f"decoder has no body {name!r}; have {sorted(self.bodies)}")
         return self.bodies[name]
 
-    def forward(self, proprio: Tensor, c: Tensor, embodiment: str | None = None,
-                **kw) -> Tensor:
-        return self.body(embodiment)(proprio, c, **kw)
+    def forward(self, z: Tensor, c: Tensor, embodiment: str | None = None, **kw) -> Tensor:
+        return self.body(embodiment)(z, c, **kw)
 
-    def loss(self, proprio: Tensor, c: Tensor, a_seg: Tensor,
+    def loss(self, z: Tensor, c: Tensor, a_seg: Tensor,
              embodiment: str | None = None, **kw) -> Tensor:
-        return self.body(embodiment).loss(proprio, c, a_seg, **kw)
+        return self.body(embodiment).loss(z, c, a_seg, **kw)

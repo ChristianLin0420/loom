@@ -7,17 +7,6 @@ Every constant, shape validator and Protocol that more than one team touches
 lives here. A genuine contract change halts Phase 1, is made once, and all six
 teams rebase (PLAN.md 6.4).
 
-TWO OWNER-AUTHORISED CHANGES have been made since the freeze, both for the
-R0-A rerun, and they are the only ones:
-
-  1. `Decoder` now takes `(proprio, c)`, not `(z, c)`. The belief is gone from
-     the realizer; `c` is the only channel carrying task information into the
-     action.
-  2. `BALANCE_COEF` 3e-3 -> 1e-2, and the executed form changed from
-     KL-of-batch-mean to the Switch auxiliary `M * sum_m f_m P_m`.
-
-Each is documented at its definition. Nothing else in this file moved.
-
 Nothing in this file imports anything from `loom` or `stubs`. It is the root of
 the dependency graph.
 """
@@ -85,22 +74,8 @@ EMA_TAU = 0.996         # target-estimator EMA
 #: per-horizon weights in L_dyn; one entry per rollout step
 DYN_WEIGHTS = (1.0, 0.5, 0.25, 0.125)
 
-#: coefficient on the Switch load-balancing term  M * sum_m f_m P_m
-#:
-#: CHANGED 3e-3 -> 1e-2 by the project owner (the second of two authorised
-#: edits to this frozen file; the other is `Decoder` below).
-#:
-#: The form changed with it. It used to be KL(mean_batch(c) || uniform(M)),
-#: which only sees the batch mean; the executed term is now the Switch
-#: auxiliary loss, `M * sum_m f_m P_m`, with `f_m` the fraction of tokens whose
-#: hard top-4 support contains m and `P_m` the mean router probability for m.
-#: This is the ONLY recruitment force whose gradient reaches an *unselected*
-#: operator without passing through the top-4 mask: measured on the R0-A
-#: checkpoints, a non-selected operator receives 0.0006 (ctrl) / 0.0001 (zinit)
-#: of a selected one's per-entry gradient at q_Delta's logits. `topk_simplex_st`
-#: returns `hard + soft - soft.detach()`, so the straight-through backward is
-#: already dense -- the deficit is magnitude, not a closed path.
-BALANCE_COEF = 1e-2
+#: coefficient on KL(mean_batch(c) || uniform(M)); prevents dead operators only
+BALANCE_COEF = 3e-3
 
 #: search-time realizability gate: reject root c when ||q_a(D_e(z,c), z) - c|| > tau
 REALIZABILITY_TAU = 0.5
@@ -251,27 +226,8 @@ class QAction(Protocol):                                  # ONE PER EMBODIMENT
 
 @runtime_checkable
 class Decoder(Protocol):                                  # ONE PER EMBODIMENT
-    """`D_e(proprio_t, c) -> (B, H_OP, dof_e)`.  The belief is NOT an input.
-
-    CHANGED by the project owner (the first of two authorised edits to this
-    frozen file; the other is `BALANCE_COEF` above). The decoder used to take
-    the whole `(B, K, D)` belief alongside `c`.
-
-    Why it does not any more: predicting an 8-step action segment from a
-    128x768 belief is behaviour cloning, and behaviour cloning needs nothing
-    from `c`. Measured on R0-A, `act/decode` fell 0.2489 -> 0.0559 while `c_a`
-    held 2-3 distinct top-4 supports over 64 real training windows -- `L_act`
-    was exerting no pressure on the coefficient at all. With `z` removed, `c`
-    is the ONLY channel carrying task information into the action, which is
-    what makes `L_act` a training signal for the operator.
-
-    `proprio` is `ObsFeats["proprio"]`, `(B, dof_e)` -- ONE timestep, the body's
-    own state. It is what tells the realizer where the arm currently is; it
-    carries no task information, which is the point.
-    """
-
-    def forward(self, proprio: Tensor, c: Tensor) -> Tensor: ...    # -> (B,H_OP,dof_e)
-    def loss(self, proprio: Tensor, c: Tensor, a_seg: Tensor) -> Tensor: ...
+    def forward(self, z: Tensor, c: Tensor) -> Tensor: ...      # -> (B,H_OP,dof_e)
+    def loss(self, z: Tensor, c: Tensor, a_seg: Tensor) -> Tensor: ...
 
 
 @runtime_checkable

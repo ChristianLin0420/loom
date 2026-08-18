@@ -34,14 +34,7 @@ source .venv/bin/activate
 # WANDB_API_KEY / WANDB_PROJECT / HF_TOKEN. Gitignored; never echoed.
 [ -f .env.local ] && source .env.local
 
-# `LOOM_CONFIG` lets one arm of a paired run pick a config that `extends:
-# r0a.yaml`. It exists because architecture flags cannot travel through
-# `LOOM_EXTRA_ARGS`: that variable is interpolated into the `srun bash -c`
-# script and word-split by the inner shell, so `--set
-# model.estimator={"learned_z_init":true}` arrives with its quotes stripped,
-# fails `json.loads`, and is silently stored as a STRING. The arm would then
-# train the default estimator and nothing in the log would say so.
-CONFIG="${LOOM_CONFIG:-configs/r0a.yaml}"
+CONFIG="configs/r0a.yaml"
 RUN_NAME="${LOOM_RUN_NAME:-r0a}"
 RUN_DIR="runs/${RUN_NAME}"
 mkdir -p "$RUN_DIR" logs

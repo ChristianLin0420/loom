@@ -45,12 +45,10 @@ optim:
   spike_mult: 0.0
 
 losses:
-  # The hinge knobs live in base.yaml; dyn here only names what R0-A changes.
   dyn:      {enabled: true, weight: 1.0, negatives: within_trajectory}
   act:      {enabled: true, weight: 1.0}
   proposal: {enabled: true, weight: 1.0}
-  # contracts.BALANCE_COEF, Switch form. See base.yaml.
-  balance:  {enabled: true, weight: 1.0e-2}
+  balance:  {enabled: true, weight: 3.0e-3}
 
 train_modules: [estimator, bank, q_delta, q_action, decoder, proposal]
 
