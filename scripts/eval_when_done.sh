@@ -41,7 +41,14 @@ for s in sorted(have):
         v = [r[k] for r in w if k in r and r[k] is not None]
         return st.median(v) if v else float("inf")
     a, p = med("act/align"), med("loss/proposal")
-    if best is None or (a, p) < (best[1], best[2]): best = (s, a, p)
+    # loss/proposal FIRST, act/align only as a tie-break. Under
+    # `losses.act.align_to: q_a` the align term measures q_Delta tracking q_a
+    # rather than the reverse, and it sits at ~0.54 whether the run is healthy
+    # or collapsed -- it does not discriminate. loss/proposal does, sharply:
+    # r0a_flip read 4.64 at step 25000 (scored 26.6 avg on 1200 episodes) and
+    # 19.35 after the step-26500 collapse, against a 19.361 uniform floor.
+    # Ranking on align would have picked a dead checkpoint.
+    if best is None or (p, a) < (best[2], best[1]): best = (s, a, p)
 print(json.dumps({"step": best[0], "align": best[1], "prop": best[2]} if best else {}))
 PYEOF
 )
