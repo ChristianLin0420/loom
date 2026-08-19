@@ -626,6 +626,7 @@ def _verify_policy(out: Path, embodiment: str, *, verbose: bool = True) -> dict[
     counts unexpected ones and moves on. Here both are surfaced, because an
     unexpected key means eval built a different module than training saved.
     """
+    import contracts as C                                 # noqa: PLC0415
     from loom.eval.policy import (                        # noqa: PLC0415
         _run_model_kwargs, make_policy, policy_provenance, submodule_state,
     )
@@ -663,11 +664,24 @@ def _verify_policy(out: Path, embodiment: str, *, verbose: bool = True) -> dict[
         inc = mod.load_state_dict(sd, strict=False)
         missing = list(inc.missing_keys)
         unexpected = list(inc.unexpected_keys)
-        loaded = [v for k, v in sd.items() if k not in set(unexpected)]
+        # Per-embodiment ModuleDicts (Estimator.proprio_proj, Decoder.bodies,
+        # QAction.bodies) mean a checkpoint that saw several bodies carries a
+        # branch for each. Evaluating ONE body legitimately leaves the others
+        # unexpected: r0b_final@9500 reported
+        # proprio_proj.libero_franka.{weight,bias} while structure and numeric
+        # both passed and missing_keys was empty. Those are keys for a body that
+        # is not under evaluation, not evidence that eval built the wrong module.
+        # Anything else still fails -- missing_keys especially, since a
+        # partly-loaded module is a partly-random module.
+        other = [e for e in C.EMBODIMENTS if e != embodiment]
+        foreign = [k for k in unexpected if any(f".{e}." in f".{k}." for e in other)]
+        unexpected = [k for k in unexpected if k not in set(foreign)]
+        loaded = [v for k, v in sd.items() if k not in set(unexpected) | set(foreign)]
         detail[name] = {
             "tensors_in_ckpt": len(sd),
             "missing_keys": missing,
             "unexpected_keys": unexpected,
+            "foreign_embodiment_keys": foreign,
             "params_loaded": int(sum(v.numel() for v in loaded)),
             "mean_abs": float(torch.stack([v.float().abs().mean()
                                            for v in loaded]).mean()),
