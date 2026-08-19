@@ -496,8 +496,21 @@ def _model_reference(config_path: str | Path) -> dict[str, torch.Size]:
     return {k: v.shape for k, v in model.state_dict().items()}
 
 
+def _embodiment_of(cfg: dict) -> str:
+    """The body this run actually trained, from its own config.
+
+    Defaulting to "libero_franka" made the policy check build LIBERO modules
+    against a RoboTwin checkpoint: nothing matched, `loaded` came back empty and
+    `torch.stack([])` raised `stack expects a non-empty TensorList` -- an error
+    that reads like corruption and is really a wrong default. Batches are
+    embodiment-homogeneous by contract, so data.embodiments[0] is the answer.
+    """
+    e = (cfg.get("data", {}) or {}).get("embodiments") or []
+    return str(e[0]) if e else "libero_franka"
+
+
 def verify(out: str | Path, run_dir: str | Path, *, step: int | None = None,
-           config_path: str | Path | None = None, embodiment: str = "libero_franka",
+           config_path: str | Path | None = None, embodiment: str | None = None,
            check_policy: bool = True, verbose: bool = True) -> dict[str, Any]:
     """Prove the consolidated file structurally, numerically, and through eval.
 
@@ -513,7 +526,14 @@ def verify(out: str | Path, run_dir: str | Path, *, step: int | None = None,
        ``IncompatibleKeys`` inspected rather than trusted.
     """
     out, run_dir = Path(out), Path(run_dir)
-    res: dict[str, Any] = {"out": str(out), "checks": {}}
+    if embodiment is None:
+        cfg_p = Path(config_path) if config_path else run_dir / "config.json"
+        try:
+            with open(cfg_p) as f:
+                embodiment = _embodiment_of(json.load(f))
+        except OSError:
+            embodiment = "libero_franka"
+    res: dict[str, Any] = {"out": str(out), "checks": {}, "embodiment": embodiment}
     payload = torch.load(str(out), map_location="cpu", weights_only=False)
     model = payload["model"]
     step = int(payload.get("global_step", step or -1))
@@ -684,7 +704,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="default: newest step with a complete shard set")
     p.add_argument("--out", default=None,
                    help="default: <run_dir>_eval/ckpt_<step>.pt")
-    p.add_argument("--embodiment", default="libero_franka")
+    p.add_argument("--embodiment", default=None,
+                   help="default: data.embodiments[0] from the run config")
     p.add_argument("--config", default=None, help="default: <run_dir>/config.json")
     p.add_argument("--no_verify", action="store_true")
     p.add_argument("--no_policy_check", action="store_true",
