@@ -2,7 +2,12 @@
 # Wait for a run to finish, pick its BEST checkpoint by training metrics,
 # consolidate it, and submit the full 1200-episode LIBERO eval. No human step.
 #
-#   bash scripts/eval_when_done.sh <run_name> [poll_s]
+#   bash scripts/eval_when_done.sh <run_name> [poll_s] [eval_script]
+#
+# eval_script defaults to logs/eval_final.sh (LIBERO, 1200 episodes). Pass
+# logs/eval_r0b.sh for RoboTwin -- it runs RoboTwin's own protocol with the
+# expert check ON, without which the language instruction silently degrades to
+# the bare task name and scores a different specification than was trained.
 #
 # "Best" is NOT the last checkpoint. Runs here oscillate: r0a_final held
 # align 0.073/prop 7.2 for 1400 steps and then sat on both floors, and the
@@ -15,6 +20,8 @@
 set -uo pipefail
 RUN="${1:?usage: eval_when_done.sh <run_name> [poll_s]}"
 POLL="${2:-300}"
+EVAL_SH="${3:-logs/eval_final.sh}"
+[ -e "$EVAL_SH" ] || { echo "no eval script at $EVAL_SH"; exit 2; }
 PY=.venv/bin/python
 
 while squeue -u "$USER" -h -n "loom_${RUN}" -o "%T" 2>/dev/null | grep -qE 'RUNNING|PENDING'; do
@@ -62,4 +69,5 @@ CKPT="$PWD/runs/${RUN}_pinned_eval/ckpt_$(printf '%09d' "$STEP").pt"
 [ -e "$CKPT" ] || { echo "consolidation produced no file at $CKPT"; exit 1; }
 
 echo "$(date -Is) submitting 1200-episode eval on $CKPT"
-sbatch --job-name="eval_${RUN}" --export=ALL,CKPT="$CKPT" logs/eval_final.sh
+sbatch --job-name="eval_${RUN}" \
+  --export=ALL,CKPT="$CKPT",OUTDIR="$PWD/runs/eval_${RUN}" "$EVAL_SH"
