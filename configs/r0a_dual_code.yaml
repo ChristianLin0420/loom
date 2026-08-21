@@ -1,0 +1,28 @@
+# R0-A dual-code action training, from fresh LOOM weights.
+#
+# This is one prospective method change to the repaired supervised R0-A recipe:
+# train D_e on both the action-conditioned semantic code and the exact sparse
+# coefficient used by direct R0 inference. The paired CFM branches share their
+# source noise/time and are averaged 1/2 + 1/2; q_Delta's single alignment edge
+# still targets stop-gradient q_action. SigLIP remains the frozen cached tower.
+#
+# This file does not authorize checkpoint reuse. A real run must use a new run
+# directory with no LATEST pointer; the ordinary loop otherwise resumes state.
+
+extends: r0a.yaml
+
+run:
+  name: r0a_dual_code
+
+model:
+  # Fresh means real randomly initialized LOOM modules, never stub fallback.
+  use_stubs: false
+
+losses:
+  act:
+    enabled: true
+    weight: 1.0
+    align_to: q_a
+    decode_from: dual_q_action_proposal
+
+train_modules: [estimator, bank, q_delta, q_action, decoder, proposal]

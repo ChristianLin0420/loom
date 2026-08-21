@@ -1,0 +1,58 @@
+# R0-A deployed-coefficient refinement, starting from the verified best-scoring 27k
+# sparse-CE proposal checkpoint.
+#
+# The only method change is where the existing L_act is conditioned: D_e learns
+# from the same sparse pi_c coefficient used at evaluation instead of seeing
+# only q_a's teacher coefficient. Inputs and losses are unchanged. The decoder
+# remains D_e(proprio, c), so all task information still passes through c.
+
+extends: r0a_refine.yaml
+
+run:
+  name: r0a_deploy
+  steps: 50000
+  ckpt_every: 500
+
+data:
+  sampling: uniform_window
+
+optim:
+  lr_scales:
+    estimator: 0.0
+    bank: 0.0
+    q_delta: 0.0
+    q_action: 0.0
+    ema: 0.0
+    proposal: 0.05
+    decoder: 0.3
+
+losses:
+  dyn:       {enabled: false, weight: 0.0, negatives: within_trajectory,
+              min_gap: 2, neg_weight: 1.0, neg_margin: 0.1, cosine: per_slot}
+  act:
+    enabled: true
+    weight: 1.0
+    align_to: q_a
+    decode_from: proposal
+  proposal:
+    enabled: true
+    weight: 1.0
+    mode: sparse_ce
+    temperature: 1.0
+    detach_belief: true
+  balance:   {enabled: false, weight: 0.0}
+
+train_modules: [decoder, proposal]
+
+# Only decoder/proposal can move in this stage. act/align and delta_sel belong
+# to frozen teachers, so neither is evidence for or against deploy convergence.
+# Deployment mismatch and support overlap remain visible as watch metrics; the
+# stopping decision is restricted to the two terms this stage optimizes.
+convergence:
+  start_step: 27000
+  block: 2000
+  blocks: 4
+  tol: 0.02
+  primary: [act/decode, loss/proposal]
+  watch: [act/deploy_c_l2, act/deploy_topk_overlap, grad_norm]
+  floor_checks: [loss/proposal]

@@ -20,13 +20,14 @@ process group this module exists to do without.
 
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
 import torch
 
 from loom.train.consolidate import (
-    consolidate_state_dict, is_sharded, shard_paths,
+    _config_hash, consolidate, consolidate_state_dict, is_sharded, shard_paths,
 )
 
 
@@ -83,7 +84,8 @@ def _chunk(tensor: torch.Tensor, world: int):
     return chunks, metas
 
 
-def _write_fake_run(tmp_path, world: int, step: int = 7, drop=None):
+def _write_fake_run(tmp_path, world: int, step: int = 7, drop=None,
+                    config_hash: str = ""):
     """A `world`-rank checkpoint whose ground truth we know. Returns it."""
     torch.manual_seed(0)
     truth = {
@@ -106,7 +108,8 @@ def _write_fake_run(tmp_path, world: int, step: int = 7, drop=None):
                 local = [_Shard(chunks[r].clone(), metas[r])]
             model[k] = ShardedTensor(local, _Meta(truth[k].shape, metas,
                                                   truth[k].dtype))
-        torch.save({"model": model, "world_size": world, "global_step": step},
+        torch.save({"model": model, "world_size": world, "global_step": step,
+                    "config_hash": config_hash},
                    tmp_path / f"ckpt_{step:09d}_rank{r}.pt")
     return truth
 
@@ -162,3 +165,32 @@ def test_chunk_tiling_matches_torch(tmp_path):
         assert sum(c.shape[0] for c in chunks) == rows
         for r, m in enumerate(metas):
             assert m.shard_offsets[0] == math.ceil(rows / world) * r
+
+
+def test_consolidation_embeds_only_hash_authenticated_resolved_config(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    cfg = {
+        "model": {"estimator": {"z_prev_residual": False}, "decoder": {}},
+        "data": {"embodiments": ["libero_franka"]},
+        "link": {"run_dir": str(run), "stop_at": 7},
+    }
+    (run / "config.json").write_text(json.dumps(cfg))
+    _write_fake_run(run, world=2, config_hash=_config_hash(cfg))
+    out = tmp_path / "eval" / "ckpt.pt"
+
+    consolidate(run, out, step=7, verbose=False)
+    payload = torch.load(out, map_location="cpu", weights_only=False)
+    assert payload["resolved_config"] == {k: v for k, v in cfg.items() if k != "link"}
+    assert payload["config_hash"] == _config_hash(payload["resolved_config"])
+
+
+def test_consolidation_refuses_a_config_from_a_different_run(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    cfg = {"model": {"estimator": {"z_prev_residual": False}}}
+    (run / "config.json").write_text(json.dumps(cfg))
+    _write_fake_run(run, world=2, config_hash="not-the-config-on-disk")
+
+    with pytest.raises(RuntimeError, match="different run"):
+        consolidate(run, tmp_path / "eval" / "ckpt.pt", step=7, verbose=False)

@@ -1,0 +1,35 @@
+# R0-A proposal refinement, starting from the validated 25k R0-A checkpoint.
+#
+# Seed a fresh run directory with the complete 16 rank shards and a LATEST
+# pointer of 25000, then run to 27000 with the normal r0a sbatch.  The schedule
+# horizon remains 32k; --stop_at is link-local and does not alter cosine decay.
+# Only pi_c updates.  q_a, the decoder, dynamics, and both estimators remain the
+# fixed teacher/action system whose 25k end-to-end SR was already validated.
+
+extends: r0a.yaml
+
+run:
+  name: r0a_refine
+
+data:
+  # The matched gate favored the original window distribution for this short
+  # head-only refinement (39.0% at 27k vs 38.25% task-balanced at 26k).
+  sampling: uniform_window
+
+optim:
+  lr_scales:
+    estimator: 0.0
+    bank: 0.0
+    q_delta: 0.0
+    q_action: 0.0
+    decoder: 0.0
+    ema: 0.0
+    proposal: 0.3
+
+losses:
+  proposal:
+    enabled: true
+    weight: 1.0
+    mode: sparse_ce
+    temperature: 1.0
+    detach_belief: true

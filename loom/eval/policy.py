@@ -63,6 +63,9 @@ with `map_location="cpu"`.
 
 from __future__ import annotations
 
+import hashlib
+import inspect
+import json
 import math
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -84,7 +87,7 @@ from contracts import (
 # is its inverse, from the same file, dispatching on the same registered
 # per-dimension semantics. Do not reimplement it here — two implementations of
 # one transform is exactly how train and eval come to disagree.
-from loom.data.canonical import to_env_rate
+from loom.data.canonical import HOLD, action_semantics, to_env_rate
 
 # The frozen SigLIP tower (Team I). Also `loom.data`, also numpy/torch-only at
 # module scope — it imports `transformers` lazily, inside the loader — so this
@@ -116,7 +119,12 @@ __all__ = [
     "submodule_state",
     "policy_provenance",
     "PLACEHOLDER_FEATURES",
+    "GRIPPER_DWELL_OFF",
 ]
+
+# Require this many consecutive segment-level polarity proposals before a HOLD
+# channel reverses. One is exactly the original, ungated inference path.
+GRIPPER_DWELL_OFF = 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -323,6 +331,10 @@ class PolicyModules:
     device: str = "cpu"
     is_stub: bool = False
     meta: dict[str, Any] = field(default_factory=dict)
+    # Loaded only for opt-in operator-oracle / search paths.  R0 does not touch
+    # this head, so keeping it optional avoids another ~30 M parameters in every
+    # ordinary evaluation worker.
+    q_action: Any = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -346,6 +358,9 @@ class LoomPolicy:
         clip_actions: bool = True,
         env_fps: float | None = None,
         op_stats: bool = False,
+        gripper_dwell: int = GRIPPER_DWELL_OFF,
+        decoder_samples: int = 1,
+        duration_normalize_segments: bool = False,
     ) -> None:
         self.modules = modules
         self.embodiment = modules.embodiment
@@ -359,10 +374,32 @@ class LoomPolicy:
         self.op_stats = bool(op_stats)
         self._low = np.asarray(self.spec.action_low, dtype=np.float32)
         self._high = np.asarray(self.spec.action_high, dtype=np.float32)
-        # ONE env rate, feeding both how many steps a segment becomes and what
-        # they contain. Two sources of truth here would desynchronise silently.
+        # ONE env rate owns how many steps a segment becomes and the legacy
+        # fixed-rate content mapping. The opt-in duration-normalized arm below
+        # still takes its bin count exclusively from this clock.
         self.env_fps = float(self.spec.env_fps if env_fps is None else env_fps)
         self.clock = SegmentClock(self.env_fps)
+        # Opt-in A/B arm. False takes the exact legacy call path in ``act``;
+        # true fills every fractional-clock chunk from the complete 8-step
+        # decoded segment instead of dropping its tail on a 5-step chunk.
+        self.duration_normalize_segments = bool(duration_normalize_segments)
+        self.decoder_samples = int(decoder_samples)
+        if self.decoder_samples < 1:
+            raise ValueError(f"decoder_samples must be >= 1, got {decoder_samples}")
+        self.gripper_dwell = int(gripper_dwell)
+        if self.gripper_dwell < 1:
+            raise ValueError(
+                f"gripper_dwell must be >= 1 ({GRIPPER_DWELL_OFF} = off), "
+                f"got {gripper_dwell}"
+            )
+        kinds = action_semantics(self.embodiment)
+        self._hold_dims = tuple(d for d, kind in enumerate(kinds) if kind == HOLD)
+        self._hold_mid = np.asarray(
+            [(self._low[d] + self._high[d]) / 2.0 for d in self._hold_dims],
+            dtype=np.float32,
+        )
+        self._policy_seed: int | None = None
+        self._decoder_accepts_generator = _accepts_keyword(modules.decoder, "generator")
         self.reset()
 
     # ── contracts.Policy ──────────────────────────────────────────────────
@@ -373,14 +410,46 @@ class LoomPolicy:
         self.clock.reset()
         self.last_coeff: Tensor | None = None
         self._op_log: list[dict[str, Any]] = []
+        n_hold = len(self._hold_dims)
+        self._latch: np.ndarray | None = None
+        self._prev_prop = np.zeros(n_hold, dtype=np.float32)
+        self._dwell = np.zeros(n_hold, dtype=np.int64)
+        self._n_prop_flip = 0
+        self._n_exec_flip = 0
+        self._n_suppressed = 0
+        self._decoder_generator: torch.Generator | None = None
+        if self._policy_seed is not None:
+            self._decoder_generator = torch.Generator(device=self.device)
+            self._decoder_generator.manual_seed(self._policy_seed)
+
+    def set_policy_seed(self, seed: int) -> None:
+        """Select and reset this episode's private decoder-noise stream.
+
+        The runner calls this before the benchmark calls ``reset()``.  Keeping
+        the RNG on the policy avoids perturbing torch's process-global stream,
+        and recreating it in ``reset`` makes an episode reproducible regardless
+        of worker assignment or prior episodes in that worker.
+        """
+        self._policy_seed = int(seed)
+        self._decoder_generator = torch.Generator(device=self.device)
+        self._decoder_generator.manual_seed(self._policy_seed)
 
     def act(self, obs: dict, instruction: str) -> np.ndarray:
         if not self._queue:
             n_env = self.clock.next_segment_len()           # how many steps
             seg = self._plan(obs, instruction)              # (H_OP, dof) @ 30 Hz
-            resampled = to_env_rate(                        # what is in them
-                seg, self.embodiment, n_env, src_fps=self.env_fps,
-            )                                               # (n_env, dof) @ env_fps
+            seg = self._gate_gripper(seg)                   # no-op when k=1
+            if self.duration_normalize_segments:
+                resampled = to_env_rate(                    # what is in them
+                    seg, self.embodiment, n_env, src_fps=self.env_fps,
+                    duration_normalized=True,
+                )
+            else:
+                # Keep the default path byte-for-byte compatible with the
+                # pre-A/B policy, including the historical call signature.
+                resampled = to_env_rate(
+                    seg, self.embodiment, n_env, src_fps=self.env_fps,
+                )
             self._queue = [row for row in resampled]
         a = self._queue.pop(0)
         if self.clip_actions:
@@ -392,6 +461,52 @@ class LoomPolicy:
     @property
     def replans(self) -> int:
         return self.clock.n_replans
+
+    def _gate_gripper(self, seg: np.ndarray) -> np.ndarray:
+        """Debounce HOLD-channel polarity reversals across operator replans.
+
+        A segment proposes the side of the action-range midpoint containing its
+        mean HOLD value. A reversal executes only after ``gripper_dwell``
+        consecutive proposals; until then values are reflected about the
+        midpoint, preserving magnitude and changing only polarity.
+        """
+        if not self._hold_dims:
+            return seg
+        seg = np.array(seg, dtype=np.float32, copy=True)
+        for j, d in enumerate(self._hold_dims):
+            mid = float(self._hold_mid[j])
+            proposed = 1.0 if float(seg[:, d].mean()) >= mid else -1.0
+            if self._latch is None:
+                self._latch = np.ones(len(self._hold_dims), dtype=np.float32)
+            if self._prev_prop[j] != 0.0 and proposed != self._prev_prop[j]:
+                self._n_prop_flip += 1
+            self._prev_prop[j] = proposed
+            if self.clock.n_replans <= 1:
+                self._latch[j] = proposed
+                continue
+            if proposed == self._latch[j]:
+                self._dwell[j] = 0
+                continue
+            self._dwell[j] += 1
+            if self._dwell[j] >= self.gripper_dwell:
+                self._latch[j] = proposed
+                self._dwell[j] = 0
+                self._n_exec_flip += 1
+            else:
+                seg[:, d] = 2.0 * mid - seg[:, d]
+                self._n_suppressed += 1
+        return seg
+
+    def gripper_summary(self) -> dict[str, Any]:
+        if not self._hold_dims:
+            return {}
+        return {
+            "grip_dwell_k": self.gripper_dwell,
+            "grip_hold_dims": list(self._hold_dims),
+            "grip_prop_flips": self._n_prop_flip,
+            "grip_exec_flips": self._n_exec_flip,
+            "grip_suppressed": self._n_suppressed,
+        }
 
     # ── inference ─────────────────────────────────────────────────────────
 
@@ -415,7 +530,15 @@ class LoomPolicy:
         # is (1, dof_e) here, already on the estimator's device and dtype via
         # `feats_to` above, and it is the same quantity training reads out of
         # `window["feats"][h]["proprio"]`.
-        a = _call(m.decoder, feats["proprio"], c)                    # (1, H_OP, dof)
+        decoder_kw = ({"generator": self._decoder_generator}
+                      if self._decoder_accepts_generator else {})
+        proprio = feats["proprio"]
+        if self.decoder_samples > 1:
+            proprio = proprio.expand(self.decoder_samples, *proprio.shape[1:])
+            c = c.expand(self.decoder_samples, *c.shape[1:])
+        a = _call(m.decoder, proprio, c, **decoder_kw)               # (S, H_OP, dof)
+        if self.decoder_samples > 1:
+            a = a.mean(dim=0, keepdim=True)
         a = a.detach().to(torch.float32).cpu().numpy()
         if a.ndim == 3:
             a = a[0]
@@ -468,7 +591,7 @@ class LoomPolicy:
         """
         log = self._op_log
         if not log:
-            return {}
+            return self.gripper_summary()
         top1 = [r["top1"] for r in log]
         support = {i for r in log for i in r["support"]}
         # The *set* the top-4 picks out, not just which indices ever appear in
@@ -501,6 +624,7 @@ class LoomPolicy:
             out["op_ent_head"] = [round(e, 5) for e in ents[:5]]
         if gaps:
             out["op_logit_gap_mean"] = round(sum(gaps) / len(gaps), 5)
+        out.update(self.gripper_summary())
         return out
 
 
@@ -540,10 +664,27 @@ def feats_to(feats: ObsFeats, device: str, dtype: torch.dtype | None = None) -> 
     return ObsFeats(**out)
 
 
-def _call(mod: Any, *args: Any) -> Tensor:
+def _call(mod: Any, *args: Any, **kw: Any) -> Tensor:
     """`nn.Module.__call__` when available, else the bare `forward`."""
     fn = mod if callable(mod) else getattr(mod, "forward")
-    return fn(*args)
+    return fn(*args, **kw)
+
+
+def _accepts_keyword(mod: Any, name: str) -> bool:
+    """Whether a module's forward surface accepts ``name``.
+
+    Stub and test decoders predate the optional generator argument.  Inspecting
+    ``forward`` (rather than ``nn.Module.__call__``, whose signature is generic)
+    preserves those injected-policy seams without catching and masking a real
+    TypeError raised inside a decoder.
+    """
+    fn = getattr(mod, "forward", mod)
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == name or p.kind == inspect.Parameter.VAR_KEYWORD
+               for p in params)
 
 
 def _argmax_coeff(proposal: Any, z: Tensor, lang: Tensor, n_candidates: int) -> Tensor:
@@ -595,6 +736,10 @@ def load_policy(
     allow_stub: bool | None = None,
     n_candidates: int = 16,
     op_stats: bool = False,
+    gripper_dwell: int = GRIPPER_DWELL_OFF,
+    decoder_samples: int = 1,
+    duration_normalize_segments: bool = False,
+    _include_q_action: bool = False,
 ) -> LoomPolicy:
     """Build a `LoomPolicy` from a checkpoint, falling back to stubs.
 
@@ -616,7 +761,9 @@ def load_policy(
     if allow_stub is None:
         allow_stub = ckpt is None
     spec = EMBODIMENTS[embodiment]
-    modules, err = _try_real_modules(ckpt, embodiment, device)
+    modules, err = _try_real_modules(
+        ckpt, embodiment, device, include_q_action=_include_q_action,
+    )
 
     if modules is None:
         if not allow_stub:
@@ -626,22 +773,74 @@ def load_policy(
     if modules.featurize is None:
         modules.featurize = (zeros_featurizer(spec) if modules.is_stub
                              else default_featurizer(spec, device=device))
-    return LoomPolicy(modules, n_candidates=n_candidates, op_stats=op_stats)
+    return LoomPolicy(
+        modules, n_candidates=n_candidates, op_stats=op_stats,
+        gripper_dwell=gripper_dwell, decoder_samples=decoder_samples,
+        duration_normalize_segments=duration_normalize_segments,
+    )
 
 
-def _run_model_kwargs(ckpt: str | Any, module: str) -> dict:
+def _resolved_config_hash(cfg: dict[str, Any]) -> str:
+    """Validate embedded provenance without importing the training stack."""
+    experiment = {k: v for k, v in cfg.items() if k != "link"}
+    return hashlib.blake2b(
+        json.dumps(experiment, sort_keys=True, default=str).encode(), digest_size=8,
+    ).hexdigest()
+
+
+def _embedded_model_kwargs(payload: Any, module: str) -> dict | None:
+    """Authenticated model kwargs, or ``None`` for a legacy checkpoint."""
+    if not isinstance(payload, dict) or "resolved_config" not in payload:
+        return None
+    cfg = payload["resolved_config"]
+    if not isinstance(cfg, dict):
+        raise RuntimeError("checkpoint resolved_config is not a mapping")
+    expected = str(payload.get("config_hash", ""))
+    if not expected:
+        raise RuntimeError(
+            "checkpoint embeds resolved_config without the config_hash that "
+            "authenticates it"
+        )
+    got = _resolved_config_hash(cfg)
+    if got != expected:
+        raise RuntimeError(
+            f"checkpoint resolved_config hash {got} does not match saved "
+            f"config_hash {expected}; refusing mutable architecture provenance"
+        )
+    model = cfg.get("model", {})
+    if not isinstance(model, dict):
+        raise RuntimeError("checkpoint resolved_config.model is not a mapping")
+    kw = model.get(module, {}) or {}
+    if not isinstance(kw, dict):
+        raise RuntimeError(f"checkpoint resolved_config.model.{module} is not a mapping")
+    return dict(kw)
+
+
+def _run_model_kwargs(ckpt: str | Any, module: str, payload: Any = None) -> dict:
     """Architecture kwargs for `module`, read from the run that produced `ckpt`.
 
-    The checkpoint payload carries `config_hash` and `git_sha` but not the config
-    itself, so the source of truth is `runs/<run>/config.json` -> `model.<module>`.
-    A consolidated checkpoint lives in `runs/<run>_eval/`, so try that sibling
-    first, then the checkpoint's own directory and its parent.
+    New consolidated checkpoints embed the resolved, config-hash-authenticated
+    experiment config. It is the source of truth even if an adjacent
+    ``config.json`` is later edited. Older checkpoints fall back to
+    ``runs/<run>/config.json`` -> ``model.<module>``; a consolidated checkpoint
+    lives in ``runs/<run>_eval/``, so try that sibling first, then the
+    checkpoint's own directory and its parent.
 
     Returns {} when nothing is found, which reproduces the shipped defaults --
     correct for every checkpoint trained before these flags existed.
     """
-    import json as _json                                     # noqa: PLC0415
     from pathlib import Path as _Path                        # noqa: PLC0415
+
+    if payload is None:
+        try:
+            payload = torch.load(str(ckpt), map_location="cpu", weights_only=False)
+        except Exception:                                    # noqa: BLE001
+            # Legacy tests and raw/sharded checkpoints may not be loadable here;
+            # their adjacent config fallback remains supported.
+            payload = None
+    embedded = _embedded_model_kwargs(payload, module)
+    if embedded is not None:
+        return embedded
 
     p = _Path(str(ckpt)).resolve()
     d = p.parent
@@ -652,7 +851,7 @@ def _run_model_kwargs(ckpt: str | Any, module: str) -> dict:
     for c in cands:
         try:
             if c.is_file():
-                cfg = _json.loads(c.read_text())
+                cfg = json.loads(c.read_text())
                 kw = ((cfg or {}).get("model") or {}).get(module) or {}
                 if isinstance(kw, dict):
                     return dict(kw)
@@ -700,7 +899,8 @@ def submodule_state(state: Any, name: str) -> dict[str, Tensor] | None:
 
 
 def _try_real_modules(
-    ckpt: str | None, embodiment: str, device: str
+    ckpt: str | None, embodiment: str, device: str, *,
+    include_q_action: bool = False,
 ) -> tuple[PolicyModules | None, Exception | None]:
     """Lazy import + checkpoint load. Any failure degrades to stubs."""
     if ckpt is None:
@@ -743,25 +943,43 @@ def _try_real_modules(
         # trained, and the per-module guard below cannot see it. (`learned_z_init`
         # at least shows up as an unexpected `z_init`.) Measured: that difference
         # is worth 1.0 vs 18.0 LIBERO avg between two arms of the same run.
-        est_kw = _run_model_kwargs(ckpt, "estimator")
+        est_kw = _run_model_kwargs(ckpt, "estimator", payload)
         if est_kw:
-            print(f"[policy] estimator kwargs from run config: {est_kw}", flush=True)
+            print(f"[policy] estimator kwargs from checkpoint config: {est_kw}", flush=True)
         estimator = Estimator(embodiments=[embodiment], **est_kw)
-        proposal = Proposal()
+        prop_kw = _run_model_kwargs(ckpt, "proposal", payload)
+        if prop_kw:
+            print(f"[policy] proposal kwargs from checkpoint config: {prop_kw}", flush=True)
+        proposal = Proposal(**prop_kw)
         # Same argument for the decoder, and it is sharper here: `residual` is
         # not a parameter either, so a body trained on the proprio-relative
         # target and rebuilt without the flag loads with 0 missing and 0
         # unexpected keys and then emits ~0.03 rad residuals as ABSOLUTE joint
         # targets. Half of that change is far worse than none.
-        dec_kw = _run_model_kwargs(ckpt, "decoder")
+        dec_kw = _run_model_kwargs(ckpt, "decoder", payload)
         if dec_kw:
-            print(f"[policy] decoder kwargs from run config: {dec_kw}", flush=True)
+            print(f"[policy] decoder kwargs from checkpoint config: {dec_kw}", flush=True)
         decoder = Decoder(embodiments=[embodiment], default_embodiment=embodiment,
                           **dec_kw)
 
+        q_action = None
+        if include_q_action:
+            from loom.heads.q_action import QAction        # noqa: PLC0415
+
+            qa_kw = _run_model_kwargs(ckpt, "q_action", payload)
+            if qa_kw:
+                print(f"[policy] q_action kwargs from checkpoint config: {qa_kw}",
+                      flush=True)
+            q_action = QAction(
+                embodiments=[embodiment], default_embodiment=embodiment, **qa_kw,
+            )
+
         loaded: dict[str, Any] = {}
-        for name, mod in (("estimator", estimator), ("proposal", proposal),
-                          ("decoder", decoder)):
+        wanted = [("estimator", estimator), ("proposal", proposal),
+                  ("decoder", decoder)]
+        if q_action is not None:
+            wanted.append(("q_action", q_action))
+        for name, mod in wanted:
             sd = submodule_state(state, name)
             if sd is None:
                 raise KeyError(
@@ -781,6 +999,17 @@ def _try_real_modules(
             loaded[name] = {"tensors_loaded": len(sd) - len(unexpected),
                             "unexpected": len(unexpected)}
             mod.eval().to(device)
+        if include_q_action:
+            # The operator oracle is only eligible on the promoted bank-stage
+            # checkpoint.  It does not execute the bank, but absence of the
+            # trained bank state means this is not that artifact.
+            bank_sd = submodule_state(state, "bank")
+            if bank_sd is None:
+                raise KeyError(
+                    f"{ckpt} has no operator-bank weights; refusing to label it "
+                    "as the promoted bank-stage oracle checkpoint"
+                )
+            loaded["bank"] = {"tensors_present": len(bank_sd), "loaded": False}
 
         # The frozen tower is part of "real modules": if the checkpoint loaded
         # but the tower cannot, this whole path must fail and degrade to the
@@ -791,6 +1020,8 @@ def _try_real_modules(
             estimator=estimator,
             proposal=proposal,
             decoder=_bind_embodiment(decoder, embodiment),
+            q_action=(_bind_embodiment(q_action, embodiment)
+                      if q_action is not None else None),
             featurize=featurize,
             embodiment=embodiment,
             device=device,
@@ -801,6 +1032,8 @@ def _try_real_modules(
                   "view_keys": list(view_keys_for(EMBODIMENTS[embodiment])),
                   "ckpt_global_step": (payload.get("global_step")
                                        if isinstance(payload, dict) else None),
+                  "ckpt_config_hash": (payload.get("config_hash")
+                                        if isinstance(payload, dict) else None),
                   "state_dict": loaded},
         ), None
     except Exception as e:                               # noqa: BLE001 — degrade, never crash eval
@@ -835,6 +1068,13 @@ def _stub_modules(embodiment: str, device: str, reason: str = "") -> PolicyModul
 
 def make_policy(ckpt: str | None = None, **kw: Any) -> LoomPolicy:
     """Alias used by `runner.py` and the CLI, so the seam has one name."""
+    oracle = kw.pop("operator_oracle", None)
+    if oracle is not None:
+        # Lazy for the same reason as the model imports above: the standard R0
+        # evaluator must not import or construct oracle-only machinery.
+        from loom.eval.operator_oracle import load_operator_oracle_policy  # noqa: PLC0415
+
+        return load_operator_oracle_policy(ckpt, oracle=oracle, **kw)
     return load_policy(ckpt, **kw)
 
 
@@ -856,6 +1096,11 @@ def policy_provenance(policy: Any) -> dict[str, Any]:
         "env_fps": getattr(policy, "env_fps", None),
         "env_steps_per_segment": getattr(getattr(policy, "clock", None),
                                          "steps_per_segment", None),
+        "gripper_dwell": getattr(policy, "gripper_dwell", None),
+        "decoder_samples": getattr(policy, "decoder_samples", None),
+        "duration_normalize_segments": getattr(
+            policy, "duration_normalize_segments", None,
+        ),
         "h_op": H_OP,
         "fps_canonical": FPS_CANONICAL,
         "resampler": f"{to_env_rate.__module__}.{to_env_rate.__name__}",

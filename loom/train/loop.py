@@ -31,10 +31,11 @@ import json
 import math
 import os
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 # `contracts` and `stubs` live at the repo root, not inside the package.
 _ROOT = Path(__file__).resolve().parents[2]
@@ -47,10 +48,20 @@ from torch import Tensor, nn
 
 import contracts as C
 import stubs as S
+from loom.heads.proposal import argmax_coeff, argmax_coeff_dense_st
 from loom.losses.dyn import dyn_loss, ln_cosine_distance
+from loom.losses.proposal_bc import (
+    proposal_bc_loss, proposal_distill_loss, proposal_sparse_ce_loss,
+)
+from loom.train import atomic as atomic_mod
 from loom.train import ckpt as ckpt_mod
 from loom.train import fsdp as fsdp_mod
 from loom.train import wandb_util
+from loom.train.direct_formal import (
+    DirectFormalSchedule,
+    evaluate_direct_formal,
+    should_evaluate_direct_formal,
+)
 from loom.train.determinism import (
     enable_determinism, rank_identity, set_global_seed, set_step_seed, torch_generator,
 )
@@ -87,7 +98,18 @@ LINK_LOCAL_KEYS = ("run_dir", "stop_at", "budget_s", "safety_s", "no_wandb",
 #: 0 turns it off.
 GRAD_PROBE_EVERY = 100
 
+# ``Optimizer.state_dict`` mixes Adam moments (which must resume) with the
+# experiment's current group recipe (which must not be inherited accidentally).
+_OPT_GROUP_CONFIG_KEYS = (
+    "name", "module", "lr", "lr_scale", "weight_decay", "betas", "eps",
+    "amsgrad", "maximize", "foreach", "capturable", "differentiable", "fused",
+)
+
 _CONFIG_DIR = _ROOT / "configs"
+
+_DIRECT_FORMAL_METRICS_ROLLBACK_FORMAT = (
+    "loom-direct-formal-metrics-rollback-v1"
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -159,6 +181,13 @@ def load_config(args) -> dict:
             node = node.setdefault(part, {})
         node[parts[-1]] = _coerce(val)
 
+    if args.steps is not None and (
+        "schedule_horizon" in cfg["run"] or "max_updates" in cfg["run"]
+    ):
+        raise ValueError(
+            "--steps cannot override a direct-formal config; freeze "
+            "run.schedule_horizon and run.max_updates in YAML"
+        )
     if args.steps is not None:
         cfg["run"]["steps"] = args.steps
     if args.seed is not None:
@@ -195,6 +224,330 @@ def config_hash(cfg: dict) -> str:
     ).hexdigest()
 
 
+def _exclusive_publish_bytes(path: Path, payload: bytes) -> None:
+    """Publish immutable bytes without an overwrite race.
+
+    A temporary inode is fully written and fsynced before ``link`` gives it the
+    final name.  Replaying an interrupted recovery may encounter an existing
+    destination; exact bytes are idempotent, while any difference fails closed.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.tmp.", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError:
+            if path.read_bytes() != payload:
+                raise RuntimeError(f"immutable recovery artifact differs: {path}")
+        else:
+            atomic_mod.fsync_dir(path.parent)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _reconcile_direct_formal_metrics(
+    run_dir: Path,
+    *,
+    checkpoint_step: int,
+    checkpoint_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authenticate a formal metrics ledger and remove only a crash tail.
+
+    The checkpoint is the durable optimizer/model authority.  A metrics ledger
+    may be ahead of it when a process dies after logging later updates but
+    before the next checkpoint.  The only repairable state is one exact row for
+    every step ``1..N`` with ``N > checkpoint_step``.  The complete original
+    and discarded tail are quarantined under content-addressed names, an
+    immutable deterministic rollback receipt is published, and only then is
+    ``metrics.jsonl`` atomically replaced by its committed prefix.
+    """
+
+    if (
+        not isinstance(checkpoint_step, int)
+        or isinstance(checkpoint_step, bool)
+        or checkpoint_step < 0
+    ):
+        raise ValueError("checkpoint_step must be a non-negative integer")
+    if not isinstance(checkpoint_identity, Mapping):
+        raise ValueError("checkpoint_identity must be a mapping")
+
+    metrics_path = Path(run_dir) / "metrics.jsonl"
+    if not metrics_path.exists():
+        if checkpoint_step == 0:
+            return {
+                "action": "NONE",
+                "checkpoint_step": 0,
+                "rows": 0,
+                "metrics_sha256": hashlib.sha256(b"").hexdigest(),
+            }
+        raise RuntimeError(
+            "formal metrics ledger is missing behind checkpoint "
+            f"{checkpoint_step}"
+        )
+
+    original = metrics_path.read_bytes()
+    if original and not original.endswith(b"\n"):
+        raise RuntimeError("formal metrics ledger has an unterminated final row")
+
+    encoded_lines = original.splitlines(keepends=True)
+    rows: list[Mapping[str, Any]] = []
+
+    def _reject_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant {value!r}")
+
+    for line_number, encoded in enumerate(encoded_lines, start=1):
+        if not encoded.endswith(b"\n"):
+            raise RuntimeError(
+                f"formal metrics row {line_number} is not newline-terminated"
+            )
+        try:
+            row = json.loads(
+                encoded.decode("utf-8"), parse_constant=_reject_constant,
+            )
+        except (UnicodeDecodeError, ValueError) as error:
+            raise RuntimeError(
+                f"formal metrics row {line_number} is malformed: {error}"
+            ) from error
+        if not isinstance(row, Mapping):
+            raise RuntimeError(
+                f"formal metrics row {line_number} is not a JSON object"
+            )
+        step = row.get("global_step")
+        if (
+            not isinstance(step, int)
+            or isinstance(step, bool)
+            or step != line_number
+        ):
+            raise RuntimeError(
+                "formal metrics ledger is not exactly contiguous: "
+                f"row {line_number} has global_step={step!r}"
+            )
+        rows.append(row)
+
+    if len(rows) < checkpoint_step:
+        raise RuntimeError(
+            "formal metrics ledger is behind checkpoint: "
+            f"{len(rows)} rows for checkpoint {checkpoint_step}"
+        )
+    if len(rows) == checkpoint_step:
+        return {
+            "action": "NONE",
+            "checkpoint_step": checkpoint_step,
+            "rows": len(rows),
+            "metrics_sha256": hashlib.sha256(original).hexdigest(),
+        }
+
+    prefix = b"".join(encoded_lines[:checkpoint_step])
+    tail = b"".join(encoded_lines[checkpoint_step:])
+    original_sha = hashlib.sha256(original).hexdigest()
+    prefix_sha = hashlib.sha256(prefix).hexdigest()
+    tail_sha = hashlib.sha256(tail).hexdigest()
+    rollback_dir = Path(run_dir) / "direct_formal_metrics_rollback"
+    created_dir = not rollback_dir.exists()
+    rollback_dir.mkdir(parents=False, exist_ok=True)
+    if created_dir:
+        atomic_mod.fsync_dir(rollback_dir.parent)
+    if not rollback_dir.is_dir():
+        raise RuntimeError(f"metrics rollback quarantine is not a directory: {rollback_dir}")
+
+    original_path = rollback_dir / f"metrics.full.sha256-{original_sha}.jsonl"
+    tail_path = rollback_dir / f"metrics.tail.sha256-{tail_sha}.jsonl"
+    receipt_path = rollback_dir / (
+        f"rollback.step-{checkpoint_step:09d}.sha256-{original_sha}.json"
+    )
+    receipt = {
+        "format": _DIRECT_FORMAL_METRICS_ROLLBACK_FORMAT,
+        "reason": "crash_tail_beyond_latest_checkpoint",
+        "checkpoint": dict(checkpoint_identity),
+        "ledger": {
+            "path": "metrics.jsonl",
+            "original_rows": len(rows),
+            "original_bytes": len(original),
+            "original_sha256": original_sha,
+            "retained_rows": checkpoint_step,
+            "retained_bytes": len(prefix),
+            "retained_sha256": prefix_sha,
+            "discarded_rows": len(rows) - checkpoint_step,
+            "discarded_bytes": len(tail),
+            "discarded_sha256": tail_sha,
+            "discarded_step_range": [checkpoint_step + 1, len(rows)],
+        },
+        "quarantine": {
+            "full_original": str(original_path.relative_to(run_dir)),
+            "discarded_tail": str(tail_path.relative_to(run_dir)),
+        },
+    }
+    receipt_bytes = (
+        json.dumps(receipt, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        + "\n"
+    ).encode("utf-8")
+
+    # Receipt-before-replace is intentional: after a crash at any point, the
+    # original bytes remain recoverable and replay either completes the exact
+    # authorized replacement or verifies that it already happened.
+    _exclusive_publish_bytes(original_path, original)
+    _exclusive_publish_bytes(tail_path, tail)
+    _exclusive_publish_bytes(receipt_path, receipt_bytes)
+    atomic_mod.atomic_write_bytes(metrics_path, prefix)
+    if metrics_path.read_bytes() != prefix:
+        raise RuntimeError("formal metrics atomic rollback verification failed")
+    return {"action": "ROLLBACK", "receipt_path": str(receipt_path), **receipt}
+
+
+def _optimizer_group_config(optimizer) -> list[dict[str, Any]]:
+    """Copy config-owned optimizer fields before checkpoint moments are loaded."""
+    return [
+        {k: group[k] for k in _OPT_GROUP_CONFIG_KEYS if k in group}
+        for group in optimizer.param_groups
+    ]
+
+
+def _reapply_optimizer_group_config(optimizer, wanted: list[dict[str, Any]]) -> None:
+    """Keep loaded Adam moments but restore LR/WD/betas from this run's config."""
+    if len(optimizer.param_groups) != len(wanted):
+        raise RuntimeError(
+            "checkpoint optimizer group count differs from the current model: "
+            f"{len(optimizer.param_groups)} vs {len(wanted)}"
+        )
+    for group, configured in zip(optimizer.param_groups, wanted):
+        group.update(configured)
+
+
+def _optimizer_state_reset_modules(optimizer, configured: Any) -> tuple[str, ...]:
+    """Validate the config-owned list of optimizer modules to reset.
+
+    Module labels come from the live optimizer groups built *after* FSDP
+    wrapping. Using those live groups, rather than serialized parameter IDs or
+    model parameter names, also works for FSDP original/sharded parameters.
+    """
+    if configured is None:
+        return ()
+    if not isinstance(configured, list):
+        raise ValueError(
+            "optim.reset_state_modules must be a list of optimizer module names, "
+            f"got {configured!r}"
+        )
+    if any(not isinstance(name, str) or not name for name in configured):
+        raise ValueError(
+            "optim.reset_state_modules entries must be non-empty strings, "
+            f"got {configured!r}"
+        )
+    if len(configured) != len(set(configured)):
+        raise ValueError(
+            "optim.reset_state_modules contains duplicate module names: "
+            f"{configured!r}"
+        )
+
+    available = {group.get("module") for group in optimizer.param_groups}
+    unknown = sorted(set(configured) - available)
+    if unknown:
+        raise ValueError(
+            "optim.reset_state_modules names modules with no optimizer group: "
+            f"{unknown}; available modules are {sorted(str(x) for x in available)}"
+        )
+    return tuple(configured)
+
+
+def _reset_optimizer_state_modules(
+        optimizer, modules: Sequence[str]) -> dict[str, int]:
+    """Drop Adam state for selected live parameter groups, and nothing else."""
+    selected = set(modules)
+    cleared = {name: 0 for name in modules}
+    for group in optimizer.param_groups:
+        module = group.get("module")
+        if module not in selected:
+            continue
+        for parameter in group["params"]:
+            if parameter in optimizer.state:
+                del optimizer.state[parameter]
+                cleared[module] += 1
+    return cleared
+
+
+def _reset_optimizer_state_for_config_transition(
+        optimizer, modules: Sequence[str], *, checkpoint_config_hash: str,
+        current_config_hash: str) -> dict[str, int] | None:
+    """Apply a selective reset once when entering a new config identity.
+
+    The next checkpoint carries ``current_config_hash``. Matching-hash resumes
+    are ordinary requeues and must retain moments accumulated after the phase
+    transition, so they deliberately return ``None`` without touching state.
+    """
+    if not modules or checkpoint_config_hash == current_config_hash:
+        return None
+    return _reset_optimizer_state_modules(optimizer, modules)
+
+
+def _reset_parameters_for_config_transition(
+        model: nn.Module, configured: Any, *, checkpoint_config_hash: str,
+        current_config_hash: str) -> dict[str, int] | None:
+    """Apply the one declared value reset exactly once at a config transition.
+
+    This deliberately is not a general checkpoint surgery language.  The only
+    supported intervention is the audited identity-centred bank contingency:
+    zero ``bank.omega`` while retaining ``bank.log_r`` and ``bank.b_raw``.
+    Binding the reset to the source experiment hash prevents an accidentally
+    seeded run from silently mutating a checkpoint from another method.
+
+    A checkpoint written after the transition carries ``current_config_hash``;
+    same-hash requeues therefore return ``None`` and preserve the learned omega
+    tensor byte-for-byte.
+    """
+    if configured is None:
+        return None
+    if not isinstance(configured, Mapping):
+        raise ValueError(
+            "optim.transition_parameter_reset must be a mapping, got "
+            f"{configured!r}"
+        )
+    expected_keys = {"source_config_hash", "tensors"}
+    if set(configured) != expected_keys:
+        raise ValueError(
+            "optim.transition_parameter_reset must have exactly "
+            f"{sorted(expected_keys)}, got {sorted(str(k) for k in configured)}"
+        )
+    source_hash = configured["source_config_hash"]
+    if not isinstance(source_hash, str) or len(source_hash) != 16 or any(
+            ch not in "0123456789abcdef" for ch in source_hash):
+        raise ValueError(
+            "optim.transition_parameter_reset.source_config_hash must be a "
+            f"16-character lowercase hexadecimal config hash, got {source_hash!r}"
+        )
+    tensors = configured["tensors"]
+    declared = {"bank.omega": "zero"}
+    if not isinstance(tensors, Mapping) or dict(tensors) != declared:
+        raise ValueError(
+            "optim.transition_parameter_reset.tensors must be exactly "
+            f"{declared!r}, got {tensors!r}"
+        )
+
+    # Validate the live model even on a same-hash resume. A typo must not hide
+    # indefinitely just because the first transition happened on another link.
+    named = dict(model.named_parameters())
+    parameter = named.get("bank.omega")
+    if parameter is None:
+        raise ValueError(
+            "optim.transition_parameter_reset names missing parameter bank.omega"
+        )
+
+    if checkpoint_config_hash == current_config_hash:
+        return None
+    if checkpoint_config_hash != source_hash:
+        raise ValueError(
+            "optim.transition_parameter_reset source mismatch: checkpoint "
+            f"config_hash={checkpoint_config_hash!r}, declared source={source_hash!r}"
+        )
+    with torch.no_grad():
+        parameter.zero_()
+    return {"bank.omega": int(parameter.numel())}
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  TRAINABLE STUB SHIMS
 #
@@ -229,8 +582,22 @@ class _StubDecoder(S.StubDecoder):
         super().__init__(embodiment)
         self.scale = nn.Parameter(torch.ones(self.dof))
 
-    def loss(self, proprio: Tensor, c: Tensor, a_seg: Tensor) -> Tensor:
-        return ((self.forward(proprio, c) * self.scale.to(proprio.dtype)
+    def loss(
+        self,
+        proprio: Tensor,
+        c: Tensor,
+        a_seg: Tensor,
+        *,
+        t: Tensor | None = None,
+        noise: Tensor | None = None,
+    ) -> Tensor:
+        # ``t`` and ``noise`` are accepted so the dual-code path can exercise the
+        # same paired-CFM call contract in CPU stub tests. The frozen stub decoder
+        # is an ordinary MSE shim and therefore has no stochastic flow path to
+        # condition; real R0-A runs fail closed on ``model.use_stubs: false``.
+        del t
+        pred = self.forward(proprio, c) if noise is None else noise
+        return ((pred * self.scale.to(proprio.dtype)
                  - a_seg) ** 2).mean()
 
 
@@ -560,18 +927,94 @@ class LoomModel(nn.Module):
             self.potential = potential
         self.ema = EMATarget(estimator, tau=float(cfg.get("optim", {}).get(
             "ema_tau", C.EMA_TAU)))
+        update_ema = cfg.get("optim", {}).get("update_ema", True)
+        if not isinstance(update_ema, bool):
+            raise ValueError(
+                f"optim.update_ema must be a boolean, got {update_ema!r}"
+            )
+        # A frozen-coordinate refinement must be able to hold both estimator
+        # copies exactly fixed. An EMA update is a parameter mutation even when E
+        # is optimizer-frozen, so LR scales cannot express this switch.
+        self.update_ema = update_ema
         self.cfg = cfg
         lc = cfg.get("losses", {})
         self.loss_cfg = {k: dict(v) for k, v in lc.items()}
-        self.negatives = self.loss_cfg.get("dyn", {}).get("negatives", "within_trajectory")
+        dcfg = self.loss_cfg.get("dyn", {})
+        self.negatives = dcfg.get("negatives", "within_trajectory")
+        # Action-labelled data knows which body motion produced each transition.
+        # R0 historically ignored that label in L_dyn and always routed the bank
+        # with q_delta. Keep that action-free default, but make the labelled
+        # operator source an explicit, config-hashed method choice.
+        self.dyn_coeff_source = str(dcfg.get("coeff_source", "q_delta"))
+        if self.dyn_coeff_source not in ("q_delta", "q_action"):
+            raise ValueError(
+                "losses.dyn.coeff_source must be 'q_delta' or 'q_action', got "
+                f"{self.dyn_coeff_source!r}"
+            )
+        detach_coeff = dcfg.get("detach_coeff", True)
+        if not isinstance(detach_coeff, bool):
+            raise ValueError(
+                "losses.dyn.detach_coeff must be a boolean, got "
+                f"{detach_coeff!r}"
+            )
+        # The historical and bank-only action anchor is a frozen semantic label.
+        # A joint action-code/bank stage may make that one existing L_dyn edge
+        # live explicitly; the default remains detached so old recipes and active
+        # runs retain byte-for-byte gradient routing.
+        self.dyn_detach_coeff = detach_coeff
         #: which side of ``L_act``'s align term carries the gradient.
         #: ``"q_delta"`` (the original) -- ``q_a`` regresses onto ``sg(q_Delta)``.
         #: ``"q_a"``     (ALIGN-FLIP)   -- ``q_Delta`` regresses onto ``sg(q_a)``,
-        #: so ``c_a``'s only gradient is ``D_e``'s reconstruction of the action.
+        #: so ``c_a`` is not pulled toward the transition head. A recipe may
+        #: additionally route L_dyn with q_a on action-labelled data.
         self.align_to = str(self.loss_cfg.get("act", {}).get("align_to", "q_delta"))
         if self.align_to not in ("q_delta", "q_a"):
             raise ValueError(
                 f"losses.act.align_to must be 'q_delta' or 'q_a', got {self.align_to!r}")
+        # Which coefficient D_e sees while learning to realize the demonstrated
+        # action.  The historical path uses q_a's action-conditioned teacher.
+        # ``proposal`` uses the exact sparse coefficient deployed by R0.
+        # ``dual_q_action_proposal`` averages paired teacher/deployed CFM terms,
+        # preserving q_a's action-semantic anchor while closing that exposure gap.
+        # Neither adds an input: D_e still receives only (proprio, c).
+        self.act_decode_from = str(
+            self.loss_cfg.get("act", {}).get("decode_from", "q_action")
+        )
+        if self.act_decode_from not in (
+            "q_action", "proposal", "dual_q_action_proposal",
+        ):
+            raise ValueError(
+                "losses.act.decode_from must be 'q_action', 'proposal', or "
+                "'dual_q_action_proposal', got "
+                f"{self.act_decode_from!r}"
+            )
+        if (
+            self.act_decode_from == "dual_q_action_proposal"
+            and not callable(getattr(self.proposal, "logits", None))
+        ):
+            raise TypeError(
+                "losses.act.decode_from='dual_q_action_proposal' requires a real "
+                "proposal.logits(z, lang) surface; stub proposal mode is unsupported. "
+                "Set model.use_stubs=false for this method."
+            )
+        pcfg = self.loss_cfg.get("proposal", {})
+        self.proposal_mode = str(pcfg.get("mode", "pl"))
+        if self.proposal_mode not in ("pl", "dense_kl", "sparse_ce"):
+            raise ValueError(
+                "losses.proposal.mode must be 'pl', 'dense_kl', or 'sparse_ce', got "
+                f"{self.proposal_mode!r}"
+            )
+        self.proposal_temperature = float(pcfg.get("temperature", 1.0))
+        if self.proposal_temperature <= 0.0:
+            raise ValueError("losses.proposal.temperature must be > 0")
+        self.proposal_detach_belief = bool(pcfg.get("detach_belief", False))
+        self.proposal_hard_weight = float(pcfg.get("hard_weight", 0.0))
+        if not math.isfinite(self.proposal_hard_weight) or self.proposal_hard_weight < 0.0:
+            raise ValueError("losses.proposal.hard_weight must be finite and >= 0")
+        if self.proposal_mode != "dense_kl" and self.proposal_hard_weight != 0.0:
+            raise ValueError(
+                "losses.proposal.hard_weight is only valid with mode='dense_kl'"
+            )
         # Team B's estimator holds per-embodiment proprio projections and infers
         # the body from proprio.shape[-1] when not told. Two registered bodies
         # already share dof=7, so inference is ambiguous and picking the wrong
@@ -611,9 +1054,24 @@ class LoomModel(nn.Module):
     def _est_kw(self, window: dict) -> dict:
         return {"embodiment": window["embodiment"]} if self._est_takes_embodiment else {}
 
+    def update_target(self) -> None:
+        """Apply the configured EMA mutation, or hold target coordinates fixed."""
+        if self.update_ema:
+            self.ema.update(self.estimator)
+
     def beliefs(self, window: dict) -> list[Tensor]:
         kw = self._est_kw(window)
         z, out = None, []
+        prefix = window.get("burn_in_feats", ())
+        if prefix:
+            # Replay real preceding observations but truncate the graph at the
+            # selected window boundary. The unchanged five main states below are
+            # the only states through which a future estimator-enabled recipe may
+            # backpropagate.
+            with torch.no_grad():
+                for feats in prefix:
+                    z = self._cast(self.estimator(feats, z, **kw))
+            z = z.detach()
         for feats in window["feats"]:
             z = self._cast(self.estimator(feats, z, **kw))
             out.append(z)
@@ -623,6 +1081,10 @@ class LoomModel(nn.Module):
     def target_beliefs(self, window: dict) -> list[Tensor]:
         kw = self._est_kw(window)
         z, out = None, []
+        # The target replays its own prefix from its own episode-start state. Do
+        # not seed it from the online prefix: online and EMA coordinates can differ.
+        for feats in window.get("burn_in_feats", ()):
+            z = self._cast(self.ema(feats, z, **kw))
         for feats in window["feats"]:
             z = self._cast(self.ema(feats, z, **kw))
             out.append(z.detach())
@@ -657,13 +1119,57 @@ class LoomModel(nn.Module):
         # on. `_qd_logits` is cleared every step so a stale graph cannot be read.
         self._qd_logits = []
         c_delta = []
-        for h in range(C.DEPTH):
-            c_h, lg_h = _coeff_and_logits(self.q_delta, zs[h], zts[h + 1])
-            c_delta.append(c_h)
-            self._qd_logits.append(lg_h)
-        if self._probe_grad and all(lg is not None for lg in self._qd_logits):
+        need_delta_coeff = (
+            self.dyn_coeff_source == "q_delta" or self._on("act") or
+            self._on("proposal") or self._on("balance")
+        )
+        if need_delta_coeff:
+            for h in range(C.DEPTH):
+                c_h, lg_h = _coeff_and_logits(self.q_delta, zs[h], zts[h + 1])
+                c_delta.append(c_h)
+                self._qd_logits.append(lg_h)
+        # A head-only refinement can freeze q_delta while retaining the probe
+        # cadence inherited from the base recipe. Frozen logits have no graph;
+        # skip their diagnostic hook instead of aborting a valid refinement.
+        if self._probe_grad and all(
+                lg is not None and lg.requires_grad for lg in self._qd_logits):
             for lg in self._qd_logits:
                 lg.retain_grad()
+
+        # Compute q_a exactly once when either enabled objective needs it. Keep
+        # this separate from c_act: proposal/balance historically consume q_a
+        # only when L_act is enabled, and selecting a dynamics source must not
+        # silently change those objectives too.
+        c_action_all: list[Tensor] | None = None
+        action_logits_all: list[Tensor | None] = []
+        actions = window.get("actions")
+        action_dyn = self._on("dyn") and self.dyn_coeff_source == "q_action"
+        if action_dyn and actions is None:
+            raise ValueError(
+                "losses.dyn.coeff_source='q_action' requires labelled action "
+                "segments; TransitionWindow.actions is None"
+            )
+        need_action_coeff = actions is not None and (self._on("act") or action_dyn)
+        if need_action_coeff:
+            qa = self.q_action[emb]
+
+            def _action_coefficients():
+                coeffs, logits = [], []
+                for h in range(C.DEPTH):
+                    c_a, lg_a = _coeff_and_logits(qa, actions[:, h], zs[h])
+                    coeffs.append(c_a)
+                    logits.append(lg_a)
+                return coeffs, logits
+
+            action_dyn_needs_grad = action_dyn and not self.dyn_detach_coeff
+            if self._on("act") or action_dyn_needs_grad:
+                # One shared q_a forward serves L_act and action-anchored L_dyn.
+                # Each objective decides below whether its view remains attached.
+                c_action_all, action_logits_all = _action_coefficients()
+            else:
+                # Bank-only action anchoring never needs a q_a/z graph at all.
+                with torch.no_grad():
+                    c_action_all, action_logits_all = _action_coefficients()
 
         # ── L_dyn ──────────────────────────────────────────────────────────
         #
@@ -674,8 +1180,18 @@ class LoomModel(nn.Module):
         # nothing was reading it.
         if self._on("dyn"):
             dcfg = self.loss_cfg.get("dyn", {})
-            c_seq = torch.stack(c_delta, dim=1)                       # (B,DEPTH,M)
+            use_q_action = self.dyn_coeff_source == "q_action"
+            if use_q_action:
+                assert c_action_all is not None  # checked loudly above
+                c_dyn = (
+                    [c.detach() for c in c_action_all]
+                    if self.dyn_detach_coeff else c_action_all
+                )
+            else:
+                c_dyn = c_delta
+            c_seq = torch.stack(c_dyn, dim=1)                         # (B,DEPTH,M)
             z_tgt = torch.stack([zts[h + 1] for h in range(C.DEPTH)], dim=1)
+            cosine = str(dcfg.get("cosine", "per_slot"))
             out = dyn_loss(
                 self.bank, zs[0], c_seq, z_tgt,
                 negatives=self.negatives,
@@ -683,7 +1199,7 @@ class LoomModel(nn.Module):
                 neg_weight=float(dcfg.get("neg_weight", 1.0)),
                 neg_margin=float(dcfg.get("neg_margin", 0.1)),
                 weights=C.DYN_WEIGHTS,
-                cosine=str(dcfg.get("cosine", "per_slot")),
+                cosine=cosine,
                 # CPU generator: the negatives' multinomial and the delta_op
                 # draw both happen where it lives and the indices move to the
                 # coefficients' device. See `losses.dyn._draw`.
@@ -698,20 +1214,36 @@ class LoomModel(nn.Module):
             # The build assert, unchanged, so the number stays comparable with
             # every prior run. Delta_op says the BANK is alive; it is not the
             # discrimination test -- `Delta_sel` below is.
-            metrics["delta_op"] = self._delta_op(zs, zts, c_delta, step, rank, seed)
-            metrics.update(self._delta_sel(zs, zts, c_delta))
+            metrics["delta_op"] = self._delta_op(zs, zts, c_dyn, step, rank, seed)
+            metrics.update(self._delta_sel(zs, zts, c_dyn))
 
         # ── L_act ──────────────────────────────────────────────────────────
         c_act: list[Tensor] | None = None
         c_act_lg: list[Tensor | None] = []
-        if self._on("act") and window.get("actions") is not None:
-            qa, dec = self.q_action[emb], self.decoder[emb]
-            c_act, c_act_lg, l_act, l_align = [], [], zero, zero
+        if self._on("act") and actions is not None:
+            if c_action_all is None:
+                raise RuntimeError("L_act requires action coefficients")
+            dec = self.decoder[emb]
+            c_act = c_action_all
+            c_act_lg = action_logits_all
+            l_act, l_align = zero, zero
+            l_decode_teacher, l_decode_deployed = zero, zero
+            deploy_l2, deploy_overlap = zero, zero
+            dual_decode = self.act_decode_from == "dual_q_action_proposal"
+            # One rank/step stream, consumed in fixed horizon order. Each horizon
+            # draws one CFM source and one time and passes those exact tensors to
+            # both code paths, so their difference is coefficient conditioning,
+            # not Monte-Carlo noise. An explicit device generator is required:
+            # CPU generators cannot drive CUDA ``randn``/``rand`` kernels.
+            act_cfm_generator = (
+                torch_generator(
+                    seed, step, rank, tag="act_dual_cfm", device=str(dev),
+                )
+                if dual_decode else None
+            )
             for h in range(C.DEPTH):
-                a_seg = window["actions"][:, h]                 # (B, H_OP, dof_e)
-                c_a, lg_a = _coeff_and_logits(qa, a_seg, zs[h])
-                c_act.append(c_a)
-                c_act_lg.append(lg_a)
+                a_seg = actions[:, h]                           # (B, H_OP, dof_e)
+                c_a = c_act[h]
                 # D_e(proprio_t, c) -- NOT D_e(z, c). Given the whole belief the
                 # decoder is a behaviour-cloning head and needs nothing from `c`,
                 # so `L_act` exerts no pressure on the coefficient (measured:
@@ -719,15 +1251,68 @@ class LoomModel(nn.Module):
                 # supports over 64 real windows). `feats[h]["proprio"]` is
                 # (B, dof_e) -- ONE timestep, at the START of segment h.
                 proprio = window["feats"][h]["proprio"]
-                l_act = l_act + dec.loss(proprio, c_a, a_seg)
+                c_deployed = None
+                if self.act_decode_from in ("proposal", "dual_q_action_proposal"):
+                    # Same forward value as Proposal.argmax: top-4 support and
+                    # restricted-softmax weights.  The straight-through tail is
+                    # only a gradient estimator, allowing the existing L_act to
+                    # teach pi_c which deployed coefficient realizes the action.
+                    p_lg = self.proposal.logits(zs[h], window["lang"])
+                    c_deployed = (
+                        argmax_coeff_dense_st(p_lg, C.TOPK, p_lg.shape[-1])
+                        if dual_decode else
+                        argmax_coeff(
+                            p_lg, C.TOPK, p_lg.shape[-1], straight_through=True,
+                        )
+                    )
+                    with torch.no_grad():
+                        deploy_l2 = deploy_l2 + (
+                            (c_deployed.float() - c_a.detach().float()).pow(2)
+                            .sum(-1).mean()
+                        )
+                        ai = c_a.detach().float().topk(C.TOPK, dim=-1).indices
+                        pi = c_deployed.detach().float().topk(C.TOPK, dim=-1).indices
+                        deploy_overlap = deploy_overlap + (
+                            (pi.unsqueeze(-1) == ai.unsqueeze(-2))
+                            .any(-1).float().mean()
+                        )
+                if dual_decode:
+                    assert c_deployed is not None
+                    assert act_cfm_generator is not None
+                    # Decoder.loss first casts the data side to proprio.dtype, so
+                    # draw the explicit shared source in that same dtype. ``t`` is
+                    # fp32 exactly as Decoder.loss's internal default draw.
+                    shared_noise = torch.randn(
+                        tuple(a_seg.shape), device=a_seg.device,
+                        dtype=proprio.dtype, generator=act_cfm_generator,
+                    )
+                    shared_t = torch.rand(
+                        a_seg.shape[0], device=a_seg.device, dtype=torch.float32,
+                        generator=act_cfm_generator,
+                    )
+                    teacher_h = dec.loss(
+                        proprio, c_a, a_seg, t=shared_t, noise=shared_noise,
+                    )
+                    deployed_h = dec.loss(
+                        proprio, c_deployed, a_seg,
+                        t=shared_t, noise=shared_noise,
+                    )
+                    l_decode_teacher = l_decode_teacher + teacher_h
+                    l_decode_deployed = l_decode_deployed + deployed_h
+                    # Averaging retains the one-decoder-term scale of R0-A. The
+                    # alignment below remains a single full-weight semantic edge.
+                    l_act = l_act + 0.5 * (teacher_h + deployed_h)
+                else:
+                    c_decode = c_deployed if c_deployed is not None else c_a
+                    l_act = l_act + dec.loss(proprio, c_decode, a_seg)
                 # ALIGN. One term, one direction, chosen by `losses.act.align_to`.
                 #
                 # "q_delta" (original): q_a regresses onto sg(q_Delta) -- one
                 #   coefficient space by construction, q_Delta defines it.
-                # "q_a" (ALIGN-FLIP): q_Delta regresses onto sg(q_a) instead, so
-                #   `c_a`'s only gradient is `dec.loss` -- the reconstruction of
-                #   a_{t:t+7} from (p_t, c), the one optimum in this objective a
-                #   batch-constant `c` cannot reach. The original direction
+                # "q_a" (ALIGN-FLIP): q_Delta regresses onto sg(q_a) instead.
+                #   In the direct-policy recipe q_a learns action reconstruction;
+                #   an action-labelled dynamics recipe may also route L_dyn with
+                #   this same coefficient. The original direction
                 #   transmits q_Delta's phase clock INTO q_a: at the observed
                 #   plateau the align gradient on c_a has norm 2*sqrt(0.500) =
                 #   1.415 and is 100% common-mode, against decode's 0.179 of
@@ -740,6 +1325,19 @@ class LoomModel(nn.Module):
             terms["act"] = (l_act + l_align) / C.DEPTH
             metrics["act/decode"] = float(l_act.detach()) / C.DEPTH
             metrics["act/align"] = float(l_align.detach()) / C.DEPTH
+            if dual_decode:
+                metrics["act/decode_teacher"] = (
+                    float(l_decode_teacher.detach()) / C.DEPTH
+                )
+                metrics["act/decode_deploy"] = (
+                    float(l_decode_deployed.detach()) / C.DEPTH
+                )
+                metrics["act/decode_gap"] = (
+                    float((l_decode_deployed - l_decode_teacher).detach()) / C.DEPTH
+                )
+            if self.act_decode_from in ("proposal", "dual_q_action_proposal"):
+                metrics["act/deploy_c_l2"] = float(deploy_l2) / C.DEPTH
+                metrics["act/deploy_topk_overlap"] = float(deploy_overlap) / C.DEPTH
             # Did the flip engage? `c_a` batch-constant reads ~0 here. One
             # scalar under no_grad; nothing below enters the training graph.
             with torch.no_grad():
@@ -753,10 +1351,80 @@ class LoomModel(nn.Module):
         # ── L_proposal ─────────────────────────────────────────────────────
         if self._on("proposal"):
             src = c_act if c_act is not None else c_delta
-            lp = zero
-            for h in range(C.DEPTH):
-                lp = lp + self.proposal.log_prob(zs[h], window["lang"], src[h].detach()).mean()
-            terms["proposal"] = -lp / C.DEPTH
+            if self.proposal_mode == "dense_kl":
+                src_logits = c_act_lg if c_act is not None else self._qd_logits
+                if not all(x is not None for x in src_logits):
+                    raise RuntimeError(
+                        "dense_kl proposal training requires dense teacher logits; "
+                        "the configured q_a/q_delta returned coefficients only"
+                    )
+                loss_prop, dense_kl, hard_nll = zero, zero, zero
+                overlap, teacher_ent, student_ent = zero, zero, zero
+                for h in range(C.DEPTH):
+                    teacher_lg = src_logits[h]
+                    loss_h, student_lg = proposal_distill_loss(
+                        self.proposal, zs[h], window["lang"], teacher_lg,
+                        temperature=self.proposal_temperature,
+                        detach_belief=self.proposal_detach_belief,
+                        return_student_logits=True,
+                    )
+                    dense_kl = dense_kl + loss_h
+                    loss_prop = loss_prop + loss_h
+                    if self.proposal_hard_weight > 0.0:
+                        z_prop = (zs[h].detach() if self.proposal_detach_belief
+                                  else zs[h])
+                        hard_h = proposal_bc_loss(
+                            self.proposal, z_prop, window["lang"], src[h])
+                        hard_nll = hard_nll + hard_h
+                        loss_prop = loss_prop + self.proposal_hard_weight * hard_h
+                    with torch.no_grad():
+                        ti = teacher_lg.float().topk(C.TOPK, dim=-1).indices
+                        si = student_lg.float().topk(C.TOPK, dim=-1).indices
+                        overlap = overlap + (si.unsqueeze(-1) == ti.unsqueeze(-2)).any(-1).float().mean()
+                        tp = torch.softmax(teacher_lg.float(), dim=-1)
+                        sp = torch.softmax(student_lg.float(), dim=-1)
+                        teacher_ent = teacher_ent - (tp * tp.clamp_min(1e-12).log()).sum(-1).mean()
+                        student_ent = student_ent - (sp * sp.clamp_min(1e-12).log()).sum(-1).mean()
+                terms["proposal"] = loss_prop / C.DEPTH
+                metrics["proposal/dense_kl"] = float(dense_kl.detach()) / C.DEPTH
+                if self.proposal_hard_weight > 0.0:
+                    metrics["proposal/hard_nll"] = float(hard_nll.detach()) / C.DEPTH
+                metrics["proposal/topk_overlap"] = float(overlap) / C.DEPTH
+                metrics["proposal/teacher_entropy"] = float(teacher_ent) / C.DEPTH
+                metrics["proposal/student_entropy"] = float(student_ent) / C.DEPTH
+            elif self.proposal_mode == "sparse_ce":
+                loss_prop = zero
+                overlap, teacher_ent, student_ent = zero, zero, zero
+                for h in range(C.DEPTH):
+                    loss_h, student_lg = proposal_sparse_ce_loss(
+                        self.proposal, zs[h], window["lang"], src[h],
+                        temperature=self.proposal_temperature,
+                        detach_belief=self.proposal_detach_belief,
+                        return_student_logits=True,
+                    )
+                    loss_prop = loss_prop + loss_h
+                    with torch.no_grad():
+                        target = src[h].detach().float()
+                        ti = target.topk(C.TOPK, dim=-1).indices
+                        si = student_lg.float().topk(C.TOPK, dim=-1).indices
+                        overlap = overlap + (si.unsqueeze(-1) == ti.unsqueeze(-2)).any(-1).float().mean()
+                        student_p = torch.softmax(student_lg.float(), dim=-1)
+                        teacher_ent = teacher_ent - (
+                            target * target.clamp_min(1e-12).log()).sum(-1).mean()
+                        student_ent = student_ent - (
+                            student_p * student_p.clamp_min(1e-12).log()).sum(-1).mean()
+                terms["proposal"] = loss_prop / C.DEPTH
+                metrics["proposal/sparse_ce"] = float(loss_prop.detach()) / C.DEPTH
+                metrics["proposal/topk_overlap"] = float(overlap) / C.DEPTH
+                metrics["proposal/teacher_entropy"] = float(teacher_ent) / C.DEPTH
+                metrics["proposal/student_entropy"] = float(student_ent) / C.DEPTH
+            else:
+                lp = zero
+                for h in range(C.DEPTH):
+                    z_prop = zs[h].detach() if self.proposal_detach_belief else zs[h]
+                    lp = lp + self.proposal.log_prob(
+                        z_prop, window["lang"], src[h].detach()).mean()
+                terms["proposal"] = -lp / C.DEPTH
 
         # ── L_balance ──────────────────────────────────────────────────────
         if self._on("balance"):
@@ -1065,6 +1733,10 @@ def _to_device(window: dict, device: str, dtype=None) -> dict:
 
     out = dict(window)
     out["feats"] = [{k: _m(v) for k, v in f.items()} for f in window["feats"]]
+    if window.get("burn_in_feats") is not None:
+        out["burn_in_feats"] = [
+            {k: _m(v) for k, v in f.items()} for f in window["burn_in_feats"]
+        ]
     out["lang"] = _m(window["lang"])
     if window.get("actions") is not None:
         out["actions"] = _m(window["actions"])
@@ -1089,7 +1761,7 @@ class TrainState:
 
     model: nn.Module
     optimizer: Any
-    scheduler: CosineWithWarmup
+    scheduler: Any
     ema: Any
     sampler: Any
     #: spike-rejection reference. Optimizer state in every sense that matters:
@@ -1188,9 +1860,29 @@ def main(argv=None) -> int:
 
     rcfg, ocfg, dcfg = cfg["run"], cfg["optim"], cfg["data"]
     seed = int(rcfg.get("seed", 0))
-    steps = int(rcfg.get("steps", 1000))
+    direct_keys = ("schedule_horizon", "max_updates")
+    direct_formal = any(key in rcfg for key in direct_keys)
+    if direct_formal and not all(key in rcfg for key in direct_keys):
+        raise ValueError(
+            "direct-formal scheduling requires both run.schedule_horizon and "
+            "run.max_updates"
+        )
+    direct_schedule = DirectFormalSchedule.from_config(cfg) if direct_formal else None
+    if direct_schedule is not None:
+        steps = direct_schedule.max_updates
+        # ``run.steps`` remains in inherited configs and in generic reporting.
+        # It must name the execution cap, never a third conflicting horizon.
+        legacy_steps = int(rcfg.get("steps", steps))
+        if legacy_steps != steps:
+            raise ValueError(
+                "direct-formal run.steps must equal run.max_updates; the LR "
+                "horizon belongs only in run.schedule_horizon"
+            )
+    else:
+        steps = int(rcfg.get("steps", 1000))
     log_every = int(rcfg.get("log_every", 20))
     ckpt_every = int(rcfg.get("ckpt_every", 500))
+    chash = config_hash(cfg)
 
     rank = int(os.environ.get("RANK", 0))
     world = int(os.environ.get("WORLD_SIZE", 1))
@@ -1203,16 +1895,76 @@ def main(argv=None) -> int:
             torch.cuda.set_device(local_rank % torch.cuda.device_count())
         dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
 
+    # A formal fresh lineage may resume its own exact checkpoints, but it may
+    # never inherit an unrelated run merely because that directory has LATEST.
+    # Authenticate the empty first-link surface before rank 0 writes config.json.
+    fresh_lineage_required = bool(rcfg.get("fresh_start_required", False))
+    latest_checkpoint_step = ckpt_mod.latest_step(run_dir)
+    fresh_start = latest_checkpoint_step is None
+    fresh_error: str | None = None
+    if rank == 0 and fresh_lineage_required:
+        if fresh_start:
+            stale: list[str] = []
+            for name in ("metrics.jsonl", "HEARTBEAT", "STOP", "config.json"):
+                if (run_dir / name).exists():
+                    stale.append(name)
+            stale.extend(
+                path.name for path in sorted(run_dir.glob("ckpt_*_rank*.pt"))
+            )
+            if stale:
+                fresh_error = (
+                    "fresh_start_required refuses prior training state in "
+                    f"{run_dir}: {stale[:8]}"
+                )
+        else:
+            config_path = run_dir / "config.json"
+            try:
+                previous_cfg = json.loads(config_path.read_text())
+                previous_hash = config_hash(previous_cfg)
+            except Exception as error:  # noqa: BLE001
+                fresh_error = f"fresh formal resume config is unreadable: {error}"
+            else:
+                if previous_hash != chash:
+                    fresh_error = (
+                        "fresh formal resume config mismatch before load: "
+                        f"run directory {previous_hash}, current {chash}"
+                    )
+    if world > 1:
+        payload_error = [fresh_error]
+        dist.broadcast_object_list(payload_error, src=0)
+        fresh_error = payload_error[0]
+    if fresh_error is not None:
+        raise RuntimeError(fresh_error)
+
     if rcfg.get("deterministic"):
         enable_determinism()
     set_global_seed(seed, rank)
     assert_ranks_distinct(rank_identity(seed, rank, local_rank, world))
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    chash = config_hash(cfg)
+    lineage_receipt = {
+        "kind": "loom-fresh-training-lineage-v1",
+        "fresh_start_required": fresh_lineage_required,
+        "config_hash": chash,
+        "seed": seed,
+        "world_size": world,
+        "act_decode_from": cfg.get("losses", {}).get("act", {}).get(
+            "decode_from", "q_action"
+        ),
+        "schedule_horizon": (
+            direct_schedule.schedule_horizon
+            if direct_schedule is not None else steps
+        ),
+        "max_updates": steps,
+    }
     if rank == 0:
         (run_dir / "config.json").write_text(json.dumps(cfg, indent=2, default=str))
-        print(f"[rank0] run={rcfg.get('name')} config_hash={chash} steps={steps} "
+        schedule_text = (
+            f" schedule_horizon={direct_schedule.schedule_horizon}"
+            if direct_schedule is not None else ""
+        )
+        print(f"[rank0] run={rcfg.get('name')} config_hash={chash} "
+              f"max_updates={steps}{schedule_text} fresh_start={int(fresh_start)} "
               f"world={world} device={device}", flush=True)
 
     # ── model ──────────────────────────────────────────────────────────────
@@ -1242,9 +1994,19 @@ def main(argv=None) -> int:
         lr_scales=lr_scales,
         module_names=MODULE_NAMES + ("ema",),
     )
-    sched = CosineWithWarmup(float(ocfg.get("lr", 3e-4)),
-                             int(ocfg.get("warmup", 2000)), steps,
-                             float(ocfg.get("min_lr_ratio", 0.05)))
+    configured_opt_groups = _optimizer_group_config(opt)
+    reset_state_modules = _optimizer_state_reset_modules(
+        opt, ocfg.get("reset_state_modules", [])
+    )
+    sched = (
+        direct_schedule
+        if direct_schedule is not None else
+        CosineWithWarmup(
+            float(ocfg.get("lr", 3e-4)), int(ocfg.get("warmup", 2000)), steps,
+            float(ocfg.get("min_lr_ratio", 0.05)),
+        )
+    )
+    configured_scheduler = sched.state_dict().copy()
     if rank == 0:
         log_shm_headroom(cfg)
     sampler = build_sampler(cfg, rank, world, seed, "cpu")
@@ -1255,6 +2017,9 @@ def main(argv=None) -> int:
                        warmup=int(ocfg.get("spike_warmup", 100)))
     state = TrainState(model=model, optimizer=opt, scheduler=sched, ema=model.ema,
                        sampler=sampler, guard=spike)
+    if rank == 0 and not model.update_ema:
+        print("[rank0] EMA updates OFF: online and target estimator coordinates "
+              "remain checkpoint-exact", flush=True)
     if rank == 0 and spike.enabled:
         print(f"[rank0] spike guard ON: skip when gnorm > {spike.mult}x the "
               f"running geometric mean (beta={spike.beta}, warmup={spike.warmup})",
@@ -1271,17 +2036,139 @@ def main(argv=None) -> int:
     model.check_bf16 = amp
 
     # ── resume ─────────────────────────────────────────────────────────────
+    payload: dict[str, Any] | None = None
     with fsdp_mod.sharded_state_dict(model):
         payload = ckpt_mod.load_latest(run_dir, map_location=device,
                                        allow_reshard=link["allow_reshard"])
         if payload is not None:
+            if fresh_lineage_required:
+                if payload.get("config_hash") != chash:
+                    raise RuntimeError(
+                        "fresh formal resume config mismatch: checkpoint "
+                        f"{payload.get('config_hash')!r}, current {chash!r}"
+                    )
+                if payload.get("fresh_lineage") != lineage_receipt:
+                    raise RuntimeError(
+                        "fresh formal resume lineage receipt is absent or changed"
+                    )
             got = ckpt_mod.restore(payload, state, world_size=world)
+            # torch.optim serialises group hyperparameters alongside moments,
+            # and this scheduler serialises its whole (stateless) recipe.
+            # Reapply current config after restoring state; otherwise a tuning
+            # continuation that requests proposal=0.3x / 32k silently executes
+            # the checkpoint's old proposal=1.0x / 60k recipe.
+            _reapply_optimizer_group_config(opt, configured_opt_groups)
+            sched.load_state_dict(configured_scheduler)
+            parameter_reset = _reset_parameters_for_config_transition(
+                model, ocfg.get("transition_parameter_reset"),
+                checkpoint_config_hash=got["config_hash"],
+                current_config_hash=chash,
+            )
+            if parameter_reset is not None:
+                detail = ", ".join(
+                    f"{name}={count}" for name, count in parameter_reset.items()
+                )
+                print(
+                    f"[rank{rank}] reset parameter values for config transition "
+                    f"({detail} tensor elements zeroed)", flush=True,
+                )
+            reset_counts = _reset_optimizer_state_for_config_transition(
+                opt, reset_state_modules,
+                checkpoint_config_hash=got["config_hash"],
+                current_config_hash=chash,
+            )
+            if reset_counts is not None:
+                detail = ", ".join(
+                    f"{name}={count}" for name, count in reset_counts.items()
+                )
+                print(
+                    f"[rank{rank}] reset optimizer state for config transition "
+                    f"({detail} parameter states cleared)", flush=True,
+                )
             if got["config_hash"] and got["config_hash"] != chash:
                 print(f"[rank{rank}] WARNING config_hash changed "
                       f"{got['config_hash']} -> {chash}; this is a different "
                       f"experiment resuming into the same run dir", flush=True)
             print(f"[rank{rank}] resumed at step {state.global_step} "
                   f"(git {got['git_sha'][:8]})", flush=True)
+
+    resumed = payload is not None
+    if direct_formal:
+        local_resume_error = ""
+        if latest_checkpoint_step is not None and payload is None:
+            local_resume_error = (
+                f"LATEST points at step {latest_checkpoint_step} but no local "
+                "checkpoint payload was loaded"
+            )
+        elif payload is not None:
+            payload_step = payload.get("global_step")
+            if (
+                not isinstance(payload_step, int)
+                or isinstance(payload_step, bool)
+                or payload_step != latest_checkpoint_step
+                or state.global_step != latest_checkpoint_step
+            ):
+                local_resume_error = (
+                    "formal checkpoint/LATEST step mismatch: "
+                    f"LATEST={latest_checkpoint_step!r}, "
+                    f"payload={payload_step!r}, state={state.global_step!r}"
+                )
+        if world > 1:
+            resume_errors: list[str | None] = [None] * world
+            dist.all_gather_object(resume_errors, local_resume_error)
+            local_resume_error = "; ".join(
+                f"rank{index}: {error}"
+                for index, error in enumerate(resume_errors) if error
+            )
+        if local_resume_error:
+            raise RuntimeError(
+                "direct-formal checkpoint resume authentication failed: "
+                + local_resume_error
+            )
+
+    # A hard crash can leave line-buffered metrics ahead of the pointer-last
+    # checkpoint. Reconcile before W&B initialization and before opening the
+    # ledger for append, so a repeated update can never create duplicate steps.
+    if direct_formal and resumed:
+        reconciliation_packet: dict[str, Any] | None = None
+        if rank == 0:
+            try:
+                assert payload is not None
+                checkpoint_identity = {
+                    "format": "loom-direct-formal-checkpoint-identity-v1",
+                    "latest_step": latest_checkpoint_step,
+                    "payload_global_step": payload.get("global_step"),
+                    "config_hash": payload.get("config_hash"),
+                    "git_sha": payload.get("git_sha"),
+                    "world_size": payload.get("world_size"),
+                    "fresh_lineage": payload.get("fresh_lineage"),
+                }
+                result = _reconcile_direct_formal_metrics(
+                    run_dir,
+                    checkpoint_step=state.global_step,
+                    checkpoint_identity=checkpoint_identity,
+                )
+                reconciliation_packet = {"result": result}
+            except Exception as error:  # noqa: BLE001
+                reconciliation_packet = {
+                    "error": f"{type(error).__name__}: {error}",
+                }
+        if world > 1:
+            reconciliation_box = [reconciliation_packet]
+            dist.broadcast_object_list(reconciliation_box, src=0)
+            reconciliation_packet = reconciliation_box[0]
+        assert reconciliation_packet is not None
+        if "error" in reconciliation_packet:
+            raise RuntimeError(
+                "direct-formal metrics resume reconciliation failed: "
+                f"{reconciliation_packet['error']}"
+            )
+        if rank == 0 and reconciliation_packet["result"]["action"] == "ROLLBACK":
+            print(
+                "[rank0] direct-formal metrics crash tail quarantined and "
+                f"rolled back to step {state.global_step}",
+                flush=True,
+            )
 
     # ── logging ────────────────────────────────────────────────────────────
     run = None if link["no_wandb"] else wandb_util.init(
@@ -1298,6 +2185,7 @@ def main(argv=None) -> int:
     grad_report = bool(ocfg.get("grad_report", True))
     probe_every = int(ocfg.get("grad_probe_every", GRAD_PROBE_EVERY))
     t0, last_delta, last_sel = time.time(), float("nan"), float("nan")
+    direct_terminal_status: str | None = None
 
     def _save(step: int, stop_reason: str = "") -> None:
         # stop_reason rides in the payload so a chain of 38 links can be triaged
@@ -1305,14 +2193,90 @@ def main(argv=None) -> int:
         # "budget" is the link running out of its own clock, "sentinel" is a
         # human, "" is a periodic save. A run that keeps stopping for "budget"
         # near step 0 is a startup that got slower, not a preemption problem.
+        # For a formal run the metrics prefix is part of the checkpoint's
+        # decision evidence. Make it durable before LATEST can advance; a rank-0
+        # I/O error is broadcast before any rank enters the checkpoint barriers.
+        if direct_formal:
+            durability_packet: dict[str, str] = {}
+            if rank == 0:
+                try:
+                    assert metrics_fp is not None
+                    metrics_fp.flush()
+                    os.fsync(metrics_fp.fileno())
+                except Exception as error:  # noqa: BLE001
+                    durability_packet = {
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+            if world > 1:
+                durability_box = [durability_packet]
+                dist.broadcast_object_list(durability_box, src=0)
+                durability_packet = durability_box[0]
+            if "error" in durability_packet:
+                raise RuntimeError(
+                    "direct-formal metrics durability failed before checkpoint: "
+                    f"{durability_packet['error']}"
+                )
+
+        checkpoint_extra = {"stop_reason": stop_reason}
+        if fresh_lineage_required:
+            checkpoint_extra["fresh_lineage"] = lineage_receipt
         with fsdp_mod.sharded_state_dict(model):
             ckpt_mod.save(
                 ckpt_mod.build_state(state, config_hash=chash, world_size=world,
                                      wandb_run_id=wandb_util.stable_run_id(run_dir),
-                                     extra={"stop_reason": stop_reason}),
+                                     extra=checkpoint_extra),
                 run_dir, step, keep_last=int(rcfg.get("keep_last", 3)))
 
-    while state.global_step < stop_at:
+    def _direct_formal_decision(step: int) -> dict[str, Any]:
+        """Evaluate/publish one fixed boundary with collective-safe errors."""
+        packet: dict[str, Any] | None = None
+        if rank == 0:
+            try:
+                assert metrics_fp is not None
+                metrics_fp.flush()
+                os.fsync(metrics_fp.fileno())
+                rows = [
+                    json.loads(line)
+                    for line in (run_dir / "metrics.jsonl").read_text().splitlines()
+                    if line.strip()
+                ]
+                receipt = evaluate_direct_formal(rows, current_step=step)
+                receipt.update({
+                    "config_hash": chash,
+                    "fresh_lineage": lineage_receipt,
+                })
+                encoded = json.dumps(
+                    receipt, sort_keys=True, separators=(",", ":"),
+                ) + "\n"
+                target = run_dir / f"direct_formal_{step:09d}.json"
+                _exclusive_publish_bytes(target, encoded.encode("utf-8"))
+                # Return the immutable published object on replay rather than a
+                # second in-memory copy. Byte equality above authenticates it.
+                packet = {"receipt": json.loads(target.read_text())}
+            except Exception as error:  # noqa: BLE001
+                packet = {"error": f"{type(error).__name__}: {error}"}
+        if world > 1:
+            gathered = [packet]
+            dist.broadcast_object_list(gathered, src=0)
+            packet = gathered[0]
+        assert packet is not None
+        if "error" in packet:
+            raise RuntimeError(f"direct-formal boundary failed: {packet['error']}")
+        return packet["receipt"]
+
+    if direct_formal and resumed and should_evaluate_direct_formal(state.global_step):
+        decision = _direct_formal_decision(state.global_step)
+        status = str(decision["status"])
+        if rank == 0:
+            print(
+                f"[rank0] direct-formal replay step={state.global_step} "
+                f"status={status} reason={decision.get('reason')}",
+                flush=True,
+            )
+        if status in ("PASS", "ABORT", "INVALID"):
+            direct_terminal_status = status
+
+    while direct_terminal_status is None and state.global_step < stop_at:
         step = state.global_step
         set_step_seed(seed, step, rank)
         is_frozen = freeze.apply(model, step, trainable)
@@ -1350,7 +2314,7 @@ def main(argv=None) -> int:
             skipped = state.guard.check(gnorm)
             if not skipped:
                 opt.step()
-        state.ema.update(model.estimator)
+        model.update_target()
 
         state.global_step += 1
         state.samples_seen += batch * world
@@ -1397,6 +2361,18 @@ def main(argv=None) -> int:
         stop = guard.should_stop()
         if stop or state.global_step % ckpt_every == 0 or state.global_step >= stop_at:
             _save(state.global_step, guard.reason if stop else "")
+        if direct_formal and should_evaluate_direct_formal(state.global_step):
+            decision = _direct_formal_decision(state.global_step)
+            status = str(decision["status"])
+            if rank == 0:
+                print(
+                    f"[rank0] direct-formal step={state.global_step} "
+                    f"status={status} reason={decision.get('reason')}",
+                    flush=True,
+                )
+            if status in ("PASS", "ABORT", "INVALID"):
+                direct_terminal_status = status
+                break
         if stop:
             print(f"[rank{rank}] stopping at {state.global_step} ({guard.reason})",
                   flush=True)
@@ -1406,6 +2382,10 @@ def main(argv=None) -> int:
         metrics_fp.close()
     wandb_util.finish(run)
     print(f"[rank{rank}] exit at {state.global_step}/{steps}", flush=True)
+    if direct_terminal_status == "INVALID":
+        return 2
+    if direct_terminal_status == "ABORT":
+        return 3
     return 0
 
 

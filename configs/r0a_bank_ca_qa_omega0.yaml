@@ -1,0 +1,18 @@
+# Iteration 3a-QA-omega0: identity-centred operator-bank contingency.
+#
+# Restart from the verified deploy step-49,666 shards, never from a rejected QA
+# state.  This changes exactly one method coordinate: on the authenticated
+# deploy-to-this-config transition, zero the bank's trainable rotation angles.
+# Keep its inherited per-channel radii and biases, and keep the complete QA
+# objective, module routing, data, schedule, convergence, and promotion gates.
+
+extends: r0a_bank_ca_qa.yaml
+
+run:
+  name: r0a_bank_ca_qa_omega0
+
+optim:
+  transition_parameter_reset:
+    source_config_hash: a199324a6205bb6d
+    tensors:
+      bank.omega: zero

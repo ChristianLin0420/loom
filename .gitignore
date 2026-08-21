@@ -235,3 +235,6 @@ outputs/
 # are not reported. Only a top-level dataset dir should be ignored here.
 /data/
 .triton_cache*/
+# Local Claude worktrees contain independent Git state plus multi-gigabyte
+# checkpoints/logs. They are execution scratch space, never repository source.
+.claude/

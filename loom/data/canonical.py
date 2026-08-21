@@ -253,7 +253,12 @@ def resample_actions(
 
 
 def to_env_rate(
-    a_seg: np.ndarray, embodiment: str, n_env_steps: int, src_fps: float | None = None
+    a_seg: np.ndarray,
+    embodiment: str,
+    n_env_steps: int,
+    src_fps: float | None = None,
+    *,
+    duration_normalized: bool = False,
 ) -> np.ndarray:
     """Canonical decoder output -> environment control rate. The eval-side inverse.
 
@@ -261,11 +266,27 @@ def to_env_rate(
     environment steps this segment covers (fractional accumulator, see
     ``contracts.env_steps_per_segment`` — rounding each segment independently
     drifts by a full second over a 600-step episode).
+
+    By default the destination bins remain fixed at the environment's physical
+    control rate.  A short fractional-clock chunk can therefore cover slightly
+    less time than the source segment (LIBERO's 5-step chunk covers 7.5 of the
+    8 canonical action intervals).  ``duration_normalized=True`` instead maps
+    the complete source-segment duration onto exactly ``n_env_steps`` bins.  It
+    still delegates to :func:`resample_actions`, so DELTA dimensions preserve
+    their full integral and HOLD dimensions remain zero-order held.
     """
     spec = EMBODIMENTS[embodiment]
     dst = float(spec.env_fps) if src_fps is None else float(src_fps)
+    a = np.asarray(a_seg)
+    if duration_normalized and n_env_steps > 0 and a.ndim == 2 and a.shape[0] > 0:
+        # A synthetic destination rate is just a compact way to make the final
+        # destination edge coincide with the final source edge:
+        #   n_env_steps / dst == len(a_seg) / FPS_CANONICAL.
+        # The actual env rate still owns SegmentClock and therefore the number
+        # of bins; this changes only how the source segment fills those bins.
+        dst = float(n_env_steps) * FPS_CANONICAL / float(a.shape[0])
     return resample_actions(
-        np.asarray(a_seg), FPS_CANONICAL, dst, action_semantics(embodiment), n_dst=n_env_steps
+        a, FPS_CANONICAL, dst, action_semantics(embodiment), n_dst=n_env_steps
     )
 
 

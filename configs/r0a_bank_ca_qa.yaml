@@ -1,0 +1,84 @@
+# Iteration 3a-QA: jointly fit the action-labelled code and operator bank.
+#
+# Restart from every verified r0a_deploy_s1 step-49,666 shard, never from the
+# rejected bank-only or N4 states.  This changes one method edge: the existing
+# action-anchored L_dyn may update q_action instead of consuming detached c_a.
+# Keep the existing weight-1 frozen-decoder half of L_act active: it is the
+# repository's semantic anchor for q_action and prevents L_dyn from learning a
+# bank-convenient code that the frozen realizer cannot execute. The stronger N4
+# hinge and every data/schedule/statistical setting otherwise remain fixed.
+
+extends: r0a_bank_ca_n4.yaml
+
+run:
+  name: r0a_bank_ca_qa
+
+optim:
+  # Both modules enter a new objective at the seed-hash transition. Same-hash
+  # requeues retain the moments accumulated by this joint stage.
+  reset_state_modules: [bank, q_action]
+  lr_scales:
+    # The ordinary head scale; the bank retains its inherited pole-safe 0.1.
+    q_action: 1.0
+
+losses:
+  dyn:
+    detach_coeff: false
+  act:
+    enabled: true
+    weight: 1.0
+    align_to: q_a
+    decode_from: q_action
+
+train_modules: [bank, q_action]
+
+# Both the operator fit and the action-realization anchor must settle. Under
+# align_to=q_a the q_delta alignment half is detached from q_action; with
+# q_delta frozen it is diagnostic only, while act/decode is the live
+# preservation gradient through the frozen decoder into q_action.
+convergence:
+  primary: [loss/dyn, act/decode]
+  watch: [dyn/pos, dyn/neg, delta_op, delta_sel/h1, delta_sel/h2,
+          delta_sel/h3, delta_sel/h4, act/align, act/c_a_spread, grad_norm]
+
+# Stability is not permission for the action code to get worse. As in the B4
+# stage, check this config-hashed efficacy condition after the full convergence
+# window and before the held-out promotion gate.
+efficacy_gate:
+  metric: act/decode
+  reference: first_post_start_block
+  comparison: final_convergence_block
+  max_relative_worsening: 0.0
+  required: true
+
+# Fixed early rejection, evaluated externally from contiguous metrics rows.
+# start_exclusive/end_inclusive means exactly updates 50,667 through 52,666.
+liveness_gate:
+  start_exclusive: 50666
+  end_inclusive: 52666
+  rows: 2000
+  requirements:
+    delta_op_median_strict_gt: 0.01
+    gnorm_bank_median_strict_gt: 1.0e-4
+    gnorm_q_action_median_strict_gt: 1.0e-4
+    skipped_rate_strict_lt: 0.01
+    unexpected_module_gradients: false
+    nonfinite: false
+  required: true
+
+# Moving q_action can make the learned bank discriminative while silently
+# breaking the frozen proposal/decoder coefficient convention.  Reuse the
+# downstream oracle's exact residual threshold on the same 32 proposal roots,
+# with one common decoder-noise draw per held-out window.
+offline_gate:
+  preservation:
+    reference_checkpoint_sha256: 15f286c268caa5327d5aa3abf1f67ebd0555c426a509fef22cb7f537bf6ab4e1
+    reference_config_hash: a199324a6205bb6d
+    reference_global_step: 49666
+    action_decode_improvement_ci_low: 0.0
+    # The joint objective has no proposal term. Preserve support agreement up
+    # to a predeclared five-point non-inferiority margin rather than demanding
+    # statistically significant improvement from a signal the stage never sees.
+    proposal_support_overlap_change_ci_low: -0.05
+    q_action_residual_max: 0.5
+    max_root_exhaustion_rate: 0.01

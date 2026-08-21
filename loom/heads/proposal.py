@@ -69,6 +69,8 @@ __all__ = [
     "pl_log_prob",
     "canonical_order",
     "weights_from_logits",
+    "argmax_coeff",
+    "argmax_coeff_dense_st",
     "gumbel_topk",
 ]
 
@@ -124,6 +126,87 @@ def weights_from_logits(logits: Tensor, idx: Tensor, m: int = M) -> Tensor:
     w = torch.softmax(sel.to(acc), dim=-1).to(logits.dtype)
     c = torch.zeros(*idx.shape[:-1], m, device=logits.device, dtype=logits.dtype)
     return c.scatter(-1, idx, w)
+
+
+class _ExactForwardSTE(torch.autograd.Function):
+    """Return ``hard`` bit-for-bit; backpropagate through hard and soft paths."""
+
+    @staticmethod
+    def forward(ctx, hard: Tensor, soft: Tensor) -> Tensor:  # noqa: ARG004
+        return hard.clone()
+
+    @staticmethod
+    def backward(ctx, grad: Tensor) -> tuple[Tensor, Tensor]:  # noqa: ARG004
+        return grad, grad
+
+
+class _ExactForwardDenseSTE(torch.autograd.Function):
+    """Return ``hard`` bit-for-bit; backpropagate through ``soft`` only."""
+
+    @staticmethod
+    def forward(ctx, hard: Tensor, soft: Tensor) -> Tensor:  # noqa: ARG004
+        return hard.clone()
+
+    @staticmethod
+    def backward(ctx, grad: Tensor) -> tuple[None, Tensor]:  # noqa: ARG004
+        return None, grad
+
+
+def argmax_coeff(
+    logits: Tensor,
+    topk: int = TOPK,
+    m: int | None = None,
+    *,
+    straight_through: bool = False,
+) -> Tensor:
+    """Exact deployed top-k coefficient, optionally with a dense STE gradient.
+
+    Support is selected from raw logits and selected weights are computed in
+    fp32 by :func:`weights_from_logits`, exactly as at deployment. Taking top-k
+    after a bf16 softmax can change near-tied support, and renormalising selected
+    probabilities in bf16 can move weights by an ulp, so neither is adequate for
+    a train/deploy exposure correction.
+
+    With ``straight_through=True`` the value remains bit-identical to the hard
+    path. For compatibility with existing deploy-refinement runs, its backward
+    is the historical hybrid of the restricted-support hard Jacobian and the
+    dense full-softmax Jacobian. New methods that require the standard
+    dense-only estimator must use :func:`argmax_coeff_dense_st`.
+    """
+    width = logits.shape[-1] if m is None else int(m)
+    if width != logits.shape[-1]:
+        raise ValueError(f"m={width} but logits end in {logits.shape[-1]}")
+    if not 1 <= topk <= width:
+        raise ValueError(f"topk must be in [1, {width}], got {topk}")
+    idx = logits.topk(topk, dim=-1).indices
+    hard = weights_from_logits(logits, idx, width)
+    if not straight_through:
+        return hard
+    soft = torch.softmax(logits.float(), dim=-1).to(logits.dtype)
+    return _ExactForwardSTE.apply(hard, soft)
+
+
+def argmax_coeff_dense_st(
+    logits: Tensor,
+    topk: int = TOPK,
+    m: int | None = None,
+) -> Tensor:
+    """Exact deployed forward coefficient with a dense-only softmax VJP.
+
+    This is the bit-exact custom-autograd form of the standard
+    ``hard.detach() + soft - soft.detach()`` estimator. Writing that expression
+    literally can perturb a bf16 hard value through add/subtract rounding; the
+    custom forward clones ``hard`` instead, while the backward is exactly the
+    full-softmax Jacobian and has no restricted-support hard-path contribution.
+
+    The legacy :func:`argmax_coeff` ``straight_through=True`` path is intentionally
+    unchanged because existing ``decode_from: proposal`` recipes already use its
+    hybrid VJP. New dual-code R0-A uses this explicit dense-only primitive.
+    """
+    width = logits.shape[-1] if m is None else int(m)
+    hard = argmax_coeff(logits, topk, width, straight_through=False)
+    soft = torch.softmax(logits.float(), dim=-1).to(logits.dtype)
+    return _ExactForwardDenseSTE.apply(hard.detach(), soft)
 
 
 def gumbel_topk(
@@ -352,9 +435,13 @@ class Proposal(nn.Module):
         greedy sequential argmax picks the largest remaining logit at every
         step, which is exactly the unperturbed top-`k`.
         """
-        logits = self.logits(z, lang)
-        idx = logits.topk(self.topk, dim=-1).indices
-        return weights_from_logits(logits, idx, self.m)
+        return argmax_coeff(self.logits(z, lang), self.topk, self.m)
+
+    def argmax_st(self, z: Tensor, lang: Tensor) -> Tensor:
+        """Deployed value with the legacy hard-plus-dense straight-through VJP."""
+        return argmax_coeff(
+            self.logits(z, lang), self.topk, self.m, straight_through=True,
+        )
 
     # ── misc ──────────────────────────────────────────────────────────────
 

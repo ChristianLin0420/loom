@@ -1,0 +1,103 @@
+# Formal fresh R0-A dual-code run.
+#
+# All six LOOM policy modules start from random initialization.  The cached
+# SigLIP vision/language tower remains frozen and outside the optimizer.  This
+# is a single direct formal lineage: no outcome reward, GRPO/PA, search, pilot,
+# or checkpoint selection by evaluation success.
+
+extends: r0a_dual_code.yaml
+
+run:
+  name: r0a_dualcode_fresh_s0_20260820
+  project: loom-r0-e2e-scratch
+  seed: 0
+  # Generic tooling still reads run.steps as the execution cap.  The direct
+  # trainer exclusively uses schedule_horizon for cosine decay and max_updates
+  # for termination; these values are authenticated on every resume.
+  steps: 40000
+  schedule_horizon: 32000
+  max_updates: 40000
+  fresh_start_required: true
+  require_online_wandb: true
+  log_every: 20
+  ckpt_every: 500
+  # The terminal convergence pass can select the first passing 500-step
+  # checkpoint between 32k and 40k after the extension completes.
+  keep_last: 20
+
+model:
+  use_stubs: false
+
+losses:
+  act:
+    enabled: true
+    weight: 1.0
+    align_to: q_a
+    decode_from: dual_q_action_proposal
+
+train_modules: [estimator, bank, q_delta, q_action, decoder, proposal]
+
+# This block is provenance for the code-owned DirectFormalGate.  The formal
+# launcher requires exact equality; changing any value creates a new method.
+direct_formal:
+  format: loom-direct-formal-convergence-v1
+  first_check: 32000
+  check_every: 500
+  hard_cap: 40000
+  block_size: 2000
+  block_count: 4
+  tolerance: 0.02
+  reference_window: {start_exclusive: 30000, end_inclusive: 32000}
+  primary:
+    [loss/dyn, act/decode_teacher, act/decode_deploy, act/align, loss/proposal]
+  health:
+    delta_op_strict_gt: 0.01
+    delta_sel_h1_to_h4_strict_gt: 0.0
+    act_align_strict_lt: 0.50
+    live_ops_q_a_gte: 16
+    live_ops_q_delta_gte: 16
+    proposal_ce_strict_lt: 4.802030263919617
+    c_delta_spread_strict_gt: 0.10
+    gnorm_bank_strict_gt: 1.0e-4
+    gnorm_q_delta_strict_gt: 1.0e-4
+    other_trainable_gnorm_strict_gt: 0.0
+    skipped_rate_strict_lt: 0.01
+    unexpected_module_gradients: false
+    nonfinite: false
+  no_convergence_by_hard_cap: ABORT_NO_EVALUATION
+
+evaluation_gate:
+  seeds: [0, 1, 2]
+  tasks_per_suite: 10
+  trials_per_task: 10
+  total_episodes: 1200
+  internal_baseline_successes: 447
+  internal_baseline_episodes: 1200
+  paired_task_bootstrap_ci_low_strict_gt: 0.0
+  seed0_stretch_successes_gte: 164
+  suite_floor_percent: [35.0, 27.0, 43.0, 24.0]
+  canonical_baseline:
+    kind: r0a_deploy_seeded1200_v2_exact_baseline
+    checkpoint_step: 49666
+    successes: 447
+    episodes: 1200
+    seed_result_sha256:
+      "0": 95e3ac186c28a6305f5fff3375b45c5184697a0a94f7c08c511ab0d09fd27f3a
+      "1": 1206ede3fae1c81d5d38f0d0c6cc1c3fe0fde97683a1733c4d44c6f25fea90c4
+      "2": 83a7396bc305f43e5ec9ea77bbfa987aa3dd8381eb6525426856a1b26cf4fd56
+  paired_task_bootstrap:
+    kind: fixed_suite_stratified_task_resample_matrix_v1
+    samples: 10000
+    seed: 49666
+    confidence: 0.95
+    lower_quantile: 0.025
+    upper_quantile: 0.975
+    lower_interpolation: lower
+    upper_interpolation: higher
+    matrix_sha256: 1e570b6d13426c8fbd58016d0fba6869dc18aa3151dfdbc0bab357373cacf32e
+
+slurm:
+  nodes: 2
+  gpus_per_node: 8
+  n_links: 3
+  extension_links: 1

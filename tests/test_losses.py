@@ -26,7 +26,9 @@ from loom.losses.dyn import (
     NEGATIVE_MODES, DynLoss, EmaEstimator, dyn_loss, ema_update,
     ln_cosine_distance, sample_within_trajectory_negatives, sequential_rollout,
 )
-from loom.losses.proposal_bc import proposal_bc_loss
+from loom.losses.proposal_bc import (
+    proposal_bc_loss, proposal_distill_loss, proposal_sparse_ce_loss,
+)
 
 torch.manual_seed(0)
 
@@ -684,6 +686,60 @@ def test_proposal_bc_rejects_a_batch_mismatch():
     with pytest.raises(ValueError):
         proposal_bc_loss(S.StubProposal(), belief(4), torch.randn(4, 16, 1152),
                          S.sparse_simplex(3))
+
+
+class _DenseProposal(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.bias = nn.Parameter(torch.zeros(C.M))
+
+    def logits(self, z, lang):
+        return self.bias.unsqueeze(0).expand(z.shape[0], -1) + z.mean((1, 2)).unsqueeze(-1)
+
+
+def test_proposal_dense_distillation_is_smooth_and_stops_teacher_and_belief():
+    p = _DenseProposal()
+    z = belief(4).requires_grad_(True)
+    teacher = torch.randn(4, C.M, requires_grad=True)
+    loss = proposal_distill_loss(
+        p, z, torch.randn(4, 16, 1152), teacher,
+        temperature=1.5, detach_belief=True,
+    )
+    assert loss.ndim == 0 and torch.isfinite(loss) and loss.item() >= -1e-6
+    loss.backward()
+    assert p.bias.grad is not None and p.bias.grad.abs().sum() > 0
+    assert teacher.grad is None
+    assert z.grad is None
+
+
+def test_proposal_dense_distillation_matches_teacher_and_validates_temperature():
+    p = _DenseProposal()
+    z, lang = belief(3), torch.randn(3, 16, 1152)
+    teacher = p.logits(z, lang).detach()
+    assert proposal_distill_loss(p, z, lang, teacher).item() == pytest.approx(0.0, abs=1e-6)
+    with pytest.raises(ValueError, match="temperature"):
+        proposal_distill_loss(p, z, lang, teacher, temperature=0.0)
+
+
+def test_proposal_sparse_ce_matches_weighted_topk_target_and_detaches_inputs():
+    p = _DenseProposal()
+    with torch.no_grad():
+        p.bias.copy_(torch.linspace(-1.0, 1.0, C.M))
+    z = belief(2).requires_grad_(True)
+    target = torch.zeros(2, C.M)
+    target[0, [3, 7, 11, 15]] = torch.tensor([0.4, 0.3, 0.2, 0.1])
+    target[1, [2, 6, 10, 14]] = torch.tensor([0.1, 0.2, 0.3, 0.4])
+    target.requires_grad_(True)
+
+    loss = proposal_sparse_ce_loss(
+        p, z, torch.randn(2, 16, 1152), target, detach_belief=True,
+    )
+    expected = -(target.detach() * p.bias.log_softmax(-1)).sum(-1).mean()
+    assert float(loss.detach()) == pytest.approx(float(expected.detach()), rel=1e-6)
+    loss.backward()
+    assert p.bias.grad is not None and p.bias.grad.abs().sum() > 0
+    assert z.grad is None
+    assert target.grad is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -1,0 +1,175 @@
+# Iteration 4: fixed-behaviour terminal-outcome GRPO on the deployed proposal.
+# Six immutable recovery folds provide terminal rewards; authenticated LIBERO
+# train demonstrations provide the existing sparse q_action semantic anchor.
+
+extends: r0a_deploy.yaml
+
+run:
+  name: r0a_outcome_grpo
+  # Absolute schedule horizon. The bounded stage itself ends at 54,466.
+  steps: 80000
+  deterministic: true
+  log_every: 20
+  ckpt_every: 200
+  keep_last: 0
+  wandb_mode: online
+
+data:
+  source: libero
+  embodiments: [libero_franka]
+  batch_per_gpu: 8
+  action_free: false
+  sampling: uniform_task
+  trajectory_split: train
+  holdout_demo_keys: [demo_49]
+  recurrent_burn_in: 4
+
+optim:
+  lr: 3.0e-4
+  warmup: 2000
+  min_lr_ratio: 0.05
+  grad_clip: 1.0
+  betas: [0.9, 0.95]
+  weight_decay: 0.05
+  eps: 1.0e-8
+  lr_scales:
+    proposal: 0.05
+  reset_state_modules: [proposal]
+  update_ema: false
+
+losses:
+  dyn:       {enabled: false, weight: 0.0}
+  act:       {enabled: false, weight: 0.0}
+  potential: {enabled: false, weight: 0.0}
+  grpo:
+    enabled: true
+    weight: 1.0
+    group: 8
+    clip_eps: 0.2
+    reward: terminal_libero_success_only
+    baseline_arms: [0, 1, 2, 3, 4, 5, 6, 7]
+    ratio_arms: [1, 2, 3, 4, 5, 6, 7]
+  proposal:
+    enabled: true
+    weight: 1.0
+    mode: sparse_ce
+    temperature: 1.0
+    detach_belief: true
+  balance:
+    enabled: true
+    weight: 1.0e-2
+    source: proposal
+
+train_modules: [proposal]
+
+fsdp:
+  shard: []
+  replicate: [proposal]
+  activation_checkpointing: false
+
+outcome_grpo:
+  format_version: 1
+  seed_checkpoint: runs/r0a_deploy_s1_eval/ckpt_000049666.pt
+  seed_global_step: 49666
+  seed_config_hash: a199324a6205bb6d
+  seed_checkpoint_sha256: 15f286c268caa5327d5aa3abf1f67ebd0555c426a509fef22cb7f537bf6ab4e1
+  start_step: 49666
+  stop_step: 54466
+  updates_per_fold: 800
+  schedule_steps: 80000
+  world_size: 8
+  contexts_per_arm: 2
+  groups_per_train_fold: 200
+  validation_groups: 400
+  validation_tasks: 40
+  informative_training_groups: only
+  minimum_informative_groups_per_fold: 100
+  minimum_validation_informative_groups: 200
+  authentication:
+    chunk_replans: 32
+    proposal_scoring_batch_size: 1
+    proposal_scoring_dtype: float32
+    proposal_scoring_autocast: false
+    cuda_matmul_tf32: false
+    cudnn_tf32: false
+    float32_matmul_precision: highest
+    proposal_scoring_module_mode: eval
+    behaviour_logprob_atol: 0.0
+    behaviour_logprob_rtol: 0.0
+    behaviour_coeff_atol: 0.0
+    behaviour_coeff_rtol: 0.0
+    identity_max_abs_logratio: 0.0
+    identity_max_coeff_error: 0.0
+    initial_ratio_min_ess_fraction: 1.0
+  folds:
+    - {split: train0, path: runs/outcome_recovery_s49666_train0}
+    - {split: train1, path: runs/outcome_recovery_s49666_train1}
+    - {split: train2, path: runs/outcome_recovery_s49666_train2}
+    - {split: train3, path: runs/outcome_recovery_s49666_train3}
+    - {split: train4, path: runs/outcome_recovery_s49666_train4}
+    - {split: train5, path: runs/outcome_recovery_s49666_train5}
+  validation: {split: validation, path: runs/outcome_recovery_s49666_validation}
+  anchor_manifest:
+    digest: sha256:f61c453864dc8a84e274a65e834e037a83ef8407ed4e9635f84c78d814fe2e7e
+    n_tasks: 40
+    n_trajectories: 1960
+    n_windows: 47271
+
+validation_gate:
+  required: true
+  max_clip_fraction: 0.20
+  min_ess_fraction: 0.80
+  max_coeff_drift_p95_l2: 0.05
+  min_live_ops: 16
+  max_topk_overlap_decline: 0.05
+  expert_batches: 16
+  nonfinite: 0
+  unexpected_module_gradients: false
+
+convergence_gate:
+  required: true
+  terminal_parallelism: one_snapshot_or_trust_per_rank
+  metric: heldout_clipped_surrogate
+  aggregation: group_arm_replan
+  constant_reward_groups: exact_zero_included
+  seed_snapshot_step: 49666
+  snapshot_steps: [53666, 53866, 54066, 54266, 54466]
+  validation_groups: 400
+  validation_tasks: 40
+  bootstrap:
+    method: task_stratified_whole_group_paired_percentile
+    samples: 2000
+    seed: 0
+    confidence: 0.95
+  efficacy:
+    comparison: final_minus_seed
+    ci_lower_strictly_greater_than: 0.0
+  plateau:
+    comparison: final_minus_each_earlier_snapshot
+    equivalence_low: -0.01
+    equivalence_high: 0.01
+  final_approx_kl_max: 0.01
+  accepted_updates: 4800
+  metrics_first_step: 49667
+  metrics_last_step: 54466
+  anchor_sparse_ce:
+    block_size: 200
+    blocks: 4
+    block_median_relative_range_max: 0.02
+    relative_range_denominator: minimum_block_median
+    terminal_block_median_strictly_less_than: 4.852030263919617
+
+slurm:
+  nodes: 1
+  gpus_per_node: 8
+  n_links: 1
+
+# This is deliberately external to training: only untouched official rollouts
+# can authorize promotion, and this trainer never launches evaluation itself.
+promotion_gate:
+  required: true
+  official_seed: 0
+  candidate_successes_min: 164
+  episodes: 400
+  paired_improvement_over_reference_required: true
+  reference_successes: 149

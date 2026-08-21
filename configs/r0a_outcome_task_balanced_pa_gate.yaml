@@ -1,0 +1,403 @@
+# Terminal full-coverage task-balanced positive-advantage method gate.
+#
+# THIS RECEIPT IS INTENTIONALLY NONLAUNCHABLE. It freezes a selection and
+# mathematical recipe for one final exposed-development direction gate. A PASS
+# may authorize only a separately implemented three-actual-macro-update
+# ineligible pilot. It does not authorize this config, a 64/800-update run, a
+# candidate, SR evaluation, formal evaluation, or promotion.
+
+extends: r0a_outcome_grpo_v2_pilot.yaml
+
+run:
+  name: r0a_outcome_task_balanced_pa_gate_NONLAUNCHABLE
+  steps: null
+  deterministic: true
+  log_every: null
+  ckpt_every: null
+  keep_last: 0
+  wandb_mode: disabled
+
+optim:
+  lr: 3.0e-4
+  grad_clip: 1.0
+  betas: [0.9, 0.95]
+  weight_decay: 0.05
+  eps: 1.0e-8
+  lr_scales:
+    estimator: 0.0
+    bank: 0.0
+    q_delta: 0.0
+    q_action: 0.0
+    ema: 0.0
+    decoder: 0.0
+    proposal: 0.0125
+  reset_state_modules: [proposal]
+  update_ema: false
+
+losses:
+  dyn: {enabled: false, weight: 0.0}
+  act: {enabled: false, weight: 0.0}
+  potential: {enabled: false, weight: 0.0}
+  grpo: {enabled: false, weight: 0.0}
+  proposal:
+    enabled: false
+    weight: 0.0
+    mode: sparse_ce
+    coefficient_status: FIXED_DISABLED_GRAPH_ABSENT
+  balance: {enabled: false, weight: 0.0}
+  positive_advantage:
+    enabled: true
+    weight: 1.0
+    kind: clipped_positive_advantage_conditional_imitation
+    rewards: all_8_exact_binary_terminal_rewards
+    standardisation: subtract_mean_divide_population_rms
+    constant_group: all_zero_advantages_and_weights
+    positive_weight: max_standardised_advantage_0
+    scored_arms: [1, 2, 3, 4, 5, 6, 7]
+    arm0: baseline_and_scale_only_never_scored_or_weighted
+    contexts_per_arm: 2
+    group_aggregation: equal_context_within_arm_then_equal_7_arms
+    macro_aggregation: equal_group_within_task_then_equal_40_tasks
+    ratio_clip: [0.8, 1.2]
+    minimized_atom: -min(rho*w,clamp(rho,0.8,1.2)*w)
+  recovery_reference:
+    enabled: true
+    weight: 1.0
+    coefficient_status: FIXED_UNIT_NO_CONTROLLER
+    kind: sampled_pl_forward_k3_control_variate
+    atom: expm1(current_minus_old_logprob)-current_minus_old_logprob
+    observed_statistic_name: empirical_k3_not_approximate_kl
+    arms: [1, 2, 3, 4, 5, 6, 7]
+    arm0: forbidden
+    group_aggregation: equal_replan_within_arm_then_equal_arm
+    macro_aggregation: equal_group_within_task_then_equal_40_tasks
+    controller: absent_fixed_unit
+  demo_reference:
+    enabled: true
+    weight: 1.0
+    coefficient_status: FIXED_UNIT
+    kind: exact_analytic_vjp_dense_categorical_forward_kl
+    orientation: KL_softmax_seed_parallel_softmax_current
+    current_vjp: p_current_minus_p_seed
+    states: exact_authenticated_train_demo_anchor_states_all_horizons
+    horizon_aggregation: equal_mean
+    live_seed_forward: identical_inputs_and_autocast_then_logits_fp32
+    seed_requires_grad: false
+    seed_in_optimizer: false
+    seed_in_checkpoint: false
+
+# Empty by construction: the ordinary loop cannot train this receipt.
+train_modules: []
+
+outcome_grpo_v2:
+  method_status: RETIRED_AUTHENTICATED_INPUTS_ONLY
+  stop_step: null
+  snapshot_steps: []
+  sampler:
+    total_updates: null
+  recovery_kl_controller:
+    interval: null
+    initial_beta: null
+    target_kl: null
+    eta: null
+    max_beta: null
+    coefficient_status: NOT_USED_FIXED_UNIT_RECOVERY
+  train_trust_panel:
+    every: null
+  validation_lineage:
+    decision_status: EXPOSED_DEVELOPMENT_ONLY_FORMAL_COLLECTION_FORBIDDEN_BEFORE_METHOD_FREEZE
+    current_development_collection:
+      split: validation
+      path: runs/outcome_recovery_s49666_validation
+      collection_format_version: 1
+      manifest_sha256: c7a59139bfe4cc8412a82f735b9668f4865f753e5248957b3430617b3e6b9272
+      observed_identity_digest: 758b046c52a401c83fccba21523c9ea6add3aef0966ffa623deee581dafeccee
+      identity_status: AUTHENTICATED_EXPOSED_DEVELOPMENT_NOT_FORMAL
+      status: DEVELOPMENT_EXPOSED_DO_NOT_FORMAL_GATE
+      exposures:
+        - v1_terminal_selection
+        - early_curve_diagnostic
+        - component_gradient_projection
+        - round_robin_direction_audit
+        - positive_advantage_direction_audit
+        - terminal_task_balanced_positive_advantage_direction_gate
+  artifact_policy:
+    role: inherited_authenticated_inputs_only
+    candidate_emission: forbidden
+    promotion: forbidden
+    official_evaluation: forbidden
+    pilot_checkpoint_only: false
+
+outcome_task_balanced_positive_advantage:
+  format_version: 1
+  recipe_kind: loom_terminal_task_balanced_positive_advantage_method_gate
+  method_status: FROZEN_SELECTION_NONLAUNCHABLE_GATE_NOT_RUN
+  selection_decision_recorded_utc: 2026-08-20T12:53:12Z
+  execution_surface: reusable_math_selection_resume_core_only
+  training_loop_present: false
+  launcher_present: false
+  job_submitted: false
+  seed:
+    checkpoint: runs/r0a_deploy_s1_eval/ckpt_000049666.pt
+    global_step: 49666
+    config_hash: a199324a6205bb6d
+    checkpoint_sha256: 15f286c268caa5327d5aa3abf1f67ebd0555c426a509fef22cb7f537bf6ab4e1
+  source_provenance:
+    core_path: loom/train/outcome_task_balanced_positive_advantage.py
+    core_file_sha256: fba655739bfbcba6161ce8f5e98d2d812fcb9a6eb15a958593ed576609373f84
+    core_closure_scheme: sha256(path-nul-sha256-nul)-v1
+    core_closure_sha256: 3a0e568e31f7ebf41e7a31c7dd1302d77905d22e7f4d959c17101a56d791a62a
+    positive_advantage_core_file_sha256: c70dfa6239ff8ef1eda9cf16b167c7bf5d3b7de00c918b8fa3c0b69faa69a358
+    inherited_v2_config:
+      path: configs/r0a_outcome_grpo_v2_pilot.yaml
+      raw_sha256: 249a221d84032f8c3801a7430e48597a364fa16b02b378e9a17d30c8a56cdf44
+      resolved_hash: 67277938c51075d2
+  authenticated_training_pool:
+    kind: exact_outcome_recovery_manifest_closure_v1
+    raw_groups: 1200
+    informative_groups: 903
+    informative_definition: inherited_int_distinct_over_8_exact_binary_terminal_rewards
+    tasks: 40
+    sources:
+      - {split: train0, path: runs/outcome_recovery_s49666_train0, manifest_sha256: f92f50960e1640b32f2f50c6e9a7c61603204ea21369c6e2493d3770b3683c17, identity_digest: 6aae6bbb5f6226de726de64bd8b57d6f4fb673a63c5e23c49ad136a03dd75433, informative_groups: 146}
+      - {split: train1, path: runs/outcome_recovery_s49666_train1, manifest_sha256: 8c45d514454598eb1c53c0d3ea3a12b3606f84baae612e5d3c2dc50bfd904421, identity_digest: 331c812f62a8249d6c4be6a368b2bc9c5bbe6e352a67f6e8ac89a4deeaf984a0, informative_groups: 159}
+      - {split: train2, path: runs/outcome_recovery_s49666_train2, manifest_sha256: 4a53fca9490840e90319d2fde986f8f6c12a6d236869c5000e5b4f0e1555b29b, identity_digest: 302d7a4a95c45526338e1bfffd6008a893825ba1eb6157217169cfe661fd77ee, informative_groups: 143}
+      - {split: train3, path: runs/outcome_recovery_s49666_train3, manifest_sha256: 289c0d6796d1bfccf471bb519c3145b0837147280b5059ae62d821a5b7d3594e, identity_digest: f6c0eb2f6b11a477f84be6323ef1a94f720dfe30e8fd854fd1d0c3d25bcef35e, informative_groups: 148}
+      - {split: train4, path: runs/outcome_recovery_s49666_train4, manifest_sha256: 025a8a81556a733da4401fb489306222e93e72535f3ca8266c4780fc76f9857b, identity_digest: 206fb752eb2f345284286a35bdc277eee03573c916563abb724c8d3f67dad13c, informative_groups: 148}
+      - {split: train5, path: runs/outcome_recovery_s49666_train5, manifest_sha256: 61253c67af3ea3c5cda710a78498e098bd2ea54082ba557ad2145a79e14a1700, identity_digest: 8b19c20610d4dcfed619ca2854e548b6bac5ca2d7a0bc26dd00182d2614f7ea7, informative_groups: 159}
+  frozen_selection:
+    receipt_path: configs/r0a_outcome_task_balanced_pa_selection_v1.json
+    receipt_file_sha256: fbb360f7a7beeb468ca4e3532c7e0d1966b5eecbd90fb661306e67223ef3aeb2
+    receipt_canonical_sha256: d609725da4eb6010de20f20bb0df0ec6f8917a6049e211203190ca852e05cf79
+    domain: pa-full-coverage-equal-task-v1
+    scheme: sha256-domain-task-and-group-order-then-task-position-rotated-mod3-v1
+    task_order: sha256_UTF8_domain_pipe_task_pipe_task_key_then_task_key_tie
+    group_order: sha256_UTF8_domain_pipe_group_pipe_split_pipe_group_id_pipe_sidecar_sha256_then_split_index_id_ties
+    task_rank: task_position_mod_8
+    task_shard_rotation: task_position_mod_3
+    group_shard: within_task_position_plus_rotation_mod_3
+    all_903_groups_exactly_once: true
+    every_40_tasks_in_each_shard: true
+    per_task_shard_count_difference_max: 1
+    tasks_per_rank: 5
+    shards: [0, 1, 2]
+    groups_by_shard: [301, 301, 301]
+    contexts_per_arm: 2
+    exact_context_selection:
+      inherited_sampler_kind: pure_step_interleaved_fold_rank_disjoint_v3
+      stable_seed_domain: outcome-v2-replan-v3
+      sampler_seed: 0
+      visit: 0
+      fold: integer_suffix_of_train_split
+      group: manifest_group_index
+      epoch_rollover: inherited_divmod_draw_by_n_replans
+      arms: [1, 2, 3, 4, 5, 6, 7]
+      atoms: 12642
+      context_assignment_sha256: 64cef16c7662615655c84cce12077a95c015e9f83d8d9db691e9ce9036d13634
+      exact_prior_24_round_robin_rows_equal: required
+    workload:
+      sidecar_bytes_by_rank_by_shard:
+        - [9769985322, 7955141808, 7558186264, 6681857414, 8393843404, 10338023222, 8619368158, 8375430326]
+        - [9950958570, 8404222524, 7441884178, 6094502580, 8807362834, 10716468674, 7885717080, 9711670006]
+        - [8975309412, 8047430838, 7653172504, 6351494010, 9000884434, 10237565436, 8175109470, 8889779702]
+      maximum_to_mean_sidecar_bytes_by_shard: [1.2217748958114467, 1.242258917614955, 1.2163911524755702]
+  frozen_objective:
+    scalar: unit_PA_plus_unit_task_balanced_recovery_k3_plus_unit_analytic_demo_reference
+    positive_advantage_weight: 1.0
+    recovery_k3_weight: 1.0
+    analytic_demo_reference_weight: 1.0
+    grpo_weight: 0.0
+    switch_balance_weight: 0.0
+    sparse_ce_weight: 0.0
+    sparse_ce_graph: absent
+    aggregation: equal_context_within_arm_then_equal_7_arms_then_equal_group_within_task_then_equal_40_tasks_PER_MACRO
+    three_macro_average_not_one_shot_full_pool_equal_group_objective: true
+    partition_interpretation: prospective_design_unbiased_deterministic_balanced_three_minibatch_one_pass
+    distributed_gradient:
+      mathematical_reduce: SUM_of_rank_local_5_over_40_task_contributions
+      production_reduce: SUM_over_world_mean
+      production_rank_loss_prescale: 8
+      equivalence: production_mean_of_world_scaled_local_equals_explicit_sum
+      execution: fixed_order_one_group_at_a_time_gradient_accumulation
+      group_weight_application: direct_group_scalar_before_autograd_then_detached_vector_accumulation
+      live_group_graphs_retained_concurrently: 1
+      demo_gradient: exactly_once_per_rank_per_macro_after_all_groups
+      collectives_inside_unequal_rank_group_loops: forbidden
+    recovery_scorer:
+      pass: separate_exact_stored_order_B1_over_identical_selected_rows
+      direction_gate_identity: current_float_bitwise_equals_stored_old_or_INVALID
+      arms: [1, 2, 3, 4, 5, 6, 7]
+      arm0: forbidden
+    demo_anchor:
+      source: frozen_authenticated_train_anchor_batches
+      live_seed_inputs_and_bf16_autocast: identical
+      arithmetic: fp32_exact_analytic_vjp
+      construction_config_source:
+        path: configs/r0a_outcome_grpo_v2_pilot.yaml
+        raw_sha256: 249a221d84032f8c3801a7430e48597a364fa16b02b378e9a17d30c8a56cdf44
+        resolved_hash: 67277938c51075d2
+      canonical_task_balanced_target:
+        enabled: false
+        weight: 0.0
+      construction_only_target:
+        enabled: true
+        weight: null
+        mode: sparse_ce
+        temperature: 1.0
+        detach_belief: true
+      v2_core_internal_target_producer_weight: 1.0
+      canonical_config_mutated: false
+      sparse_target_adapter_scope: constructor_only_state_and_target_producer
+      sparse_ce_scalar_computed: false
+      sparse_ce_graph_constructed: false
+  optimizer_geometry:
+    kind: reset_AdamW_proposal_only
+    base_lr: 3.0e-4
+    proposal_lr_scale: 0.0125
+    effective_proposal_lr: 3.75e-6
+    grad_clip: 1.0
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+    weight_decay: 0.05
+    reset_state_modules: [proposal]
+    macro_offsets: [0, 1, 2]
+  direction_gate:
+    status: NOT_RUN
+    live_optimizer_steps: 0
+    live_parameter_mutations: 0
+    trigger:
+      report_path: runs/diagnostics/outcome_positive_advantage_direction_audit/outcome_positive_advantage_direction_audit_v2_s49666_32581242.json
+      report_sha256: 91896553aa34aebf6ee6b5cfa46670c04b5bcbc54b9132d8a78818d7fc5cd0b7
+      required_kind: loom_outcome_positive_advantage_round_robin_direction_audit
+      required_format_version: 2
+      required_execution_validated: true
+      required_status: ABORT_POSITIVE_ADVANTAGE_OBJECTIVE
+      required_decision_passed: false
+      authenticate_before_training_manifest_or_sidecar_access: true
+    heldout_panel:
+      role: frozen_exposed_development_derivative_only
+      collection_manifest_sha256: c7a59139bfe4cc8412a82f735b9668f4865f753e5248957b3430617b3e6b9272
+      collection_identity_digest: 758b046c52a401c83fccba21523c9ea6add3aef0966ffa623deee581dafeccee
+      group_receipt_kind: outcome_blind_group_id_panel_v1
+      group_receipt_sha256: 924e28cb96d49ff581ad5907fe8069ccba76f3aff404a3a75e434dcd90c0e329
+      groups: 48
+      tasks: 40
+      sampling_receipt_kind: outcome_blind_hash_replan_sampling_v1
+      sampling_receipt_sha256: 63060e11f2bc8382ef05fecb702e19e155070b4e5f1a1bd78dbf7fc039fbd10a
+      contexts_per_arm: 2
+      signed_grpo_scalar:
+        api: outcome_grpo_v2.sampled_group_objectives_v2.grpo
+        reward_advantage: all_8_terminal_rewards_population_standardised_constant_zero
+        atom: -min(rho*A,clamp(rho,0.8,1.2)*A)
+        arms: [1, 2, 3, 4, 5, 6, 7]
+        arm0: reward_baseline_and_scale_only
+        reduction: equal_context_within_arm_then_equal_7_arms_then_equal_group_within_task_then_equal_40_tasks
+        projection: heldout_gradient_dot_update_delta
+        benefit_cosine: negative_cosine_of_heldout_gradient_and_update_delta
+        train_direction_use: forbidden
+    bootstrap:
+      kind: fixed_suite_stratified_task_resample_matrix_v1
+      samples: 10000
+      seed: 49666
+      confidence: 0.95
+      bonferroni_endpoints: 3
+      matrix_sha256: 1e570b6d13426c8fbd58016d0fba6869dc18aa3151dfdbc0bab357373cacf32e
+      tasks_per_row: 40
+    direction_families:
+      primary_endpoint_order:
+        - pa_only_cumulative_clipped_sgd
+        - pa_full_beta1_lambda1_cumulative_clipped_sgd
+        - pa_full_beta1_lambda1_reset_adamw_with_production_decay
+      production_adamw_increment_order:
+        - pa_full_beta1_lambda1_adamw_decay_increment_t0
+        - pa_full_beta1_lambda1_adamw_decay_increment_t1
+        - pa_full_beta1_lambda1_adamw_decay_increment_t2
+      direct_first_repeat:
+        independent_accumulations: 2
+        first_is_authoritative: true
+        maximum_relative_residual: 1.0e-7
+        applies_to: [pa_only_each_macro, direct_full_each_macro]
+      projection_closure_max_relative_residual: 2.0e-4
+    locked_thresholds:
+      endpoint_point_mean_loss_delta_max_exclusive: 0.0
+      endpoint_one_sided_95_ucb_max_exclusive: 0.0
+      endpoint_benefit_cosine_min: 0.01
+      catastrophic_increment_one_sided_95_lcb_max: 0.0
+      catastrophic_increment_benefit_cosine_min_exclusive: -0.01
+      reference_gradient_relative_bound_max: 1.0e-6
+      recovery_identity_vjp: bitwise_zero
+      analytic_demo_identity_vjp: bitwise_zero
+    threshold_reuse: exact_predeclared_no_relaxation_no_posthoc_sweep
+    failure_classification:
+      complete_finite_zero_PA_or_full_direction: SCIENTIFIC_ABORT_UNDEFINED_REQUIRED_COSINE
+      complete_finite_nonzero_reference_vjp_after_exact_identity: SCIENTIFIC_ABORT
+      missing_direction_or_reference_graph: INVALID_NO_REPORT
+      nonfinite_gradient_or_scalar: INVALID_NO_REPORT
+      ratio_or_selected_context_scorer_authentication_failure: INVALID_NO_REPORT
+      recovery_current_float_not_bitwise_stored_old_at_seed: INVALID_NO_REPORT
+      source_manifest_sidecar_or_receipt_authentication_failure: INVALID_NO_REPORT
+    on_pass: authorize_only_separate_three_actual_macro_update_ineligible_pilot_freeze
+    on_fail: terminal_stop_for_outcome_conditioned_proposal_optimization
+  prospective_pilot_maximum_authority:
+    status: NOT_IMPLEMENTED_NOT_LAUNCHABLE
+    actual_macro_updates: 3
+    start_step: 49666
+    update_steps: [49666, 49667, 49668]
+    post_update_snapshot_steps: [49667, 49668, 49669]
+    stop_step: 49669
+    shard_by_macro_offset: [0, 1, 2]
+    one_full_903_group_pass: true
+    optimizer_steps_per_shard: 1
+    trust_and_exposed_dev_after_every_macro: true
+    candidate_emission: forbidden
+    success_rate_evaluation: forbidden
+    official_evaluation: forbidden
+    promotion: forbidden
+    longer_continuation: forbidden
+    resume_contract:
+      required_identity_fields:
+        - partition_receipt_sha256
+        - recipe_file_sha256
+        - core_closure_sha256
+        - seed_checkpoint_sha256
+      exact_state_fields:
+        - next_global_step
+        - completed_macro_updates
+        - optimizer_steps_completed
+        - post_update_trust_dev_gates_completed
+        - completed_shards
+        - remaining_shards
+        - informative_groups_consumed
+        - next_shard
+        - one_full_903_group_pass_complete
+      skip_or_replay_shard: forbidden
+  exposed_development_chronology:
+    validation_collection:
+      path: runs/outcome_recovery_s49666_validation
+      started_utc: 2026-08-19T22:17:32Z
+      completed_utc: 2026-08-20T00:14:47Z
+      manifest_sha256: c7a59139bfe4cc8412a82f735b9668f4865f753e5248957b3430617b3e6b9272
+      identity_digest: 758b046c52a401c83fccba21523c9ea6add3aef0966ffa623deee581dafeccee
+      role: exposed_development_never_formal_terminal
+    ordered_exposures:
+      - {name: v1_terminal_selection, artifact: runs/r0a_outcome_grpo_strict_s1/terminal_report.json, artifact_sha256: e42de09dcc0cf691c570f8a73b06144ad09767915565f876136d96fd36c94337, observed_utc: 2026-08-20T08:23:39Z, status: FAIL}
+      - {name: early_curve_diagnostic, artifact: runs/r0a_outcome_grpo_strict_s1_early_curve_diagnostic/summary.json, artifact_sha256: 620e3202a6ec170b9f240cba8aec801ef4370adfcf6d1b774b4ec249b985a27d, observed_utc: 2026-08-20T09:27:02Z, status: DIAGNOSTIC_COMPLETE}
+      - {name: component_gradient_projection, artifact: runs/diagnostics/outcome_component_gradient_audit/outcome_component_gradient_audit_v2_s49666_32572561.json, artifact_sha256: 8c9ea5c308fa232e2fb67be71cac853b49ff90193f05bd3b2f7ea87aeb288543, observed_utc: 2026-08-20T09:36:29Z, status: DIAGNOSTIC_COMPLETE}
+      - {name: round_robin_direction_audit, artifact: runs/diagnostics/outcome_round_robin_direction_audit/outcome_round_robin_direction_audit_v2_s49666_32577492.json, artifact_sha256: 1f3c4af95ba97a5976e2cdacee8fc50fda6ff88f725886fca25b9304e4ef9e1f, observed_utc: 2026-08-20T11:06:28Z, status: ABORT_OUTCOME_OBJECTIVE}
+      - {name: positive_advantage_direction_audit, artifact: runs/diagnostics/outcome_positive_advantage_direction_audit/outcome_positive_advantage_direction_audit_v2_s49666_32581242.json, artifact_sha256: 91896553aa34aebf6ee6b5cfa46670c04b5bcbc54b9132d8a78818d7fc5cd0b7, observed_utc: 2026-08-20T12:28:43Z, status: ABORT_POSITIVE_ADVANTAGE_OBJECTIVE}
+      - {name: terminal_task_balanced_positive_advantage_direction_gate, artifact: null, artifact_sha256: null, observed_utc: null, status: PROSPECTIVELY_FROZEN_NOT_RUN}
+    formal_terminal_collection_accessed: false
+    formal_terminal_collection_collection_or_selection_authorized: false
+
+artifact_policy:
+  role: exposed_development_nonlaunchable_method_gate_receipt
+  checkpoint_emission: forbidden
+  candidate_emission: forbidden
+  success_rate_evaluation: forbidden
+  official_evaluation: forbidden
+  promotion: forbidden
+
+promotion_gate:
+  required: false
+  eligible: false
+  reason: terminal_task_balanced_PA_recipe_is_nonlaunchable_exposed_development_gate_only

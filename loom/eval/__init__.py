@@ -24,6 +24,7 @@ __all__ = [
     "EvalProtocol",
     "EpisodeResult",
     "episode_seed",
+    "policy_seed",
     "PROTOCOL_NOTE",
 ]
 
@@ -197,4 +198,17 @@ def episode_seed(seed: int, bench: str, suite: str, task_id: int, episode: int) 
     machines and restarts.
     """
     raw = f"{bench}|{suite}|{int(task_id)}|{int(episode)}|{int(seed)}".encode()
+    return int.from_bytes(hashlib.sha256(raw).digest()[:4], "big") & 0x7FFF_FFFF
+
+
+def policy_seed(seed: int, bench: str, suite: str, task_id: int, episode: int) -> int:
+    """Stable decoder-RNG seed for one evaluation work item.
+
+    It is deliberately a function only of the protocol work tuple: two
+    checkpoints (or two method arms) evaluated on the same item receive common
+    decoder noise.  The domain prefix keeps this stream independent of the
+    environment seed, including on benches such as RoboTwin that own a custom
+    environment-seed convention.
+    """
+    raw = f"policy|{bench}|{suite}|{int(task_id)}|{int(episode)}|{int(seed)}".encode()
     return int.from_bytes(hashlib.sha256(raw).digest()[:4], "big") & 0x7FFF_FFFF

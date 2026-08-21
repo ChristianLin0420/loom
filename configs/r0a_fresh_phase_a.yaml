@@ -1,0 +1,37 @@
+# Fresh R0 staged rebuild, phase A (updates 1..2,000).
+#
+# Establish the original action-semantic coefficient space before asking the
+# bank to model it.  The only objective delta from r0a.yaml is that L_dyn is
+# temporarily off and the bank is frozen.  The absolute 32k cosine schedule is
+# unchanged; --stop_at 2000 is link-local and must not enter this identity.
+
+extends: r0a.yaml
+
+run:
+  name: r0a_fresh_staged
+  steps: 32000
+  ckpt_every: 500
+
+losses:
+  dyn:
+    enabled: false
+    weight: 0.0
+
+train_modules: [estimator, q_delta, q_action, decoder, proposal]
+
+phase_gate:
+  start_exclusive: 1000
+  end_inclusive: 2000
+  rows: 1000
+  requirements:
+    act_align_median_strict_lt: 0.40
+    c_a_spread_median_strict_gt: 0.10
+    c_delta_spread_median_strict_gt: 0.10
+    live_ops_q_a_median_gte: 16
+    live_ops_q_delta_median_gte: 16
+    proposal_loss_median_strict_lt: 4.852030263919617
+    skipped_rate_strict_lt: 0.15
+    bank_gradients: false
+    expected_module_gradients: true
+    nonfinite: false
+  required: true

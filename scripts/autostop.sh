@@ -3,9 +3,9 @@
 #
 #   bash scripts/autostop.sh <run_name> [min_step] [interval_s]
 #
-# Fires `touch runs/<run>/STOP` only on scripts/convergence.py's CONVERGED
-# (exit 0): every primary metric flat within tolerance AND off every known
-# degenerate floor.
+# Fires `touch runs/<run>/STOP` on scripts/convergence.py's CONVERGED (exit 0)
+# after min_step, or immediately on a declared required stage gate
+# failure (exit 4). It never cancels scheduler jobs.
 #
 # It deliberately does NOT stop on CONVERGED_DEGENERATE (exit 3). A run pinned
 # at a floor has also "stopped changing", and this project has produced several;
@@ -20,22 +20,39 @@ RUN="${1:?usage: autostop.sh <run_name> [min_step] [interval_s]}"
 MIN="${2:-20000}"
 INT="${3:-300}"
 PY=.venv/bin/python
+RUN_DIR="${LOOM_RUN_ROOT:-runs}/${RUN}"
 while true; do
-  if [ -f "runs/${RUN}/STOP" ]; then echo "$(date -Is) STOP already present; exiting"; break; fi
+  if [ -f "${RUN_DIR}/STOP" ]; then echo "$(date -Is) STOP already present; exiting"; break; fi
+  STEP=$(awk '{print $2}' "${RUN_DIR}/HEARTBEAT" 2>/dev/null || echo 0)
+  STEP=${STEP:-0}
+  # Always inspect declared stage gates, even before MIN. Liveness owns its
+  # exact configured row window; MIN remains only the legacy convergence guard.
+  OUT=$($PY scripts/convergence.py "${RUN_DIR}" 2>&1); RC=$?
+  if [ "$RC" -eq 4 ]; then
+    echo "$(date -Is) required stage gate FAILED at step ${STEP} -- writing STOP"
+    echo "$OUT"
+    touch "${RUN_DIR}/STOP"
+    break
+  fi
+  # A partially-written config/metrics line is a retryable read (rc=2), not a
+  # method verdict. Required gate schema/data failures use rc=4 above.
   if ! squeue -u "$USER" -h -n "loom_${RUN}" -o "%T" 2>/dev/null | grep -qE 'RUNNING|PENDING'; then
     echo "$(date -Is) run finished on its own; exiting"; break
   fi
-  STEP=$(awk '{print $2}' "runs/${RUN}/HEARTBEAT" 2>/dev/null || echo 0)
-  STEP=${STEP:-0}
   if [ "$STEP" -ge "$MIN" ] 2>/dev/null; then
-    OUT=$($PY scripts/convergence.py "runs/${RUN}" 2>&1); RC=$?
     case "$RC" in
       0) echo "$(date -Is) CONVERGED at step ${STEP} -- writing STOP"; echo "$OUT"
-         touch "runs/${RUN}/STOP"; break ;;
+         touch "${RUN_DIR}/STOP"; break ;;
       3) echo "$(date -Is) step ${STEP}: CONVERGED_DEGENERATE (plateaued ON a floor) -- NOT stopping"
          echo "$OUT" | tail -6 ;;
       *) : ;;   # NOT_CONVERGED / TOO_EARLY -- keep going, quietly
     esac
   fi
-  sleep "$INT"
+  SLEEP_FOR="$INT"
+  if [ "$RC" -eq 1 ] && [ "$INT" -gt 5 ] && \
+     { [[ "$OUT" == *"LIVENESS: PENDING"* ]] || \
+       [[ "$OUT" == *"PHASE_GATE: PENDING"* ]]; }; then
+    SLEEP_FOR=5
+  fi
+  sleep "$SLEEP_FOR"
 done

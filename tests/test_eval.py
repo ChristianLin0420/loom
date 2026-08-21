@@ -142,6 +142,25 @@ def test_cli_runs_end_to_end(tmp_path, capsys):
     assert table.LIBERO_HEADER in md.read_text()
 
 
+def test_duration_normalized_segment_cli_is_opt_in_and_recorded(tmp_path, capsys):
+    from loom.eval.__main__ import build_parser, main
+
+    assert build_parser().parse_args([]).duration_normalize_segments is False
+
+    out = tmp_path / "duration_normalized.json"
+    rc = main([
+        "--bench", "libero", "--out", str(out),
+        "--episodes-per-task", "1", "--n-tasks", "1",
+        "--suites", "libero_spatial", "--seeds", "0",
+        "--max-steps", "1", "--backend", "fake", "--quiet",
+        "--duration-normalize-segments",
+    ])
+    assert rc == 0
+    meta = json.loads(out.read_text())["meta"]
+    assert meta["eval_identity"]["policy_kw"]["duration_normalize_segments"] is True
+    assert meta["policy"]["duration_normalize_segments"] is True
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  2 · RESAMPLING — the test that protects the score
 # ═══════════════════════════════════════════════════════════════════════════
@@ -302,6 +321,72 @@ def test_to_env_rate_is_identity_at_the_canonical_rate():
     assert C.env_steps_per_segment(C.FPS_CANONICAL) == C.H_OP
 
 
+def test_duration_normalized_segment_preserves_the_full_delta_integral():
+    seg = np.zeros((C.H_OP, 7), dtype=np.float32)
+    scale = np.arange(1, 7, dtype=np.float32)[None, :]
+    seg[:, :6] = np.arange(1, C.H_OP + 1, dtype=np.float32)[:, None] * scale / 100.0
+    seg[:, 6] = 1.0
+
+    for n_env in (5, 6):
+        out = pol.to_env_rate(
+            seg, "libero_franka", n_env, duration_normalized=True,
+        )
+        np.testing.assert_allclose(
+            out[:, :6].sum(axis=0), seg[:, :6].sum(axis=0),
+            rtol=0.0, atol=1e-6,
+        )
+
+
+def test_duration_normalized_segment_keeps_hold_zero_order_held():
+    seg = np.zeros((C.H_OP, 7), dtype=np.float32)
+    seg[:, 6] = [-1, -1, 1, 1, -1, 1, 1, -1]
+
+    out5 = pol.to_env_rate(seg, "libero_franka", 5, duration_normalized=True)
+    out6 = pol.to_env_rate(seg, "libero_franka", 6, duration_normalized=True)
+
+    # Normalized ZOH samples source indices [0,1,3,4,6] and [0,1,2,4,5,6].
+    np.testing.assert_array_equal(out5[:, 6], [-1, -1, 1, -1, 1])
+    np.testing.assert_array_equal(out6[:, 6], [-1, -1, 1, -1, 1, 1])
+    assert set(np.unique(np.concatenate((out5[:, 6], out6[:, 6])))) == {-1.0, 1.0}
+
+
+def test_duration_normalized_5_5_6_cycle_does_not_drop_segment_tails():
+    seg = np.full((C.H_OP, 7), 0.2, dtype=np.float32)
+    seg[:, 6] = 1.0
+    clock = pol.SegmentClock(20.0)
+    lengths = tuple(clock.next_segment_len() for _ in range(7))[-3:]
+    assert lengths == (5, 5, 6)
+
+    legacy = [pol.to_env_rate(seg, "libero_franka", n)[:, 0].sum()
+              for n in lengths]
+    normalized = [
+        pol.to_env_rate(
+            seg, "libero_franka", n, duration_normalized=True,
+        )[:, 0].sum()
+        for n in lengths
+    ]
+
+    np.testing.assert_allclose(legacy, [1.5, 1.5, 1.6], rtol=0.0, atol=1e-6)
+    np.testing.assert_allclose(normalized, [1.6, 1.6, 1.6], rtol=0.0, atol=1e-6)
+
+
+def test_duration_normalized_default_is_exactly_the_legacy_resampler():
+    seg = np.random.default_rng(4).normal(size=(C.H_OP, 7)).astype(np.float32)
+    seg[:, 6] = np.where(np.arange(C.H_OP) < 4, -1.0, 1.0)
+    expected = canonical.resample_actions(
+        seg, C.FPS_CANONICAL, 20.0,
+        canonical.action_semantics("libero_franka"), n_dst=5,
+    )
+
+    np.testing.assert_array_equal(pol.to_env_rate(seg, "libero_franka", 5), expected)
+    np.testing.assert_array_equal(
+        pol.to_env_rate(
+            seg, "libero_franka", 5, duration_normalized=False,
+        ),
+        expected,
+    )
+
+
 def test_policy_executes_the_semantics_aware_segment():
     """End of the chain: what the decoder emits is what reaches the env."""
     class FixedDecoder:
@@ -320,6 +405,25 @@ def test_policy_executes_the_semantics_aware_segment():
     assert p.replans == 1, "one segment should cover the first 5 env steps"
     assert np.allclose(acted[:, :6], 0.3, atol=1e-6), "delta magnitude not restored"
     assert set(np.unique(acted[:, 6]).tolist()) <= {-1.0, 1.0}, "gripper interpolated"
+
+
+def test_policy_duration_normalized_arm_executes_the_complete_segment():
+    class FixedDecoder:
+        def forward(self, z, c):
+            seg = np.full((C.H_OP, 7), 0.2, dtype=np.float32)
+            seg[:, 6] = [-1, -1, -1, -1, 1, 1, 1, 1]
+            return torch.from_numpy(seg).unsqueeze(0)
+
+    mods = pol._stub_modules("libero_franka", "cpu")
+    mods.decoder = FixedDecoder()
+    p = pol.LoomPolicy(
+        mods, n_candidates=2, duration_normalize_segments=True,
+    )
+    acted = np.stack([p.act({}, "task") for _ in range(5)])
+
+    assert p.replans == 1
+    np.testing.assert_allclose(acted[:, :6].sum(axis=0), 1.6, rtol=0.0, atol=1e-6)
+    assert set(np.unique(acted[:, 6])) <= {-1.0, 1.0}
 
 
 def test_policy_hands_the_decoder_proprio_and_not_the_belief():
@@ -706,6 +810,89 @@ def test_resume_refuses_to_mix_incomparable_protocols(tmp_path):
                         env_factory=fake_env_factory())
 
 
+@pytest.mark.parametrize("change", [
+    {"episodes_per_task": 3},
+    {"n_tasks": 3},
+    {"suites": ("libero_object", "libero_spatial")},
+    {"seeds": (0, 1)},
+    {"max_steps": 25},
+    {"notes": "a different scoring protocol"},
+])
+def test_resume_compares_the_full_protocol(tmp_path, change):
+    out = tmp_path / "r.json"
+    protocol = tiny_protocol()
+    runner.ResultStore(out, protocol).flush()
+
+    with pytest.raises(ValueError, match="different protocol"):
+        runner.ResultStore(out, protocol.replace(**change))
+
+
+def test_resume_refuses_a_different_checkpoint(tmp_path):
+    out = tmp_path / "r.json"
+    protocol = tiny_protocol()
+    runner.ResultStore(out, protocol, meta={"ckpt": tmp_path / "arm_a.pt"}).flush()
+
+    with pytest.raises(ValueError, match="different checkpoint"):
+        runner.ResultStore(out, protocol, meta={"ckpt": tmp_path / "arm_b.pt"})
+
+
+def test_resume_without_a_checkpoint_remains_valid_for_injected_policies(tmp_path):
+    """The policy/env injection seam intentionally has no checkpoint identity."""
+    out = tmp_path / "r.json"
+    protocol = tiny_protocol()
+    runner.ResultStore(out, protocol, meta={"ckpt": None}).flush()
+    resumed = runner.ResultStore(out, protocol, meta={"ckpt": None})
+    assert resumed.n_resumed == 0
+
+
+@pytest.mark.parametrize("changed", ["backend", "policy_kw", "policy_seed_scheme"])
+def test_resume_refuses_a_different_evaluation_identity(tmp_path, changed):
+    out = tmp_path / "r.json"
+    protocol = tiny_protocol()
+    identity = runner._eval_identity(
+        ckpt=None, backend="fake", resolved_backend="fake",
+        policy_kw={"n_candidates": 8, "op_stats": False},
+        policy_source="checkpoint_factory",
+    )
+    runner.ResultStore(
+        out, protocol, meta={"ckpt": None, "eval_identity": identity},
+    ).flush()
+
+    other = json.loads(json.dumps(identity))
+    if changed == "backend":
+        other["backend"]["resolved"] = "libero"
+    elif changed == "policy_kw":
+        other["policy_kw"]["n_candidates"] = 16
+    else:
+        other["policy_seed_scheme"] = "legacy-global-rng"
+    with pytest.raises(ValueError, match="different evaluation identity"):
+        runner.ResultStore(
+            out, protocol, meta={"ckpt": None, "eval_identity": other},
+        )
+
+
+def test_duration_normalized_arm_has_a_distinct_resume_identity(tmp_path):
+    out = tmp_path / "r.json"
+    protocol = tiny_protocol()
+    legacy = runner._eval_identity(
+        ckpt=None, backend="fake", resolved_backend="fake",
+        policy_kw={}, policy_source="checkpoint_factory",
+    )
+    normalized = runner._eval_identity(
+        ckpt=None, backend="fake", resolved_backend="fake",
+        policy_kw={"duration_normalize_segments": True},
+        policy_source="checkpoint_factory",
+    )
+    assert legacy != normalized
+    runner.ResultStore(
+        out, protocol, meta={"ckpt": None, "eval_identity": legacy},
+    ).flush()
+    with pytest.raises(ValueError, match="different evaluation identity"):
+        runner.ResultStore(
+            out, protocol, meta={"ckpt": None, "eval_identity": normalized},
+        )
+
+
 def test_no_resume_starts_over(tmp_path):
     out = tmp_path / "r.json"
     protocol = tiny_protocol()
@@ -879,6 +1066,48 @@ def test_same_seed_gives_the_same_episode(tmp_path):
     assert [e["env_seed"] for e in a["episodes"]] == [e["env_seed"] for e in b["episodes"]]
     # the fake env is a pure function of its seed, so outcomes match too
     assert [e["success"] for e in a["episodes"]] == [e["success"] for e in b["episodes"]]
+
+
+def test_decoder_rng_is_reset_per_work_item_and_shared_across_arms():
+    class DrawDecoder:
+        def __init__(self):
+            self.draws = []
+
+        def forward(self, proprio, c, *, generator=None):
+            assert generator is not None
+            x = torch.randn(proprio.shape[0], C.H_OP, 7, generator=generator,
+                            device=proprio.device, dtype=proprio.dtype)
+            self.draws.append(x.detach().clone())
+            return x
+
+    def make_arm():
+        decoder = DrawDecoder()
+        modules = pol._stub_modules("libero_franka", "cpu")
+        modules.decoder = decoder
+        return pol.LoomPolicy(modules, n_candidates=2), decoder
+
+    protocol = tiny_protocol(episodes_per_task=1, n_tasks=1,
+                             suites=("libero_spatial",), max_steps=1)
+    item = runner.iter_work(protocol)[0]
+    arm_a, dec_a = make_arm()
+    arm_b, dec_b = make_arm()
+    factory = fake_env_factory(p_success=0.0)
+
+    rec_a = runner._run_item(item, arm_a, libero, factory, "fake")
+    rec_b = runner._run_item(item, arm_b, libero, factory, "fake")
+    assert torch.equal(dec_a.draws[0], dec_b.draws[0]), (
+        "checkpoint/method arms must receive common decoder noise"
+    )
+    assert rec_a.extra["policy_seed"] == rec_b.extra["policy_seed"] == item.policy_seed
+
+    # Re-running the same item resets the private generator to the same stream.
+    runner._run_item(item, arm_a, libero, factory, "fake")
+    assert torch.equal(dec_a.draws[0], dec_a.draws[1])
+
+    other = runner.iter_work(protocol.replace(seeds=(1,)))[0]
+    runner._run_item(other, arm_b, libero, factory, "fake")
+    assert other.policy_seed != item.policy_seed
+    assert not torch.equal(dec_b.draws[0], dec_b.draws[1])
 
 
 def test_degrades_to_one_process_on_cpu():
@@ -1328,6 +1557,12 @@ def test_provenance_records_whether_stubs_ran():
     assert "zeros_featurizer" in prov["featurizer"]
     assert prov["resampler"] == "loom.data.canonical.to_env_rate"
     assert prov["env_steps_per_segment"] == C.env_steps_per_segment(20.0)
+    assert prov["duration_normalize_segments"] is False
+
+    normalized = pol.policy_provenance(
+        pol.load_policy(None, duration_normalize_segments=True),
+    )
+    assert normalized["duration_normalize_segments"] is True
 
 
 def test_results_json_records_the_policy_that_actually_ran(tmp_path):
@@ -1395,3 +1630,41 @@ def test_eval_reads_estimator_flags_from_the_run_config(tmp_path):
 
     # No config anywhere -> defaults, never an exception.
     assert _run_model_kwargs(tmp_path / "nowhere" / "c.pt", "estimator") == {}
+
+
+def test_eval_prefers_and_validates_embedded_resolved_config(tmp_path):
+    from loom.eval.policy import _resolved_config_hash, _run_model_kwargs
+
+    embedded = {
+        "model": {
+            "estimator": {"z_prev_residual": False, "learned_z_init": True},
+            "proposal": {"width": 384},
+        },
+        "data": {"embodiments": ["libero_franka"]},
+    }
+    payload = {
+        "resolved_config": embedded,
+        "config_hash": _resolved_config_hash(embedded),
+    }
+    ckpt = tmp_path / "run_eval" / "ckpt.pt"
+    ckpt.parent.mkdir()
+    torch.save(payload, ckpt)
+
+    # A mutable adjacent config says the opposite. The checkpoint-owned config
+    # must win for both non-parameter estimator flags and proposal architecture.
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "config.json").write_text(json.dumps({
+        "model": {"estimator": {"z_prev_residual": True},
+                  "proposal": {"width": 768}},
+    }))
+    assert _run_model_kwargs(ckpt, "estimator") == embedded["model"]["estimator"]
+    assert _run_model_kwargs(ckpt, "proposal") == {"width": 384}
+
+    corrupted = dict(payload)
+    corrupted["resolved_config"] = {
+        **embedded,
+        "model": {**embedded["model"], "estimator": {"z_prev_residual": True}},
+    }
+    with pytest.raises(RuntimeError, match="does not match saved config_hash"):
+        _run_model_kwargs(ckpt, "estimator", corrupted)

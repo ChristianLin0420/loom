@@ -85,6 +85,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import sys
@@ -409,7 +410,44 @@ def consolidate_state_dict(paths: Sequence[Path], section: str = "model",
     return full, report
 
 
+def _config_hash(cfg: dict[str, Any]) -> str:
+    """Training's experiment hash, kept local so consolidation stays standalone."""
+    experiment = {k: v for k, v in cfg.items() if k != "link"}
+    return hashlib.blake2b(
+        json.dumps(experiment, sort_keys=True, default=str).encode(), digest_size=8,
+    ).hexdigest()
+
+
+def _resolved_config(config_path: str | Path, expected_hash: str) -> dict[str, Any]:
+    """Read and authenticate the config that defines checkpoint architecture."""
+    path = Path(config_path)
+    try:
+        cfg = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        raise RuntimeError(
+            f"cannot embed the resolved training config from {path}: {e}"
+        ) from e
+    if not isinstance(cfg, dict):
+        raise RuntimeError(f"resolved training config {path} is not a mapping")
+    got = _config_hash(cfg)
+    if not expected_hash:
+        raise RuntimeError(
+            "checkpoint has no config_hash; refusing to attach an unauthenticated "
+            "mutable config.json to the consolidated checkpoint"
+        )
+    if got != expected_hash:
+        raise RuntimeError(
+            f"{path} has config_hash={got}, but the checkpoint records "
+            f"{expected_hash}. Refusing to embed architecture from a different run."
+        )
+    # Link-local paths and job controls are intentionally outside config_hash and
+    # cannot affect model construction. Leave them out so every embedded field is
+    # authenticated by the checkpoint's experiment identity.
+    return {k: v for k, v in cfg.items() if k != "link"}
+
+
 def consolidate(run_dir: str | Path, out: str | Path, *, step: int | None = None,
+                config_path: str | Path | None = None,
                 verbose: bool = True) -> dict[str, Any]:
     """Write one eval-ready checkpoint. Returns a report dict.
 
@@ -436,10 +474,14 @@ def consolidate(run_dir: str | Path, out: str | Path, *, step: int | None = None
     scalars = {k: head[k] for k in EVAL_SECTIONS if k in head}
     del head
 
+    cfg_path = Path(config_path) if config_path is not None else run_dir / "config.json"
+    resolved_config = _resolved_config(cfg_path, str(scalars.get("config_hash", "")))
+
     model, report = consolidate_state_dict(paths, "model", verbose=verbose)
 
     payload: dict[str, Any] = dict(scalars)
     payload["model"] = model
+    payload["resolved_config"] = resolved_config
     payload["consolidated"] = {
         "tool": "loom.train.consolidate",
         "run_dir": str(run_dir.resolve()),
@@ -746,7 +788,7 @@ def main(argv: Sequence[str] | None = None) -> int:
               f"into {src} (hardlinks; run_dir untouched)", flush=True)
 
     if not args.verify_only:
-        consolidate(src, out, step=step)
+        consolidate(src, out, step=step, config_path=config_path)
 
     res: dict[str, Any] = {}
     if not args.no_verify:

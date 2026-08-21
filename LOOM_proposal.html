@@ -153,7 +153,6 @@
 <!-- lane B: z_t to imaginer and decoder -->
 <g fill="none" stroke="#25467F" stroke-width="1.3" marker-end="url(#a3)">
   <path d="M310,296 L74,296 L74,550 L270,550"/>
-  <path d="M74,550 L74,650 L104,650"/>
 </g>
 
 <!-- z_t to sources -->
@@ -171,7 +170,7 @@
   <text class="tag" x="459" y="348" text-anchor="middle" fill="#6A55A0">ACTION-LABELLED PATH · S2</text>
   <rect x="352" y="356" width="214" height="52" fill="#fff" stroke="#6A55A0" stroke-width="1.8" stroke-dasharray="6 3"/>
   <text class="nm" x="459" y="377" text-anchor="middle" fill="#6A55A0">q_a( c | a_t , z_t )</text>
-  <text class="sm" x="459" y="393" text-anchor="middle">regresses q_Δ · train only</text>
+  <text class="sm" x="459" y="393" text-anchor="middle">action anchor; q_Δ regresses sg(q_a) · train only</text>
   <rect x="598" y="356" width="110" height="52" fill="#fff" stroke="#0E141B" stroke-width="1.4"/>
   <text class="nm" x="653" y="387" text-anchor="middle">a_t</text>
 </g>
@@ -187,7 +186,7 @@
 <g>
   <rect x="272" y="444" width="228" height="48" fill="#6A55A0" stroke="#6A55A0" stroke-width="2"/>
   <text class="nm" x="386" y="464" text-anchor="middle" fill="#F7F8FA">c ∈ Δ¹²⁷ , ‖c‖₀ ≤ 4</text>
-  <text class="sm" x="386" y="480" text-anchor="middle" fill="#DAD2EC">hard top-k · + ε·L_balance</text>
+  <text class="sm" x="386" y="480" text-anchor="middle" fill="#DAD2EC">hard top-4 · + 10⁻² Switch L_balance</text>
   <rect x="560" y="444" width="404" height="48" fill="#fff" stroke="#25467F" stroke-width="2"/>
   <text class="nm" x="762" y="464" text-anchor="middle" fill="#25467F">operator bank { A₁ … A₁₂₈ }</text>
   <text class="sm" x="762" y="480" text-anchor="middle">real 2×2 rotation-decay blocks · ‖A_m‖₂ ≤ ρ · SHARED ACROSS ALL BODIES</text>
@@ -210,7 +209,7 @@
   <text class="sm" x="490" y="563" text-anchor="middle">contractive ‖A(c)‖₂ ≤ ρ &lt; 1 by convexity · no MLP · no pixels · h&gt;1 by composition</text>
   <rect x="768" y="524" width="196" height="54" fill="#fff" stroke="#9E2F45" stroke-width="2"/>
   <text class="nm" x="866" y="545" text-anchor="middle" fill="#9E2F45">L_dyn</text>
-  <text class="sm" x="866" y="562" text-anchor="middle">InfoNCE over c · h ∈ {1,2,4}</text>
+  <text class="sm" x="866" y="562" text-anchor="middle">LN-cosine + within-trajectory hinge · h=1…4</text>
 </g>
 <g fill="none" stroke="#9E2F45" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#a4)">
   <path d="M710,551 L766,551"/>
@@ -220,7 +219,7 @@
 <!-- R8 -->
 <g>
   <rect x="106" y="624" width="272" height="52" fill="#fff" stroke="#A8681C" stroke-width="2"/>
-  <text class="nm" x="242" y="645" text-anchor="middle" fill="#A8681C">D_e( z_t , c ) → â</text>
+  <text class="nm" x="242" y="645" text-anchor="middle" fill="#A8681C">D_e( proprio_t , c ) → â</text>
   <text class="sm" x="242" y="662" text-anchor="middle">flow matching · 20 M · only body-specific module</text>
   <rect x="410" y="624" width="88" height="52" fill="#fff" stroke="#0E141B" stroke-width="1.4"/>
   <text class="nm" x="454" y="655" text-anchor="middle">â</text>
@@ -248,7 +247,7 @@
 <!-- ══════════ INFERENCE ══════════ -->
 <section class="panel">
   <div class="panel-head"><h2>Architecture · inference loop</h2>
-    <span class="note">one tree edge = one operator = 8 control steps · depth 4 = one 32-step chunk</span></div>
+    <span class="note">R0: direct π_c → D_e · R3: planned batched shooting · one operator = 8 control steps</span></div>
 
 <svg viewBox="0 0 1060 604" role="img" aria-label="LOOM inference and search loop">
 <text class="band" transform="rotate(-90 18 60)" x="18" y="60" text-anchor="middle">BELIEVE</text>
@@ -261,7 +260,7 @@
   <text class="sm" x="530" y="63" text-anchor="middle" fill="#C9D3E4">~30 ms · once per cycle</text>
   <rect x="428" y="104" width="204" height="46" fill="#fff" stroke="#25467F" stroke-width="2"/>
   <text class="nm" x="530" y="124" text-anchor="middle" fill="#25467F">π_c( c | z_t , ℓ )</text>
-  <text class="sm" x="530" y="140" text-anchor="middle">categorical over 128 · N=1000 · ~15 ms</text>
+  <text class="sm" x="530" y="140" text-anchor="middle">R0 argmax top-4; R3 samples N=1000 trajectories</text>
 </g>
 <g fill="none" stroke="#0E141B" stroke-width="1.4" marker-end="url(#a1)">
   <path d="M530,72 L530,102"/><path d="M530,150 L530,178"/>
@@ -320,15 +319,15 @@
 
 <g>
   <rect x="336" y="372" width="388" height="44" fill="#EEF0F3" stroke="#1C6B5A" stroke-width="2"/>
-  <text class="eq" x="530" y="392" text-anchor="middle">S = Φ(ẑ₄,ℓ) − Φ(z_t,ℓ) − λ_u·U − λ_c·C</text>
-  <text class="sm" x="530" y="407" text-anchor="middle">telescopes exactly · root baseline cancels across paths</text>
+  <text class="eq" x="530" y="392" text-anchor="middle">S = Φ(ẑ₄,ℓ)</text>
+  <text class="sm" x="530" y="407" text-anchor="middle">R3 only · batched shooting, no MCTS, uncertainty, or cost term</text>
 </g>
 
 <g>
   <rect x="462" y="450" width="136" height="42" fill="#6A55A0" stroke="#6A55A0" stroke-width="2"/>
   <text class="nm" x="530" y="476" text-anchor="middle" fill="#F7F8FA">c* root edge</text>
   <rect x="140" y="450" width="252" height="42" fill="#fff" stroke="#A8681C" stroke-width="2"/>
-  <text class="nm" x="266" y="469" text-anchor="middle" fill="#A8681C">D_e( z_t , c* ) → a</text>
+  <text class="nm" x="266" y="469" text-anchor="middle" fill="#A8681C">D_e( proprio_t , c* ) → a</text>
   <text class="sm" x="266" y="484" text-anchor="middle">swap per body · SO-101 / UR5e / Franka</text>
   <rect x="668" y="450" width="256" height="42" fill="#fff" stroke="#78848F" stroke-width="1.6" stroke-dasharray="6 3"/>
   <text class="nm" x="796" y="469" text-anchor="middle">‖ q_a(â,z) − c* ‖ &gt; τ → reject</text>
@@ -358,20 +357,20 @@
 
 <!-- ══════════ SPEC ══════════ -->
 <section class="panel">
-  <div class="panel-head"><h2>Module spec</h2><span class="note">0.9 B shared + 20 M per body</span></div>
+  <div class="panel-head"><h2>Module spec</h2><span class="note">≈255 M shared + 50 M per body</span></div>
 <table>
 <thead><tr><th>module</th><th>trainable</th><th>params</th><th>config</th></tr></thead>
 <tbody>
 <tr><td class="m">visual encoder</td><td>frozen</td><td class="n">—</td><td>SigLIP2-so400m, 224², all RGB + tactile streams</td></tr>
 <tr><td class="m">text encoder</td><td>frozen</td><td class="n">—</td><td>SigLIP2 text tower</td></tr>
-<tr><td class="m">E · estimator</td><td>yes</td><td class="n">700 M</td><td>Perceiver, K=128, d=768, 10 blocks, 16 heads</td></tr>
+<tr><td class="m">E · estimator</td><td>yes</td><td class="n">150 M</td><td>Perceiver, K=128, d=768, 10 blocks, 16 heads</td></tr>
 <tr><td class="m">Ē · EMA target</td><td>no</td><td class="n">—</td><td>τ = 0.996</td></tr>
-<tr><td class="m">{A_m} · bank</td><td>yes</td><td class="n">12 M</td><td>M=128, 384 real 2×2 blocks each, r = ρ·σ(θ), ρ=0.98</td></tr>
+<tr><td class="m">{A_m} · bank</td><td>yes</td><td class="n">25 M</td><td>M=128, 384 real 2×2 blocks each, r = ρ·σ(θ), ρ=0.98</td></tr>
 <tr><td class="m">q_Δ</td><td>train only</td><td class="n">30 M</td><td>(z_t, z_t+1) → Δ¹²⁷, top-4 straight-through</td></tr>
-<tr><td class="m">q_a</td><td>train only</td><td class="n">30 M</td><td>(a_t, z_t) → Δ¹²⁷, regresses sg(q_Δ)</td></tr>
-<tr><td class="m">D_e · decoder</td><td>yes, per body</td><td class="n">20 M</td><td>flow matching, 32×dof output</td></tr>
+<tr><td class="m">q_a</td><td>train only</td><td class="n">30 M</td><td>(a_t, z_t) → Δ¹²⁷; action anchor, q_Δ regresses sg(q_a)</td></tr>
+<tr><td class="m">D_e · decoder</td><td>yes, per body</td><td class="n">20 M</td><td>flow matching, 8×dof output; task information only through c</td></tr>
 <tr><td class="m">Φ · potential</td><td>S3 only</td><td class="n">0.2 M</td><td>pool(z) ⊕ ℓ → 256 → 1</td></tr>
-<tr><td class="m">π_c · proposal</td><td>S3 only</td><td class="n">150 M</td><td>categorical(128) + top-4 weights</td></tr>
+<tr><td class="m">π_c · proposal</td><td>R0 / R2 / R3</td><td class="n">50 M</td><td>categorical(128) + top-4 weights; sparse weighted CE to sg(q_a) in R0</td></tr>
 </tbody>
 </table>
 <div class="pad">
@@ -379,11 +378,12 @@
 c        = q_Δ(z_t, z_{t+1})   or   q_a(a_t, z_t)  Δ¹²⁷, ‖c‖₀ ≤ 4
 A(c)     = Σ_m c_m A_m                             ‖A(c)‖₂ ≤ ρ  (convexity)
 ẑ_{t+h}  = A(c_{t+h-1}) ⋯ A(c_t) z_t + Σ b         h > 1 by COMPOSITION only
-â        = D_e(z_t, c)
+â        = D_e(proprio_t, c)
 
-L_dyn    = −Σ_h w_h log [ exp(sim(ẑ_{t+h}, z⁺_{t+h})/τ) / Σ_{c⁻} exp(sim(A(c⁻)…z_t, z⁺)/τ) ]
-L_act    = FlowMatching(â, a_t)
-L        = L_dyn + λ_a·L_act + ε·L_balance         λ_a = 1.0,  ε = 3e-3</pre>
+L_dyn    = Σ_h w_h[1−cos(LN(ẑ_{t+h}),LN(z⁺_{t+h}))] + same-trajectory hinge
+L_act    = FlowMatching(â, a_t) + ‖q_Δ−sg(q_a)‖²
+L_prop   = CE(sg(top4(q_a)), π_c(z,ℓ))
+L        = L_dyn + L_act + L_prop + 10⁻²·L_balance</pre>
 </div>
 </section>
 
@@ -396,9 +396,10 @@ L        = L_dyn + λ_a·L_act + ε·L_balance         λ_a = 1.0,  ε = 3e-3</p
 <li><b>operator bank</b> — M=128 × 384 real 2×2 rotation-decay blocks. Radius <code>r = ρ·sigmoid(θ)</code>, angle <code>ω</code> free. Assert <code>‖A(c)‖₂ ≤ ρ</code> numerically on random simplex draws.</li>
 <li><b>q_Δ + top-k</b> — straight-through top-4 with renormalisation so <code>c</code> stays on the simplex. This is what makes the contractivity bound hold; do not substitute a plain softmax.</li>
 <li><b>imaginer</b> — batched composition <code>A(c_H)⋯A(c_1)z</code>. Must be a single fused elementwise kernel over the block-diagonal, not a matmul loop. Target: 1000 candidates × depth 4 under 5 ms.</li>
-<li><b>L_dyn</b> — InfoNCE with in-batch negatives drawn from other transitions. Uncurated negatives; do not group by task or embodiment.</li>
-<li><b>q_a + D_e</b> — <code>q_a</code> regresses <code>sg(q_Δ)</code>, so both write into one coefficient space by construction. <code>D_e</code> is flow matching on (z, c).</li>
-<li><b>Φ + π_c + MCTS</b> — 128-arm MCTS, depth 4, PUCT with π_c as prior. Only built for Run 3.</li>
+<li><b>L_dyn</b> — weighted layer-normalized cosine prediction plus a hinge against coefficients from the same trajectory at least two segments away.</li>
+<li><b>q_a + D_e</b> — action-labelled <code>q_a</code> anchors the space; <code>q_Δ</code> regresses <code>sg(q_a)</code>. <code>D_e</code> is flow matching on <code>(proprio,c)</code>, so task information must pass through the operator.</li>
+<li><b>π_c</b> — executable R0 head, trained by sparse coefficient-weighted CE to detached top-4 <code>q_a</code>; direct argmax feeds <code>D_e</code> at deployment.</li>
+<li><b>Φ + shooting</b> — batched proposal sampling, depth-4 bank rollout, and leaf-potential argmax. R3 only; no MCTS or extra score terms.</li>
 </ol>
 <div class="gate">
 <b>Single build assert.</b> During training, log <code>d(A(c_true)z, z⁺) − d(A(c_random)z, z⁺)</code>. If this gap sits near zero, <code>c</code> is being ignored, <code>A(c) ≈ I</code>, and the model has silently degenerated into a plain latent policy. Not a research metric — a unit test that the architecture is wired.
@@ -407,16 +408,54 @@ L        = L_dyn + λ_a·L_act + ε·L_balance         λ_a = 1.0,  ε = 3e-3</p
 
 <!-- ══════════ RUNS ══════════ -->
 <section class="panel">
-  <div class="panel-head"><h2>Runs</h2><span class="note">32–64 × A100 80 GB · bf16 · FSDP</span></div>
+  <div class="panel-head"><h2>Runs</h2><span class="note">16 × A100 80 GB for R0 · bf16 · FSDP</span></div>
 <table>
 <thead><tr><th>run</th><th>data</th><th>trains</th><th>losses</th><th>time</th><th>read out</th></tr></thead>
 <tbody>
-<tr><td class="m">R0</td><td>LIBERO per-suite, from scratch</td><td>E, bank, q_Δ, q_a, D_e</td><td class="m">L_dyn + L_act</td><td class="n">~2 d</td><td>LIBERO success</td></tr>
+<tr><td class="m">R0</td><td>LIBERO, all four suites</td><td>E, bank, q_Δ, q_a, D_e, π_c</td><td class="m">L_dyn + L_act + L_proposal + L_balance</td><td class="n">~8 h</td><td>LIBERO success</td></tr>
 <tr><td class="m">R1</td><td>Ego4D + Ego-Exo4D + HoloAssist, action-free</td><td>E, bank, q_Δ</td><td class="m">L_dyn</td><td class="n">~4 d</td><td>—</td></tr>
-<tr><td class="m">R2</td><td>OpenNeoData 5k h + AgiBot 3k h + RoboMIND 1.4k h + OXE 600 h</td><td>+ q_a, D_e</td><td class="m">L_dyn + L_act</td><td class="n">~6 d</td><td>LIBERO, LIBERO-Plus, RoboTwin</td></tr>
+<tr><td class="m">R2</td><td>OpenNeoData 5k h + AgiBot 3k h + RoboMIND 1.4k h + OXE 600 h</td><td>+ q_a, D_e, π_c</td><td class="m">L_dyn + L_act + L_proposal + L_balance</td><td class="n">~6 d</td><td>LIBERO, LIBERO-Plus, RoboTwin</td></tr>
 <tr><td class="m">R3</td><td>sim rollouts</td><td>+ Φ, π_c</td><td class="m">L_Φ + L_proposal + GRPO</td><td class="n">~3 d</td><td>same three, with search on</td></tr>
 </tbody>
 </table>
+<div class="gate">
+<b>R0 deployed-coefficient refinement.</b> Starting from the verified best-scoring 27k sparse-CE checkpoint (36.42%; its short proposal-only objective was still moving), train the existing action-realization loss on the coefficient the deployed policy actually emits: <code>c_π = top4(π_c(z,ℓ))</code>, <code>L_act = CFM(D_e(proprio,c_π),a)</code>. Keep sparse-CE imitation to <code>sg(q_a)</code> as the semantic anchor and update only <code>π_c</code> and <code>D_e</code>. This adds no input, module, or loss; it closes the teacher/deployment coefficient gap while preserving <code>c</code> as the only task-information channel into the body decoder. Evaluate only after deployed action loss and sparse CE plateau off their applicable floors.
+The converged step-49,666 parity gate scored 152/400 = 38.0% (40/32/48/32) on exactly the same condition, environment-seed, and policy-seed keys as the prior 156/400 = 39.0% arm (45/40/44/27). The subsequent authoritative evaluation completed 447/1,200 = 37.25% (40.67/29.67/53.67/25.00) with zero errors, +0.83 points over step 27k but with gains isolated to Goal. Its verified artifact <code>runs/r0a_deploy_s1_eval/ckpt_000049666.pt</code> is the current best average and the frozen seed for the next method. Full result: <code>runs/eval_r0a_deploy_s1_s49666_seeded1200_v2/summary.md</code>.
+</div>
+<div class="gate">
+<b>Iteration 2 · B4 recurrent burn-in · final negative outcome.</b> For each retained <code>uniform_window</code> sample, prepend four already-cached prior operator-boundary observations at <code>t−32, t−24, t−16, t−8</code>, oldest to newest. Replay the four observations independently through the online estimator and EMA target under <code>no_grad</code>, each from its own empty recurrent state; detach both prefix beliefs before the unchanged five main states. Inputs, supervised action chunks, modules, deployed <code>L_act</code>, and sparse proposal CE are unchanged. Train only <code>π_c</code> from the step-49,666 seed; fix the estimator, decoder, bank, <code>q_Δ</code>, and <code>q_a</code>, and explicitly freeze the EMA against both gradients and updates. Held-out B4 versus full-history preflight passed on 116 boundaries across all 40 tasks: exact top-1/top-4 support and 0.999996 overall action-loss parity. Jobs 32490962/32490963 reached step 58,000 with 8,334 clean post-seed updates, but the exact verdict was <code>NOT_CONVERGED</code>: four-block action loss drifted 4.995% and worsened 5.736% from the locked reference, while proposal CE was flat at 0.470% drift. B4 was rejected; no checkpoint was consolidated and no simulator evaluation was run.
+</div>
+<div class="gate">
+<b>Iteration 3a · action-anchored bank fit · rejected.</b> Start a new run at global step 49,666 from the verified consolidated <code>runs/r0a_deploy_s1_eval/ckpt_000049666.pt</code>, explicitly not from the rejected, unconsolidated B4 shards. Keep <code>uniform_window</code> and B4's cached <code>t−32/t−24/t−16/t−8</code> history, replaying the online and EMA prefixes separately under <code>no_grad</code> before the unchanged five states; reserve each task's complete <code>demo_49</code> trajectory for the stage-heldout gate and optimize on its exact complement. At each horizon use <code>c_a,h = sg(q_action(a_h,z_h))</code>, not <code>c_Δ</code>, in the existing sequential <code>L_dyn</code> and same-trajectory hinge. Train only the bank; freeze the estimator, EMA, <code>q_Δ</code>, <code>q_a</code>, decoder, <code>π_c</code>, and <code>Φ</code>, disable other losses, disable EMA updates, and clear only the bank's old Adam moments once at the method transition. Preserve the fixed absolute 80,000-step cosine horizon. From step 49,666, require four complete 2,000-step blocks with ≤2% drift in the sole convergence primary <code>loss/dyn</code>; watch <code>dyn/pos</code>, <code>dyn/neg</code>, <code>delta_op</code>, <code>delta_sel/h1…h4</code>, and <code>grad_norm</code>. After convergence, a deterministic gate uses 256 seeded task-balanced windows, 32 proposal plans per root, one global cyclic previous-row control, and 2,000 paired task/whole-trajectory bootstrap replicates; every 95% CI lower endpoint must be strictly above zero for <code>delta_sel/h1…h4</code>, <code>identity_error/h − bank_rollout_error/h</code>, and proposal-leaf pairwise cosine spread. The deployed cache yields a disjoint 1,960-trajectory/47,271-window train split and 40-trajectory/918-window gate split, both covering all 40 tasks; the fixed gate has 6–7 unique rows per task. Config <code>6db3572a8ee3123e</code>, the 31-test gate slice, and the full non-slow repository suite pass preflight. The fixed 2,000-row liveness window failed: median signed <code>delta_op=+2.79918e-5</code> versus required <code>&gt;+0.01</code>, although median bank gradient was <code>0.00653263</code> and skips were zero. <code>STOP</code> was written; no convergence, heldout, or simulator result is claimed.
+</div>
+<div class="gate">
+<b>Iteration 3a-N4 · rejected one-scalar fallback.</b> Restart from the verified step-49,666 deploy shards and change only the existing same-trajectory hinge weight <code>losses.dyn.neg_weight: 1→4</code>. Keep inputs, action-labelled coefficients, frozen/trainable modules, data split, burn-in, LR/schedule, bank-state reset, and every gate unchanged. Recipe <code>configs/r0a_bank_ca_n4.yaml</code>, hash <code>e2dbdef1d95ad344</code>; run <code>r0a_bank_ca_n4_s1</code>, jobs <code>32511156/32511157</code>, W&amp;B <code>f630e21a0e394e18</code>. The exact 2,000-row liveness gate failed: median signed <code>delta_op=+6.02305e-5</code>, maximum <code>+0.005573</code>, and 0/2,000 rows above the required <code>+0.01</code>. The hinge was active (<code>dyn/neg=0.67803</code> versus <code>dyn/pos=0.23636</code>), bank gradient doubled to <code>0.0137725</code>, and skips were zero, so scalar weighting did not repair operator liveness. <code>STOP</code> was written and the safety link is terminal at step 52,714; no convergence, heldout, or simulator result is claimed.
+</div>
+<div class="gate">
+<b>Iteration 3a-QA · audited joint repair, rejected.</b> Keep the N4 action-labelled route and hinge, allow <code>L_dyn</code> to backpropagate through <code>c_a=q_action(a,z)</code>, and train only bank plus <code>q_action</code>. Retain the existing weight-1 frozen-decoder <code>L_act</code> with <code>align_to:q_a</code> and <code>decode_from:q_action</code>; this preserves q_action's defined action-semantic gradient and prevents an unanchored private bank/code convention. Recipe <code>configs/r0a_bank_ca_qa.yaml</code>, hash <code>0ec8af0a26135ecc</code>; run <code>r0a_bank_ca_qa_s1</code>, W&amp;B <code>bce708fb85014b5b</code>. Full q_action LR scale was 1.0, bank 0.1, both Adam states reset once, and EMA/frozen coordinates stayed fixed. Jobs <code>32515978</code>/<code>32516601</code>/<code>32516602</code> all completed 0:0. The exact 2,000-row liveness gate failed: median signed <code>delta_op=+6.81542e-5</code> versus required <code>&gt;+0.01</code>, while median bank/q_action gradients were healthy at <code>0.0110436/0.123302</code>, skips were zero, and no unexpected gradients or nonfinite values occurred. <code>STOP</code> was written; the terminal step is 52,674 with 16/16 shards. No convergence, heldout, consolidation, or simulator result is claimed. This rejects further scalar bank/q_action tuning and activates the staged fresh-R0 contingency.
+</div>
+<div class="gate">
+<b>Iteration 3c · staged fresh-R0 contingency, rejected at Phase A.</b> One bounded rebuild tested whether unchanged <code>L_act + L_proposal + L_balance</code> could establish q_action/q_delta semantics before enabling <code>L_dyn</code>. Phase A was job <code>32519130</code>, run <code>r0a_fresh_staged_s1</code>, W&amp;B <code>17633c551b5a4dfc</code>, hash <code>3de2324b2e369c20</code>. Job <code>32519130</code> completed 0:0 in 25:07; <code>LATEST</code> is step 2,000 with 16/16 shards. The persisted artifact <code>runs/r0a_fresh_staged_s1/phase_gate_001000_002000.json</code> (<code>sha256:b3e81eaf549ce75587dc7bdfac6e067b96fb19f7f54b3de4dd77f108e0f56885</code>) covers exactly 1,000 contiguous rows. Three locked checks failed: <code>act/align=0.592831 &gt; 0.40</code>, q_delta spread <code>0.019616 &lt; 0.10</code>, and five live q_delta operators versus at least 16. The other checks passed: q_action spread <code>0.531661</code>, 36 live q_action operators, proposal loss <code>3.33187</code>, every expected gradient present, bank gradients absent, and skips zero. Phase B was never submitted. This closes offline dynamics/code repair and moves the next iteration to actual terminal-outcome GRPO on the deployed proposal policy.
+</div>
+<div class="gate">
+<b>Iteration 4 · canonical terminal-outcome proposal GRPO · validation complete, launch authentication corrected.</b> Optimize the deployed <code>E → π_c → D_e</code> decision directly, freezing estimator/EMA/bank/q_delta/q_action/decoder/Phi and training only the existing proposal. The canonical implementation is <code>loom/train/outcome_grpo.py</code> plus <code>scripts/train_outcome_grpo.py</code>/<code>scripts/outcome_grpo.sbatch</code>; resolved config <code>configs/r0a_outcome_grpo.yaml</code> remains <code>1786ff2272566453</code>, and its corrected authenticated 28-file behavior closure after row-wise replay plus the process-lifetime sole-writer lock is <code>61882a886642b0fc2b09ffdaf570ab1f53946f7cf52f4909d900f8368ada01a3</code>. The settled tree passes 59/59 focused trainer, 75/75 trainer-plus-direct-validation, and 117/117 trainer-plus-promotion tests. It restores step 49,666, resets proposal Adam state exactly once, then performs 800 accepted updates on each of six immutable folds: 4,800 contiguous updates through step 54,466 on the fixed 80,000-step schedule. All eight terminal rewards form the baseline; stored-order Plackett–Luce ratios/loss use only arms 1–7, clip epsilon 0.2, and reduce equally replan→arm→group. Informative-only training requires at least 100 independent groups per fold, uses two contexts per sampled arm, pools Switch balance across all 14 logits, and adds the authenticated sparse q_action CE anchor from the 1,960-trajectory/47,271-window train split excluding <code>demo_49</code>. No Phi/bank/shaped reward is allowed; EMA is off, only proposal gradients are legal, and sampling/resume are deterministic, checkpointable, rank-unique, and ledger-reconciled.
+<br><br>All six collector jobs completed <code>0:0</code> with exact COMPLETE manifests: 200 groups / 1,600 trajectories per fold, informative counts <code>146/159/143/148/148/159</code>, and 1,200 groups / 9,600 trajectories total. Independent full byte/receipt/tensor re-authentication passed for all 1,200 groups. Manifest SHA-256s for <code>train0..train5</code> are <code>f92f50960e1640b32f2f50c6e9a7c61603204ea21369c6e2493d3770b3683c17</code>, <code>8c45d514454598eb1c53c0d3ea3a12b3606f84baae612e5d3c2dc50bfd904421</code>, <code>4a53fca9490840e90319d2fde986f8f6c12a6d236869c5000e5b4f0e1555b29b</code>, <code>289c0d6796d1bfccf471bb519c3145b0837147280b5059ae62d821a5b7d3594e</code>, <code>025a8a81556a733da4401fb489306222e93e72535f3ca8266c4780fc76f9857b</code>, and <code>61253c67af3ea3c5cda710a78498e098bd2ea54082ba557ad2145a79e14a1700</code>. Parent arm 0 succeeded 463/1,200 (38.6%), pass@8 was 960/1,200 (80.0%), and 903/1,200 groups (75.2%) were informative. These are training-data facts, not an oracle or deployable result.
+<br><br>Before candidate emission, snapshots 53,666/53,866/54,066/54,266/54,466 must evaluate the exact clipped surrogate on all 400 validation groups with group→arm1..7→replan reduction and all-equal groups retained as exact zero. A seed-0, 2,000-replicate task-stratified paired whole-group bootstrap requires the final-minus-seed 95% CI lower endpoint above zero and every final-minus-earlier CI wholly inside <code>[-0.01,+0.01]</code>; final mean approximate KL must be ≤0.01. Exactly 4,800 accepted rows are required, and the final four 200-update sparse-CE block medians must stay within 2%, with the terminal block below <code>ln(128)</code>. Trust also requires clip fraction ≤0.20, ESS fraction ≥0.80, p95 coefficient L2 drift ≤0.05, at least 16 live operators, top-k overlap decline ≤0.05, frozen-byte identity, zero nonfinite values, and no unexpected gradients. Terminal PASS/FAIL is atomic and only PASS emits a candidate. The independently hardened promotion authenticator passes <b>57/57 focused and 117/117 combined prelaunch tests</b> against the refreshed source pin; it requires exact step-54,466/4,800-update/config/source lineage, six-fold plus validation provenance, and matching convergence/trust/terminal PASS evidence before accepting a candidate. External promotion requires at least 164/400 successes on untouched official seed-0 episodes and paired improvement over the 149/400 reference.
+<br><br><b>Validation terminal evidence:</b> job <code>32523490</code> completed <code>0:0</code> at 2026-08-20 00:14:48 UTC. Its atomic COMPLETE manifest SHA-256 is <code>c7a59139bfe4cc8412a82f735b9668f4865f753e5248957b3430617b3e6b9272</code>: exactly 400 groups / 3,200 trajectories, with 291 informative groups versus the required 200. Successes by arm are <code>[143,148,125,139,146,134,121,126]</code>; arm 0 is 143/400 and pass@8 is 309/400. Arm-0/pass@8 suite counts are Spatial <code>38/77</code>, Object <code>32/79</code>, Goal <code>48/88</code>, and Long <code>25/65</code>. There were zero harness errors and one nonfatal MuJoCo QACC warning.
+<br><br><b>Canonical launch outcome:</b> job <code>32530592</code> ran on eight ranks from 00:14:56 to 00:19:23 UTC and failed closed during pre-update behavior authentication (<code>FAILED 2:0</code>). Replay found parent-proposal coefficient mismatches in <code>libero_spatial/task=00/trial=10/seed=0 arm 0</code> (<code>max_abs=0.000567138</code>) and trial 15 arm 0 (<code>max_abs=0.000200659</code>). The attempt used exact config <code>1786ff2272566453</code> and then-current source closure <code>2efc943c81eec2250a46b0c5aa0007bd7c785a9b2081f6cf2ea1fa27390ae4a8</code>, but the run has zero metric rows, no HEARTBEAT/LATEST/checkpoint, no terminal report, and no candidate. This is an authentication failure, not a training, convergence/trust, promotion, or SR result.
+<br><br><b>Exact batch-1 replay correction:</b> full fixed-group A100-SXM4 probe job <code>32534089</code> completed <code>0:0</code> in 38 seconds (13.8998 seconds replay). Artifact <code>runs/outcome_auth_probe_train0_group0.json</code> is SHA-256 <code>c028f191e6bca3d6b0cac915cdd9347cb0a952aaf9ace4caafecc6bd0eb255cd</code> and covers all 469 replans of <code>train0</code> group 0. Collector-equivalent batch-1 FP32 with TF32 off and no autocast reproduced stored coefficients and sampled old log-probabilities exactly: max/p95 errors were <code>0/0</code> for each, raw argmax support order/set matched on <code>469/469</code> replans and arm-0 <code>97/97</code>, and expanded-language plus deterministic trainer batch-1 replays were also exact. Chunk-32 FP32 produced coefficient max/p95 <code>1.43018e-3/4.51460e-4</code> and sampled-old-log-probability max/p95 <code>7.94983e-3/3.35903e-3</code>, with sets matching <code>469/469</code> but one order change. Batch-1 TF32 increased those errors to <code>4.07127e-2/1.08394e-2</code> and <code>3.95479e-1/1.04792e-1</code>; batch-1 BF16 increased them to <code>5.62145e-1/1.16199e-1</code> and <code>2.72474/1.29072</code>, with support changes in both reduced-precision modes. The exact fix is row-wise batch-1 FP32, TF32 off, no autocast, chunking only for transfer, and no tolerance widening. Config remains <code>1786ff2272566453</code>; the probe-validated row-wise source closure is <code>33223ca4dee84190fa9061fa48c6b7c2e488bce0a8338b01525034b2a41ed87b</code>, superseded for launch only by sole-writer hardening closure <code>61882a886642b0fc2b09ffdaf570ab1f53946f7cf52f4909d900f8368ada01a3</code>.
+<br><br><b>Sole-writer launch correction:</b> relaunches <code>32534207</code>/<code>32534324</code> shared <code>runs/r0a_outcome_grpo_s1</code>; the duplicate-launch guard wrote <code>STOP</code> before the first update. All 16 ranks reported <code>PREEMPTED_DURING_COLLECTION_AUTH</code>, both jobs completed <code>0:0</code> at step 49,666, and the run has zero metric rows and no HEARTBEAT/LATEST/checkpoint/terminal report/candidate. A process-lifetime sole-writer lock was then added and authenticated under closure <code>61882a886642b0fc2b09ffdaf570ab1f53946f7cf52f4909d900f8368ada01a3</code>. Canonical job <code>32534523</code> (<code>r0a_outcome_grpo_canonical</code>) is active in isolated <code>runs/r0a_outcome_grpo_canonical_s1</code> and owns that lock. Submission <code>32534680</code> targets the old run directory and is superseded through its existing <code>STOP</code> sentinel. No training, convergence/trust, promotion, or SR result is claimed from nonterminal canonical work.
+<br><br><b>Unique canonical retry:</b> the collided run and its <code>STOP</code> are preserved unchanged. Job <code>32534523</code> (<code>r0a_outcome_grpo_canonical</code>) used the fresh directory <code>runs/r0a_outcome_grpo_canonical_s1</code>. It completed the full pre-update gate: row-wise batch-1 replay passed on <code>train0..train5</code> plus validation with atom counts <code>[119090,117310,118179,117895,119238,117099,240945]</code>, and every split reported exactly zero maximum coefficient and old-log-probability error under the original tight tolerances. All eight ranks opened the exact authenticated train loader (1,960 trajectories / 47,271 windows, uniform-task sampling, burn-in 4); W&amp;B run ID is <code>b1a5a9a9752b4f45</code>. The durable initial checkpoint and <code>LATEST=49666</code> were written before training. The first accepted row then exposed a distinct fail-closed defect in the training path: under its bf16 autocast/batched replay, the supposedly identical behavior ratio was already <code>mean=1.05611</code>, <code>min=0.469427</code>, <code>max=2.21471</code>, with clip fraction <code>0.544643</code>, rather than identity. <code>STOP</code> was written with reason <code>fail closed: initial behavior ratio was not identity under bf16 autocast; preserve checkpoint for audit only</code>. The job completed <code>0:0</code> at 2026-08-20 01:17:43 UTC after 133 finite, skip-free, config-matching contiguous rows (steps 49,667–49,799); terminal <code>LATEST=49799</code> points to the sentinel checkpoint (SHA-256 <code>94394a554cc676388dea65863e2ae7c2fe5687955c649de6ae54b986b0a39deb</code>, 586,209,834 bytes, one proposal reset, source closure <code>61882a886642b0fc2b09ffdaf570ab1f53946f7cf52f4909d900f8368ada01a3</code>). There is no terminal report or candidate. This checkpoint is audit-only: no convergence, trust, promotion, or simulator result is claimed.
+</div>
+<div class="gate">
+<b>Iteration 3a-QA-omega0 · rejected at liveness.</b> Recipe <code>configs/r0a_bank_ca_qa_omega0.yaml</code>, hash <code>7a5e8a24327ecc0c</code>, inherited QA and added exactly one authenticated parameter reset from deploy hash <code>a199324a6205bb6d</code>: zero only <code>bank.omega</code> (6,291,456 elements). The release-gate implementation and integration slice passed 125/125. Before training, <code>scripts/omega0_preflight.py</code> restored the verified step-49,666 deploy checkpoint, proved every non-omega tensor and the direct estimator/proposal/decoder path exact, and passed all four strict rollout-versus-identity comparisons on 16 fixed task-distinct windows from the authenticated <code>demo_49</code> holdout. Pre-update artifact: <code>runs/r0a_bank_ca_qa_omega0_s1/pre_update_gate.json</code> (<code>sha256:c4745ffa5459aaed3ba6d5b72db6f8a82b3f3176152aced5e61cdfce685a532e</code>). Training then ran from all 16 exact deploy shards under jobs <code>32522670/32522671/32522672</code>, with the expected one-time omega and bank/q_action optimizer resets. The exact 2,000-row <code>(50,666,52,666]</code> liveness gate failed only <code>delta_op</code>: median <code>+1.079626e-4</code> versus required <code>&gt;+0.01</code>; median bank/q_action gradients were <code>4.67323e-4/1.41187e-2</code>, skips were zero, and no unexpected gradients occurred. Artifact: <code>runs/r0a_bank_ca_qa_omega0_s1/liveness_050666_052666.json</code> (<code>sha256:7ec6fe59aa36ca0811206c3db627ff44275f9d1ecebe08a0dd647dc71f5388c8</code>). Autostop wrote <code>STOP</code>. All three serialized jobs completed <code>0:0</code> without overlap at steps 52,675/52,676/52,677; the two same-hash recovery links did not repeat either reset, and their one-step sentinel races remained outside the fixed gate. Terminal <code>LATEST=52677</code> has 16/16 nonzero shards, and all 3,011 metric rows from 49,667 through 52,677 are valid and contiguous. No convergence, heldout-bank, oracle, or simulator result is claimed. This closes the offline bank/dynamics branch.
+</div>
+<div class="gate">
+<b>Iteration 4 · superseded Round-0 planning note.</b> The earlier one-fold/400-update harness and real-cache preflight are retained only as noncanonical diagnostics. Job <code>32526232</code> auto-released when validation completed and <code>32528244</code> remains chained behind it, but neither can supply evidence for the canonical six-fold recipe. Only the preceding canonical Iteration 4 recipe and its fail-closed gates can authorize a candidate.
+</div>
+<div class="gate">
+<b>Iteration 3b preflight · causal K=16 root oracle.</b> After an action-bank stage passes its heldout gate, <code>scripts/libero_root_oracle.py</code> runs 16 fresh branches from each official seed-0 WorkItem's identical reset. Arm 0 forces exact deployed argmax once; arms 1–15 force independent SHA-seeded proposal samples once. Every arm receives identical root decoder noise, <code>q_a</code> scores the exact decoded/executed root segment, and only that root is intervened on; later replans use the frozen direct argmax policy. Eligibility is residual ≤0.5 and reward is terminal success, with no rejection fall-through. Promotion requires 400 groups / 6,400 rows / zero errors, exact arm-0 reproduction of 149/400 and suites 40/32/48/29, complete reset/RNG/root/execution/continuation provenance, a fixed 14-file behavior-source digest bound to resume identity, and masked oracle ≥360/400 overall. This is the causal root action-value/failure-snapshot gate; it does not claim to run the bank/<code>Φ</code> planner. Root/oracle/eval validation passes 137/137. The separate 1,200×16 all-replans harness is only a stochastic-policy portfolio diagnostic because its arms diverge after root one; it is not an operator-oracle promotion gate and remains unlaunched.
+</div>
 <div class="gate">
 <b>Go / no-go.</b> R0 ≥ 96.2 average on standard LIBERO. That is VLA-Adapter's number at 0.6 B with no embodied pretraining, and it is the correct bar because LOOM also freezes a foundation encoder. Below it, the operator formulation is not competitive as a policy class and nothing downstream is worth running.
 </div>
@@ -454,11 +493,12 @@ L        = L_dyn + λ_a·L_act + ε·L_balance         λ_a = 1.0,  ε = 3e-3</p
 <tr><td class="m">Fast-WAM</td><td class="n">6 B</td><td>✗</td><td class="n">97.0</td><td class="n">99.4</td><td class="n">96.6</td><td class="n">94.8</td><td class="n">97.0</td></tr>
 <tr><td class="m">Motus</td><td class="n">8 B</td><td>✓</td><td class="n">96.8</td><td class="n">99.8</td><td class="n">96.6</td><td class="n">97.6</td><td class="n">97.7</td></tr>
 <tr><td class="m">LingBot-VA</td><td class="n">5.3 B</td><td>✓</td><td class="n">98.5</td><td class="n">99.6</td><td class="n">97.2</td><td class="n">98.5</td><td class="n">98.5</td></tr>
-<tr class="target"><td class="m">LOOM · R0</td><td class="n">0.9 B</td><td>✗</td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td></tr>
-<tr class="target"><td class="m">LOOM · R2</td><td class="n">0.9 B</td><td>✓</td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td></tr>
+<tr class="target"><td class="m">LOOM · R0-A · verified best @27k (not converged)</td><td class="n">0.3 B</td><td>✗</td><td class="n">44.7</td><td class="n">34.3</td><td class="n">41.3</td><td class="n">25.3</td><td class="n">36.4</td></tr>
+<tr class="target"><td class="m">LOOM · R0-A · deploy exposure @49,666</td><td class="n">0.3 B</td><td>✗</td><td class="n">40.7</td><td class="n">29.7</td><td class="n">53.7</td><td class="n">25.0</td><td class="n">37.3</td></tr>
+<tr class="target"><td class="m">LOOM · R2</td><td class="n">0.3 B</td><td>✓</td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td></tr>
 </tbody>
 </table>
-<div class="pad" style="color:var(--soft);font-size:13px">Baselines from Light-WAM Table 1, single source. Fast-WAM's average is printed as 97.6 / 97.0 / 97.60 by three different papers — never assemble this table across sources.</div>
+<div class="pad" style="color:var(--soft);font-size:13px">Baselines from Light-WAM Table 1, single source. Fast-WAM's average is printed as 97.6 / 97.0 / 97.60 by three different papers — never assemble this table across sources. The step-27k LOOM row is 437/1,200 from <code>runs/r0a_s8_sparse_lr03_prop_flat_eval/ckpt_000027000.pt</code>; its 2k proposal-only continuation was still moving and is retained as a verified historical measurement. The converged deploy-exposure row is 447/1,200 from <code>runs/r0a_deploy_s1_eval/ckpt_000049666.pt</code>, with zero harness errors; full provenance is in <code>runs/eval_r0a_deploy_s1_s49666_seeded1200_v2/summary.md</code>.</div>
 </section>
 
 <section class="panel">
@@ -492,6 +532,19 @@ L        = L_dyn + λ_a·L_act + ε·L_balance         λ_a = 1.0,  ε = 3e-3</p
 <tr><td class="m">simulator</td><td>ManiSkill3 for GPU-parallel envs; state save/restore required for R3</td></tr>
 </tbody>
 </table>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h2>Iteration 4 correction · exact terminal-outcome training</h2><span class="note">seven-split + first-forward identity passed · training live</span></div>
+  <div class="pad">
+    <p>Job <code>32534523</code> is terminal and rejected. Its step-49,799 checkpoint contains 133 audit-only updates whose first behavior ratio was already nonidentity (<code>mean=1.05611</code>, <code>min=0.469427</code>, <code>max=2.21471</code>, clip fraction <code>0.544643</code>); it must not be resumed or evaluated.</p>
+    <p>The method remains proposal-only terminal-success GRPO plus the existing sparse q_action CE anchor and <code>1e-2</code> proposal Switch balance. The corrected scorer now exactly matches collection: proposal eval mode, row-wise batch 1, FP32, autocast off, matmul/cuDNN TF32 off, highest FP32 precision, and the recorded Plackett–Luce order. Final config hash is <code>a2ae23093778e803</code>; the authenticated 28-file trainer closure is <code>b3668bd22e1283248239725348e6b305fe94f411e708fbf6ccaa0673604c71e5</code>.</p>
+    <p>Before any update, all 949,756 stored atoms must replay with zero error, the verified step-49,666 proposal and empty/reset Adam state must match, and all eight ranks must produce exact ratio 1 with zero clipping. These witnesses persist through checkpoints/resume and promotion. Heldout terminal work is distributed one snapshot per rank (ranks 0–5), trust on rank 6, and an idle verifier on rank 7; every rank, the final snapshot, and the emitted candidate must share one proposal digest. The hardened promotion gate validates the same evidence. Verification passes 92/92 trainer-plus-direct, 84/84 promotion, and 176/176 combined tests, plus compilation, CLI, shell, source/config-pin, and whitespace checks. No corrected candidate, convergence result, promotion result, or new SR is claimed yet.</p>
+    <p>Clean job <code>32541821</code> is terminal <b>FAIL before update</b> (<code>FAILED 2:0</code>, 36:17). Coefficients replayed exactly on all seven splits, but stored PL differed by <code>7.6293945e-6–1.5258789e-5</code>. The run has no anchor/W&amp;B startup, checkpoint, metric, optimizer update, candidate, convergence, promotion, or SR evidence. The remaining defect was that B=1 proposal rows were concatenated before PL accumulation, whereas collection accumulated each PL atom at B=1.</p>
+    <p>The minimal correction leaves the method, data, objective, stored behavior denominator, and model inputs unchanged and now accumulates stored-order PL row by row at B=1. All replay/first-forward gates are literal identity: zero coefficient and old-logprob/log-ratio error, 14 ratios per rank exactly equal to one, ESS one, and zero clipping before backward. The resolved recipe is <code>25afdedfc9deea5e</code>; the 28-file trainer closure is <code>7345b18448be1363e3e9dc3a8cd71741258ae906872305b4522d9cb4d7cb777c</code>. The combined trainer/direct-validation/promotion/probe slice passes <code>195/195</code>, with compilation, shell, pin, and whitespace checks also green.</p>
+    <p>Read-only one-A100 witness job <code>32545881</code> completed <code>0:0</code> in 34 seconds. Artifact <code>runs/outcome_ratio_identity_probe_7345b184.json</code> (SHA-256 <code>c06d8106fe9e1aac6c498887355d459dc17f30a3fef08dc92db61b23d1759353</code>) tested 30 authenticated train0 rows. The legacy batched PL path reproduced three mismatches (maximum <code>1.9073486e-6</code>), while corrected coefficients and old log-probabilities were bit-exact on every row. The production START sample had 14/14 ratios exactly one, zero log-ratio/clipping, a finite proposal backward, and zero optimizer steps. The probe authorizes a fresh eight-GPU launch but is not a training or SR result.</p>
+    <p>Fresh canonical job <code>32545962</code> started at 2026-08-20 03:08 UTC in <code>runs/r0a_outcome_grpo_pl_b1_s1</code>, pinned to config <code>25afdedfc9deea5e</code> and source <code>7345b18448be1363e3e9dc3a8cd71741258ae906872305b4522d9cb4d7cb777c</code>. Seven-split replay passed exactly over all 949,756 stored atoms (<code>[119090,117310,118179,117895,119238,117099,240945]</code>): coefficient, stored-old-logprob, and log-ratio errors were all zero. The step-49,666 START proposal matched digest <code>62e98b6307026a6092b4e655c8148313aff5fac57fe5bb8a7e396d59a50d7aef</code>, proposal Adam was reset once with zero state entries, and every rank opened the exact 1,960-trajectory/47,271-window anchor split. W&amp;B run <code>f071dc278f534e45</code> is online. Before the first backward, all eight ranks reported 14/14 ratios exactly one, ESS one, zero log-ratio, and zero clipping. At 2026-08-20 03:49 UTC, 20 contiguous proposal-only updates had been accepted through step 49,686 with finite losses/gradients, zero skipped updates, and no unexpected-gradient violation. This is authenticated live-training evidence only; no convergence, trust, candidate, promotion, simulator evaluation, or SR result is claimed.</p>
+  </div>
 </section>
 
 </div>

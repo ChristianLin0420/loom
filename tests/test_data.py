@@ -62,6 +62,7 @@ def _make_body(
     n_patches: int = P,
     feat_dim: int = F,
     seed: int = 0,
+    recurrent_burn_in: int = 0,
 ) -> CachedWindowDataset:
     """Canonicalise `n_traj` synthetic demos and write their features to a cache."""
     spec = C.EMBODIMENTS[body]
@@ -88,7 +89,45 @@ def _make_body(
                 embodiment=body,
                 src_fps=src_fps,
             )
-    return CachedWindowDataset(trajs, CA.FeatureCache(root))
+    return CachedWindowDataset(
+        trajs, CA.FeatureCache(root), recurrent_burn_in=recurrent_burn_in,
+    )
+
+
+def _make_libero_holdout_source(root, n_tasks: int = 4):
+    """Tiny cache with two whole demos per LIBERO-shaped task id."""
+    rng = np.random.default_rng(73)
+    trajs = []
+    for task_index in range(n_tasks):
+        suite = f"libero_suite_{task_index // 10}"
+        task = f"task_{task_index:02d}"
+        for demo_key in ("demo_0", "demo_49"):
+            trajs.append(CN.to_canonical(
+                n_src_frames=80,
+                src_fps=20.0,
+                embodiment="libero_franka",
+                traj_id=f"{suite}/{task}/{demo_key}",
+                actions=rng.normal(0, 0.1, size=(80, 7)),
+                lang=f"do {task}",
+            ))
+
+    need = CN.required_source_frames([w for t in trajs for w in CN.segment(t)])
+    spec = CA.CacheSpec("fp16", 2, P, F, 7, L)
+    with CA.FeatureCacheWriter(root, spec) as writer:
+        for traj in trajs:
+            frames = need[traj.traj_id]
+            suite, task, _ = traj.traj_id.split("/")
+            writer.write(
+                traj.traj_id,
+                frames=frames,
+                views=rng.normal(size=(len(frames), 2, P, F)),
+                proprio=rng.normal(size=(len(frames), 7)),
+                lang=rng.normal(size=(L, F)),
+                embodiment="libero_franka",
+                src_fps=20.0,
+                meta={"suite": suite, "task": task},
+            )
+    return trajs, CA.FeatureCache(root)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -391,6 +430,84 @@ def test_batch_has_five_states_four_segments_and_positive_src_fps(tmp_path):
         assert f["lang"].shape == (4, L, F)
 
 
+def test_recurrent_burn_in_uses_real_prior_operator_boundaries(tmp_path):
+    base = _make_body(tmp_path / "a", "libero_franka", n_traj=2, seed=7)
+    trajs = list(base._traj.values())
+    burned = CachedWindowDataset(
+        trajs, base.cache, recurrent_burn_in=4,
+    )
+
+    # Every sufficiently long trajectory loses exactly its first four windows.
+    assert len(burned) == len(base) - 4 * len(trajs)
+    w = burned.windows[0]
+    assert w.start == 4 * C.H_OP
+    traj = burned._traj[w.traj_id]
+    expected_src = tuple(
+        int(traj.obs_src_index[t]) for t in (0, C.H_OP, 2 * C.H_OP, 3 * C.H_OP)
+    )
+    blob = base.cache.read(w.traj_id, expected_src)
+    sample = burned[0]
+    assert len(sample["burn_in_feats"]) == 4
+    for i, feat in enumerate(sample["burn_in_feats"]):
+        torch.testing.assert_close(feat["views"], torch.from_numpy(blob["views"][i]))
+        torch.testing.assert_close(feat["proprio"], torch.from_numpy(blob["proprio"][i]))
+
+    # Burn-in changes history only. The five main observations and labelled
+    # actions are identical to the historical window with the same start.
+    j = next(i for i, old in enumerate(base.windows)
+             if old.traj_id == w.traj_id and old.start == w.start)
+    old = base[j]
+    for got, want in zip(sample["feats"], old["feats"]):
+        for key in ("views", "proprio", "lang"):
+            assert torch.equal(got[key], want[key])
+    assert torch.equal(sample["actions"], old["actions"])
+
+
+def test_zero_burn_in_is_exactly_backward_compatible(tmp_path):
+    implicit = _make_body(tmp_path / "a", "libero_franka", seed=4)
+    explicit = CachedWindowDataset(
+        list(implicit._traj.values()), implicit.cache, recurrent_burn_in=0,
+    )
+    assert len(explicit) == len(implicit)
+    for i in (0, len(implicit) // 2, len(implicit) - 1):
+        old, new = implicit[i], explicit[i]
+        assert old.keys() == new.keys()
+        assert "burn_in_feats" not in old and "burn_in_feats" not in new
+        assert old["embodiment"] == new["embodiment"]
+        assert old["src_fps"] == new["src_fps"]
+        assert torch.equal(old["actions"], new["actions"])
+        assert torch.equal(old["lang"], new["lang"])
+        for got, want in zip(new["feats"], old["feats"]):
+            for key in ("views", "proprio", "lang"):
+                assert torch.equal(got[key], want[key])
+
+
+@pytest.mark.parametrize("bad", [-1, 1.5, True, "4"])
+def test_recurrent_burn_in_rejects_invalid_lengths(tmp_path, bad):
+    base = _make_body(tmp_path / "a", "libero_franka", n_traj=1)
+    with pytest.raises(ValueError, match="recurrent_burn_in"):
+        CachedWindowDataset(
+            list(base._traj.values()), base.cache, recurrent_burn_in=bad,
+        )
+
+
+def test_burn_in_collates_separately_and_rejects_mixed_lengths(tmp_path):
+    base = _make_body(tmp_path / "a", "libero_franka", n_traj=1)
+    burned = CachedWindowDataset(
+        list(base._traj.values()), base.cache, recurrent_burn_in=4,
+    )
+    batch = collate_window([burned[0], burned[1]])
+    assert len(batch["burn_in_feats"]) == 4
+    assert len(batch["feats"]) == C.N_STATES
+    for feat in batch["burn_in_feats"]:
+        assert feat["views"].shape == (2, 2, P, F)
+        assert feat["proprio"].shape == (2, 7)
+        assert feat["lang"].shape == (2, L, F)
+
+    with pytest.raises(ValueError, match="burn-in lengths"):
+        collate_window([base[0], burned[0]])
+
+
 def test_action_free_path_works_end_to_end(tmp_path):
     ds = _make_body(tmp_path / "af", "libero_franka", action_free=True)
     loader = LoomLoader({"libero_franka": ds}, batch_size=4, seed=0)
@@ -445,6 +562,18 @@ def _sampler(n=64, bs=4, world=2, seed=0, sizes=None):
                               world_size=world, seed=seed)
 
 
+def _task_sampler(seed=0, bs=2, world=2):
+    pools = {
+        "short": np.arange(0, 4),
+        "medium": np.arange(4, 12),
+        "long": np.arange(12, 24),
+    }
+    return HomogeneousSampler(
+        {"synth_a": 24}, batch_size=bs, world_size=world, seed=seed,
+        sampling="uniform_task", task_indices={"synth_a": pools},
+    ), pools
+
+
 def test_same_seed_step_rank_gives_same_indices():
     s1, s2 = _sampler(), _sampler()
     for step in range(20):
@@ -469,6 +598,47 @@ def test_different_seed_gives_different_indices():
         not np.array_equal(a.batch_at(t, 0)[1], b.batch_at(t, 0)[1]) for t in range(16)
     )
     assert diff >= 15
+
+
+def test_uniform_task_sampling_is_deterministic_at_an_arbitrary_resume_step():
+    a, _ = _task_sampler(seed=11)
+    b, _ = _task_sampler(seed=11)
+    for step in range(30):
+        for rank in range(2):
+            np.testing.assert_array_equal(a.batch_at(step, rank)[1],
+                                          b.batch_at(step, rank)[1])
+
+    # A newly constructed sampler can seek directly to a resumed global step;
+    # no replay or hidden task cursor is allowed.
+    resumed, _ = _task_sampler(seed=11)
+    for rank in range(2):
+        np.testing.assert_array_equal(resumed.batch_at(137, rank)[1],
+                                      a.batch_at(137, rank)[1])
+
+
+def test_uniform_task_sampling_balances_tasks_then_windows():
+    sampler, pools = _task_sampler(seed=5)
+    owner = {int(i): task for task, idx in pools.items() for i in idx}
+    by_task = {task: [] for task in pools}
+
+    # 9 global steps * 4 samples = 36 = 12 draws from each of three tasks.
+    # The underlying pools are deliberately 4/8/12 windows.
+    for step in range(9):
+        for rank in range(2):
+            _, idx = sampler.batch_at(step, rank)
+            for i in idx:
+                by_task[owner[int(i)]].append(int(i))
+
+    assert {task: len(idx) for task, idx in by_task.items()} == {
+        "short": 12, "medium": 12, "long": 12,
+    }
+    for task, seen in by_task.items():
+        pool = pools[task]
+        # Each task has its own without-replacement permutation. Across repeated
+        # task epochs every window's exposure can differ by at most one.
+        counts = [seen.count(int(i)) for i in pool]
+        assert set(seen[:len(pool)]) == set(pool.tolist())
+        assert max(counts) - min(counts) <= 1
 
 
 def test_epoch_is_covered_without_duplicates_within_a_rank():
@@ -520,23 +690,42 @@ def test_body_share_tracks_weights():
     assert abs(share - 0.75) < 0.05
 
 
-def test_resume_needs_only_global_step(tmp_path):
+@pytest.mark.parametrize("sampling", ["uniform_window", "uniform_task"])
+@pytest.mark.parametrize("recurrent_burn_in", [0, 4])
+def test_resume_needs_only_global_step(tmp_path, sampling, recurrent_burn_in):
     """Team D's checkpoint stores no sampler cursor. It must not have to."""
-    ds = _make_body(tmp_path / "a", "libero_franka")
-    l1 = LoomLoader({"libero_franka": ds}, batch_size=4, seed=3)
-    ref = [b["feats"][0]["views"].clone() for b in l1.batches(0, 6)]
+    ds = _make_body(
+        tmp_path / "a", "libero_franka",
+        recurrent_burn_in=recurrent_burn_in,
+    )
+    l1 = LoomLoader({"libero_franka": ds}, batch_size=4, seed=3,
+                    sampling=sampling)
+    ref = [(
+        b["feats"][0]["views"].clone(),
+        [f["views"].clone() for f in b.get("burn_in_feats", ())],
+    ) for b in l1.batches(0, 6)]
     assert l1.state_dict() == {"global_step": 6}
 
-    l2 = LoomLoader({"libero_franka": ds}, batch_size=4, seed=3)
+    l2 = LoomLoader({"libero_franka": ds}, batch_size=4, seed=3,
+                    sampling=sampling)
     l2.load_state_dict({"global_step": 4})
-    resumed = [b["feats"][0]["views"] for b in l2.batches(l2.global_step, 2)]
+    resumed = list(l2.batches(l2.global_step, 2))
     for i, got in enumerate(resumed):
-        torch.testing.assert_close(got, ref[4 + i])
+        torch.testing.assert_close(got["feats"][0]["views"], ref[4 + i][0])
+        assert len(got.get("burn_in_feats", ())) == len(ref[4 + i][1])
+        for got_prefix, want_prefix in zip(
+                got.get("burn_in_feats", ()), ref[4 + i][1]):
+            torch.testing.assert_close(got_prefix["views"], want_prefix)
 
 
 def test_sampler_rejects_a_body_too_small_for_one_batch():
     with pytest.raises(ValueError, match="cannot fill one global batch"):
         HomogeneousSampler({"synth_a": 6}, batch_size=4, world_size=2)
+
+
+def test_sampler_rejects_unknown_sampling_mode():
+    with pytest.raises(ValueError, match="sampling must be one of"):
+        HomogeneousSampler({"synth_a": 16}, batch_size=4, sampling="taskish")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -595,6 +784,23 @@ def test_worker_queue_is_sized_to_shared_memory(tmp_path):
     assert loader.bytes_per_batch() > 0
     next(iter(loader.batches(0, 1)))
     assert 0 <= loader.effective_workers <= loader.num_workers
+
+
+def test_burn_in_bytes_are_included_in_worker_queue_accounting(tmp_path):
+    base = _make_body(tmp_path / "a", "libero_franka", n_traj=1)
+    burned = CachedWindowDataset(
+        list(base._traj.values()), base.cache, recurrent_burn_in=4,
+    )
+    batch_size = 4
+    old = LoomLoader({"libero_franka": base}, batch_size=batch_size)
+    new = LoomLoader({"libero_franka": burned}, batch_size=batch_size)
+    one = collate_window([burned[0]])
+    prefix_bytes = sum(
+        feat[key].nbytes
+        for feat in one["burn_in_feats"]
+        for key in ("views", "proprio", "lang")
+    )
+    assert new.bytes_per_batch() == old.bytes_per_batch() + batch_size * prefix_bytes
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -729,6 +935,156 @@ def test_build_loader_rejects_an_unwired_body(tmp_path):
                     "cache_dir": str(tmp_path / "c")}}
     with pytest.raises(DataConfigError, match="no adapter wired"):
         build_loader(cfg, rank=0, world=1, seed=0, device="cpu")
+
+
+def test_real_dataset_factory_passes_recurrent_burn_in(tmp_path, monkeypatch):
+    from loom.data.adapters import libero as libero_adapter
+    from loom.data.loader import _dataset_for
+
+    base = _make_body(tmp_path / "c", "libero_franka", n_traj=2)
+    trajs = list(base._traj.values())
+    monkeypatch.setattr(
+        libero_adapter, "libero_trajectories", lambda **kwargs: trajs,
+    )
+    burned = _dataset_for(
+        "libero_franka", "libero", base.cache,
+        {"recurrent_burn_in": 4, "action_free": False},
+    )
+    assert burned.recurrent_burn_in == 4
+    assert len(burned) == len(base) - 4 * len(trajs)
+
+
+def test_demo49_whole_trajectory_split_is_exact_complete_and_order_stable():
+    from loom.data.loader import _select_libero_trajectories
+
+    # Match the released LIBERO cardinality without reading 2,000 HDF5 action
+    # arrays: four suites x ten tasks x fifty whole demonstrations.
+    trajs = [
+        CN.CanonicalTrajectory(
+            traj_id=f"libero_{suite}/task_{task:02d}/demo_{demo}",
+            embodiment="libero_franka",
+            src_fps=20.0,
+            obs_src_index=np.arange(C.H_PLAN + 1, dtype=np.int64),
+            actions=None,
+        )
+        for suite in range(4)
+        for task in range(10)
+        for demo in range(50)
+    ]
+
+    train, train_manifest = _select_libero_trajectories(
+        list(reversed(trajs)), split="train", holdout_demo_keys=("demo_49",),
+    )
+    gate, gate_manifest = _select_libero_trajectories(
+        trajs, split="gate", holdout_demo_keys=("demo_49",),
+    )
+    _, gate_manifest_reordered = _select_libero_trajectories(
+        list(reversed(trajs)), split="gate", holdout_demo_keys=("demo_49",),
+    )
+
+    train_ids = set(train_manifest["trajectory_ids"])
+    gate_ids = set(gate_manifest["trajectory_ids"])
+    assert len(train) == train_manifest["n_trajectories"] == 1960
+    assert len(gate) == gate_manifest["n_trajectories"] == 40
+    assert train_manifest["n_tasks"] == gate_manifest["n_tasks"] == 40
+    assert train_ids.isdisjoint(gate_ids)
+    assert train_ids | gate_ids == {traj.traj_id for traj in trajs}
+    assert all(len(ids) == 49 for ids in train_manifest["tasks"].values())
+    assert all(len(ids) == 1 for ids in gate_manifest["tasks"].values())
+    assert all(traj_id.endswith("/demo_49") for traj_id in gate_ids)
+    assert gate_manifest_reordered == gate_manifest
+    assert gate_manifest["digest"].startswith("sha256:")
+
+
+def test_whole_trajectory_split_fails_if_any_task_lacks_the_holdout():
+    from loom.data.loader import DataConfigError, _select_libero_trajectories
+
+    # Keep this fixture metadata-only: the failure must happen before windows or
+    # cached tensors can influence selection.
+    trajs = [
+        CN.CanonicalTrajectory(
+            traj_id=f"libero_goal/task_{task}/demo_{demo}",
+            embodiment="libero_franka",
+            src_fps=20.0,
+            obs_src_index=np.arange(C.H_PLAN + 1, dtype=np.int64),
+            actions=None,
+        )
+        for task in range(2)
+        for demo in (0, 49)
+        if not (task == 1 and demo == 49)
+    ]
+    with pytest.raises(DataConfigError, match="absent from task"):
+        _select_libero_trajectories(
+            trajs, split="gate", holdout_demo_keys=("demo_49",),
+        )
+
+
+def test_gate_loader_manifest_and_clusters_are_rank_resume_stable(
+    tmp_path, monkeypatch,
+):
+    from loom.data.adapters import libero as libero_adapter
+    from loom.data.loader import build_gate_loader, build_loader
+
+    trajs, cache = _make_libero_holdout_source(tmp_path / "c", n_tasks=4)
+    monkeypatch.setattr(
+        libero_adapter, "libero_trajectories",
+        lambda **kwargs: list(reversed(trajs)),
+    )
+    cfg = {
+        "run": {"seed": 17},
+        "data": {
+            "source": "libero",
+            "embodiments": ["libero_franka"],
+            "batch_per_gpu": 2,
+            "sampling": "uniform_task",
+            "num_workers": 0,
+            "pin_memory": False,
+            "trajectory_split": "train",
+            "holdout_demo_keys": ["demo_49"],
+        },
+    }
+
+    rank0 = build_loader(cfg, rank=0, world=2, cache_root=cache.root)
+    rank1 = build_loader(cfg, rank=1, world=2, cache_root=cache.root)
+    gate = build_gate_loader(cfg, rank=0, world=1, cache_root=cache.root)
+    train_manifest = rank0.trajectory_manifest()
+    gate_manifest = gate.trajectory_manifest()
+
+    assert rank1.trajectory_manifest() == train_manifest
+    assert train_manifest["n_tasks"] == gate_manifest["n_tasks"] == 4
+    assert train_manifest["n_trajectories"] == gate_manifest["n_trajectories"] == 4
+    assert set(train_manifest["trajectory_ids"]).isdisjoint(
+        gate_manifest["trajectory_ids"]
+    )
+    assert all(len(ids) == 1 for ids in train_manifest["tasks"].values())
+    assert all(len(ids) == 1 for ids in gate_manifest["tasks"].values())
+
+    at_resume = rank0.next(137)["data_meta"]
+    other_rank = rank1.next(137)["data_meta"]
+    resumed = build_loader(cfg, rank=0, world=2, cache_root=cache.root)
+    resumed.load_state_dict({"global_step": 137})
+    after_resume = resumed.next(resumed.global_step)["data_meta"]
+    assert after_resume == at_resume
+    for metadata in (at_resume, other_rank):
+        assert metadata["source"] == "libero"
+        assert metadata["split"] == "train"
+        assert metadata["manifest_digest"] == train_manifest["digest"]
+        assert metadata["trajectory_cluster_ids"] == metadata["trajectory_ids"]
+        assert set(metadata["trajectory_ids"]) <= set(train_manifest["trajectory_ids"])
+
+    gate_metadata = gate.next(0)["data_meta"]
+    assert gate_metadata["split"] == "gate"
+    assert gate_metadata["manifest_digest"] == gate_manifest["digest"]
+    assert set(gate_metadata["task_ids"]) <= set(gate_manifest["tasks"])
+    assert set(gate_metadata["trajectory_ids"]) <= set(gate_manifest["trajectory_ids"])
+
+
+def test_bank_ca_config_trains_on_demo49_complement():
+    from loom.train.loop import read_config
+
+    cfg = read_config(Path(__file__).parents[1] / "configs" / "r0a_bank_ca.yaml")
+    assert cfg["data"]["trajectory_split"] == "train"
+    assert cfg["data"]["holdout_demo_keys"] == ["demo_49"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -124,14 +124,16 @@ def assert_bf16(t: torch.Tensor, what: str) -> None:
 
 def assert_features_are_cached(window: dict) -> None:
     """Cached features carry no autograd history and no grad requirement."""
-    for i, feats in enumerate(window["feats"]):
-        for key in ("views", "proprio", "lang"):
-            t = feats[key]
-            if t.requires_grad or t.grad_fn is not None:
-                raise RuntimeError(
-                    f"feats[{i}][{key!r}] carries autograd history: the frozen "
-                    f"tower is in the training graph. PLAN 9 -- features are cached."
-                )
+    for seq_name in ("burn_in_feats", "feats"):
+        for i, feats in enumerate(window.get(seq_name, ())):
+            for key in ("views", "proprio", "lang"):
+                t = feats[key]
+                if t.requires_grad or t.grad_fn is not None:
+                    raise RuntimeError(
+                        f"{seq_name}[{i}][{key!r}] carries autograd history: the "
+                        "frozen tower is in the training graph. PLAN 9 -- features "
+                        "are cached."
+                    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

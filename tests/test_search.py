@@ -24,7 +24,8 @@ import contracts as C
 import stubs as S
 from loom.heads.potential import Potential
 from loom.heads.proposal import (
-    Proposal, canonical_order, gumbel_topk, pl_log_prob, weights_from_logits,
+    Proposal, argmax_coeff, canonical_order, gumbel_topk, pl_log_prob,
+    weights_from_logits,
 )
 from loom.search.shooting import realizability_residual, shooting
 
@@ -417,6 +418,37 @@ def test_argmax_selects_the_largest_logits():
     want = logits.topk(C.TOPK, dim=-1).indices.sort(-1).values
     got = a.topk(C.TOPK, dim=-1).indices.sort(-1).values
     assert torch.equal(want, got)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_argmax_st_is_bit_exact_to_deployed_argmax(dtype):
+    """Exposure training must use the exact hard support/weights eval deploys."""
+    torch.manual_seed(41)
+    p = Proposal(dim=8, lang_dim=8, m=TINY_M, topk=TINY_K,
+                 width=16, n_blocks=1, n_heads=2).to(dtype)
+    z = torch.randn(3, 5, 8, dtype=dtype)
+    lang = torch.randn(3, 3, 8, dtype=dtype)
+    hard = p.argmax(z, lang)
+    st = p.argmax_st(z, lang)
+    assert torch.equal(st, hard)
+    assert torch.equal((st != 0).sum(-1), torch.full((3,), TINY_K))
+    # Forward parity above is bit-exact.  Simplex tolerance must still respect
+    # the storage dtype: three rounded BF16 weights can differ from one by an
+    # ulp even though the restricted softmax was accumulated in FP32.
+    atol = 1e-6 if dtype == torch.float32 else 8 * torch.finfo(dtype).eps
+    torch.testing.assert_close(st.float().sum(-1), torch.ones(3), atol=atol, rtol=0)
+
+
+def test_argmax_coeff_ste_has_dense_gradient_without_changing_forward():
+    torch.manual_seed(42)
+    logits = torch.randn(4, 12, requires_grad=True)
+    hard = argmax_coeff(logits, topk=4)
+    st = argmax_coeff(logits, topk=4, straight_through=True)
+    assert torch.equal(st, hard)
+    weight = torch.linspace(-1.0, 1.0, 12)
+    (st * weight).sum().backward()
+    support = hard != 0
+    assert (logits.grad[~support].abs() > 0).all()
 
 
 def test_argmax_is_the_mode_of_the_support_distribution():

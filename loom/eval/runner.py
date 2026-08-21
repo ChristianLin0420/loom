@@ -34,7 +34,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 import torch
 
-from loom.eval import EpisodeResult, EvalProtocol, episode_seed
+from loom.eval import EpisodeResult, EvalProtocol, episode_seed, policy_seed
 
 __all__ = [
     "WorkItem", "iter_work", "shard", "n_devices", "seed_fn_for",
@@ -43,6 +43,7 @@ __all__ = [
 ]
 
 RESULTS_VERSION = 1
+POLICY_SEED_SCHEME = "sha256(work-item)-v1"
 
 #: How long a worker waits for its GPU off the device queue. Generous because
 #: the cost of being wrong is a silent second policy on GPU 0, and the cost of
@@ -106,6 +107,7 @@ class WorkItem:
     episode:  int
     seed:     int
     env_seed: int
+    policy_seed: int
     max_steps: int
 
     def key(self) -> tuple[str, str, int, int, int]:
@@ -115,7 +117,7 @@ class WorkItem:
     def to_dict(self) -> dict[str, Any]:
         return dict(bench=self.bench, suite=self.suite, task_id=self.task_id,
                     episode=self.episode, seed=self.seed, env_seed=self.env_seed,
-                    max_steps=self.max_steps)
+                    policy_seed=self.policy_seed, max_steps=self.max_steps)
 
 
 def seed_fn_for(bench: str):
@@ -153,6 +155,7 @@ def iter_work(protocol: EvalProtocol) -> list[WorkItem]:
                         episode=ep,
                         seed=seed,
                         env_seed=env_seed_of(seed, protocol.bench, suite, task_id, ep),
+                        policy_seed=policy_seed(seed, protocol.bench, suite, task_id, ep),
                         max_steps=protocol.max_steps,
                     ))
     return items
@@ -225,6 +228,53 @@ def env_available(mod: Any) -> bool:
 #  RESULT STORE  —  incremental, atomic, resumable
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _checkpoint_identity(ckpt: Any) -> str | None:
+    """Canonical local path used to prevent cross-checkpoint resume.
+
+    A missing checkpoint is intentional for injected/stub policies and remains
+    a valid identity.  Resolving paths makes ``foo.pt`` and ``./foo.pt`` the
+    same checkpoint without reading or hashing a potentially multi-gigabyte
+    file at evaluation startup.
+    """
+    if ckpt is None:
+        return None
+    return str(Path(str(ckpt)).expanduser().resolve())
+
+
+def _identity_value(value: Any) -> Any:
+    """Canonical JSON-safe value for explicit evaluation options."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, os.PathLike):
+        return str(Path(value).expanduser().resolve())
+    if isinstance(value, (list, tuple)):
+        return [_identity_value(v) for v in value]
+    if isinstance(value, dict):
+        if not all(isinstance(k, str) for k in value):
+            raise TypeError("evaluation identity dictionaries require string keys")
+        return {k: _identity_value(value[k]) for k in sorted(value)}
+    raise TypeError(
+        f"policy_kw contains non-serializable {type(value).__name__}; pass an "
+        "explicit JSON-like value so resume can compare evaluation behavior"
+    )
+
+
+def _eval_identity(*, ckpt: Any, backend: str | None, resolved_backend: str,
+                   policy_kw: dict | None, policy_source: str) -> dict[str, Any]:
+    """Behavior-affecting explicit inputs that must agree across a resume."""
+    return {
+        "version": 1,
+        "checkpoint": _checkpoint_identity(ckpt),
+        "backend": {"requested": backend or "auto", "resolved": resolved_backend},
+        "policy_kw": _identity_value(policy_kw or {}),
+        # Policy objects/factories are injection seams and intentionally are not
+        # serialized; their stable mode is enough to avoid mixing them with the
+        # checkpoint-built path while preserving injected-policy resume tests.
+        "policy_source": policy_source,
+        "policy_seed_scheme": POLICY_SEED_SCHEME,
+    }
+
+
 class ResultStore:
     """Holds every `EpisodeResult` and rewrites the JSON after each one.
 
@@ -248,6 +298,8 @@ class ResultStore:
         self.path = Path(path).resolve() if path is not None else None
         self.protocol = protocol
         self.meta = dict(meta or {})
+        if "ckpt" in self.meta:
+            self.meta["ckpt"] = _checkpoint_identity(self.meta["ckpt"])
         self.records: dict[tuple, EpisodeResult] = {}
         self.n_resumed = 0
         if resume and self.path is not None and self.path.exists():
@@ -262,11 +314,29 @@ class ResultStore:
                 f"delete it or pass --no-resume"
             ) from e
         old = EvalProtocol.from_dict(blob.get("protocol", {}))
-        if old.max_steps != self.protocol.max_steps or old.bench != self.protocol.bench:
+        if old != self.protocol:
             raise ValueError(
                 f"{self.path} was produced under a different protocol "
-                f"(bench={old.bench}, max_steps={old.max_steps}); resuming would "
+                f"(old={old.to_dict()}, new={self.protocol.to_dict()}); resuming would "
                 f"mix incomparable episodes. Use a different --out or --no-resume."
+            )
+        old_meta = blob.get("meta", {})
+        old_ckpt = _checkpoint_identity(old_meta.get("ckpt"))
+        new_ckpt = _checkpoint_identity(self.meta.get("ckpt"))
+        if old_ckpt != new_ckpt:
+            raise ValueError(
+                f"{self.path} was produced by a different checkpoint "
+                f"(old={old_ckpt!r}, new={new_ckpt!r}); resuming would mix "
+                f"incomparable episodes. Use a different --out or --no-resume."
+            )
+        old_identity = old_meta.get("eval_identity")
+        new_identity = self.meta.get("eval_identity")
+        if old_identity != new_identity:
+            raise ValueError(
+                f"{self.path} was produced under a different evaluation identity "
+                f"(old={old_identity!r}, new={new_identity!r}); backend, policy "
+                f"options, and RNG scheme must not change across resume. Use a "
+                f"different --out or --no-resume."
             )
         for d in blob.get("episodes", []):
             r = EpisodeResult.from_dict(d)
@@ -396,9 +466,16 @@ def _run_item(
         bench=item.bench, suite=item.suite, task_id=item.task_id,
         episode=item.episode, seed=item.seed, env_seed=item.env_seed,
         task_name=mod.task_name(item.suite, item.task_id),
+        extra={"policy_seed": item.policy_seed},
     )
     t0 = time.time()
     factory = env_factory or mod.make_env
+
+    # Only policies with an explicit per-episode RNG seam are touched.  Plain
+    # injected policies keep their existing no-argument reset contract.
+    set_seed = getattr(policy, "set_policy_seed", None)
+    if callable(set_seed):
+        set_seed(item.policy_seed)
 
     def build():
         return factory(item.suite, item.task_id, item.env_seed,
@@ -517,6 +594,7 @@ def _worker_run(item_dict: dict) -> dict:
         rec = EpisodeResult(
             bench=item.bench, suite=item.suite, task_id=item.task_id,
             episode=item.episode, seed=item.seed, env_seed=item.env_seed,
+            extra={"policy_seed": item.policy_seed},
             error=traceback.format_exc(),
         )
     prov = _WORKER.pop("provenance", None)
@@ -566,15 +644,27 @@ def run_eval(
         policy_kw.setdefault("embodiment", body)
 
     items = iter_work(protocol)
+    available = env_available(mod)
+    resolved_backend = ("injected" if env_factory is not None else
+                        (backend or (bench if available else "fake")))
+    policy_source = ("injected_instance" if policy is not None else
+                     "injected_factory" if policy_factory is not None else
+                     "checkpoint_factory")
+    eval_identity = _eval_identity(
+        ckpt=ckpt, backend=backend, resolved_backend=resolved_backend,
+        policy_kw=policy_kw, policy_source=policy_source,
+    )
     store = ResultStore(out, protocol, resume=resume, meta={
-        "ckpt": str(ckpt) if ckpt else None,
+        "ckpt": _checkpoint_identity(ckpt),
         "bench": bench,
         "backend": backend or ("auto"),
+        "policy_seed_scheme": POLICY_SEED_SCHEME,
+        "eval_identity": eval_identity,
         # Whether the REAL simulator was importable. A fake-env run and a real
         # one produce identically shaped tables; this is the only field that
         # distinguishes them, so it is recorded per bench rather than only for
         # LIBERO (`libero_available` is kept for older results files).
-        "env_available": env_available(mod),
+        "env_available": available,
         "libero_available": bool(getattr(mod, "libero_available", lambda: False)()),
         "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
         # Which commit scored this. `meta` is not restored from an existing

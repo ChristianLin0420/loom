@@ -1,0 +1,70 @@
+# R0-A recurrent-history refinement. Seed a fresh run directory with every
+# r0a_deploy_s1 shard at step 49,666; do not reset optimizer/global-step state.
+# The complete 8,000-step gate begins at 49,666 and ends at 57,666. Stop the
+# first link at 58,000, but keep the 80,000 cosine horizon fixed: a 60k horizon
+# makes the absolute-step LR nearly dead throughout the required gate.
+
+extends: r0a_deploy.yaml
+
+run:
+  name: r0a_burnin
+  steps: 80000
+  ckpt_every: 500
+
+data:
+  sampling: uniform_window
+  # Four REAL preceding operator-boundary observations, spaced H_OP=8 canonical
+  # frames apart. They are read from the existing feature cache, replayed oldest
+  # to newest, and detached before the unchanged five-state training window.
+  recurrent_burn_in: 4
+
+optim:
+  # LR=0 does not freeze an EMA: loop.py historically updated it after every
+  # optimizer step. This switch holds both estimator coordinate systems exactly
+  # at their seeded values for the proposal-only refinement.
+  update_ema: false
+  lr_scales:
+    estimator: 0.0
+    bank: 0.0
+    q_delta: 0.0
+    q_action: 0.0
+    ema: 0.0
+    proposal: 0.05
+    decoder: 0.0
+
+losses:
+  dyn:       {enabled: false, weight: 0.0, negatives: within_trajectory,
+              min_gap: 2, neg_weight: 1.0, neg_margin: 0.1, cosine: per_slot}
+  act:
+    enabled: true
+    weight: 1.0
+    align_to: q_a
+    decode_from: proposal
+  proposal:
+    enabled: true
+    weight: 1.0
+    mode: sparse_ce
+    temperature: 1.0
+    detach_belief: true
+  balance:   {enabled: false, weight: 0.0}
+
+train_modules: [proposal]
+
+convergence:
+  start_step: 49666
+  block: 2000
+  blocks: 4
+  tol: 0.02
+  primary: [act/decode, loss/proposal]
+  watch: [act/deploy_c_l2, act/deploy_topk_overlap, proposal/topk_overlap, grad_norm]
+  floor_checks: [loss/proposal]
+
+# scripts/convergence.py proves a stable, off-floor endpoint. Before any simulator
+# evaluation, also check this config-hashed efficacy condition manually: a flat
+# objective that never benefited from recurrent context is not a successful stage.
+efficacy_gate:
+  metric: act/decode
+  reference: first_post_start_block
+  comparison: final_convergence_block
+  min_relative_improvement: 0.05
+  required: true

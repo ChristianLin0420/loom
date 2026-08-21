@@ -67,6 +67,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="record which operator `argmax pi_c` selected at every "
                         "replan into EpisodeResult.extra. Diagnostic only — it "
                         "does not change the action the policy takes.")
+    r.add_argument("--gripper-dwell", type=int, default=1,
+                   help="execute a HOLD-channel polarity reversal only after N "
+                        "consecutive replans; 1 is the original path")
+    r.add_argument("--decoder-samples", type=int, default=1,
+                   help="average N deterministic CFM decoder samples per replan")
+    r.add_argument("--duration-normalize-segments", action="store_true",
+                   help="map each complete decoded 8-step segment onto its "
+                        "SegmentClock-selected env bins (opt-in A/B arm)")
     r.add_argument("--row-label", default=ROW_LABEL_DEFAULT,
                    help="which PLAN 8 LOOM row these numbers fill; defaults per "
                         "bench (libero -> R0-A, robotwin -> R0-B)")
@@ -118,6 +126,12 @@ def main(argv: list[str] | None = None) -> int:
         policy_kw["allow_stub"] = False
     if args.op_stats:
         policy_kw["op_stats"] = True
+    if args.gripper_dwell != 1:
+        policy_kw["gripper_dwell"] = int(args.gripper_dwell)
+    if args.decoder_samples != 1:
+        policy_kw["decoder_samples"] = int(args.decoder_samples)
+    if args.duration_normalize_segments:
+        policy_kw["duration_normalize_segments"] = True
 
     done = {"n": 0}
 

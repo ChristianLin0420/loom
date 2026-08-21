@@ -25,11 +25,12 @@ the dependency graph.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, TypedDict, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 import torch
 from torch import Tensor
+from typing_extensions import TypedDict
 
 __all__ = [
     # temporal
@@ -209,14 +210,18 @@ class ObsFeats(TypedDict):
     lang:    Tensor   # (B, L, F)
 
 
-class TransitionWindow(TypedDict):
-    """One training example. Embodiment-homogeneous by construction."""
-
+class _TransitionWindowRequired(TypedDict):
     feats:      list[ObsFeats]   # length N_STATES, at CANONICAL_FRAMES
     actions:    Tensor | None    # (B, DEPTH, H_OP, dof_e); None for action-free data
     lang:       Tensor           # (B, L, F)
     embodiment: str              # HOMOGENEOUS within a batch
     src_fps:    float            # original rate, needed to invert resampling at eval
+
+
+class TransitionWindow(_TransitionWindowRequired, total=False):
+    """One training example. Embodiment-homogeneous by construction."""
+
+    burn_in_feats: list[ObsFeats]  # real preceding operator-boundary observations
 
 
 # ═══════════════════════════════════════════════════════════════════════════

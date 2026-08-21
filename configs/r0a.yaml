@@ -17,7 +17,10 @@ extends: base.yaml
 
 run:
   name: r0a
-  steps: 60000           # schedule horizon; retune once it/s is measured on 16 GPUs
+  # The validated baseline peaks near 25k while a 60k cosine still supplies
+  # 2e-4.  Decay through the measured useful region instead of spending the
+  # second half of the run destabilising an already-good policy.
+  steps: 32000
   log_every: 20
   ckpt_every: 500
 
@@ -25,6 +28,10 @@ data:
   source: libero
   embodiments: [libero_franka]     # registered in contracts.py
   batch_per_gpu: 8
+  # The benchmark macro-averages 40 tasks, while flat windows give LIBERO-10
+  # 42.8% of training draws and spatial only 17.5%. Sample task first, then a
+  # window within it; the loader remains step-indexed and exactly resumable.
+  sampling: uniform_task
   action_free: false
 
 optim:
@@ -42,7 +49,20 @@ optim:
   # delta_op 0.064 -> 0.000, peak grad norm 71535); with spike_mult: 10 it did
   # not collapse through step 2700 (act/align 0.369, delta_op 0.069,
   # live_ops 24, peak grad norm 413) at a cost of 11.4% of steps skipped.
-  spike_mult: 0.0
+  spike_mult: 10.0
+  lr_scales:
+    # pi_c is a 50M classifier chasing a moving teacher.  The bounded sparse CE
+    # below removes the PL support-order spike; the lower head LR removes the
+    # remaining timescale mismatch.
+    proposal: 0.3
+
+model:
+  # These are part of the 26.6%-SR baseline recipe but were missing from this
+  # file.  z_prev_residual is architectural behaviour, not a checkpoint tensor,
+  # so eval cannot infer it from state_dict.
+  estimator:
+    learned_z_init: true
+    z_prev_residual: false
 
 losses:
   # The hinge knobs live in base.yaml; dyn here only names what R0-A changes.
@@ -55,7 +75,18 @@ losses:
   # gradient is D_e's reconstruction of the action -- the one optimum in this
   # objective that a batch-constant c cannot reach.
   act:      {enabled: true, weight: 1.0, align_to: q_a}
-  proposal: {enabled: true, weight: 1.0}
+  # Match the coefficient that inference actually executes: q_a's detached
+  # top-4 simplex weights.  Hard ordered PL labels drove a gradient spike near
+  # 26k, while dense KL over q_a's high-entropy 128-op tail made pi_c uniform and
+  # cut seeded SR to 8.75%.  Sparse weighted CE keeps the gradient bounded,
+  # preserves coefficient magnitudes, and reached 38.25% in the matched gate.
+  # Stop its gradient at z so pi_c cannot move its own input.
+  proposal:
+    enabled: true
+    weight: 1.0
+    mode: sparse_ce
+    temperature: 1.0
+    detach_belief: true
   # contracts.BALANCE_COEF, Switch form. See base.yaml.
   balance:  {enabled: true, weight: 1.0e-2}
 

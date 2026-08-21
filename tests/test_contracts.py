@@ -26,6 +26,13 @@ def test_temporal_consistency():
     assert len(C.DYN_WEIGHTS) == C.DEPTH
 
 
+def test_recurrent_burn_in_is_the_only_optional_window_field():
+    assert C.TransitionWindow.__required_keys__ == {
+        "feats", "actions", "lang", "embodiment", "src_fps",
+    }
+    assert C.TransitionWindow.__optional_keys__ == {"burn_in_feats"}
+
+
 def test_slot_width_even():
     """The operator acts on adjacent pairs as 2x2 blocks."""
     assert C.D % 2 == 0

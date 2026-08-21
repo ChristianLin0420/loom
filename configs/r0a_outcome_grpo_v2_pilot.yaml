@@ -1,0 +1,293 @@
+# Outcome-GRPO v2 reusable-core scaffold.
+#
+# THIS FILE IS INTENTIONALLY NOT LAUNCHABLE. The component projection found no
+# beneficial predeclared GRPO/anchor mixture, the controller has not passed its
+# resume smoke, the fixed TRAIN-only trust panel is not frozen, and the current
+# validation collection has been exposed to development diagnostics. Nulls are
+# freeze placeholders, not implicit zeros or tunable command-line defaults.
+
+extends: r0a_deploy.yaml
+
+run:
+  name: r0a_outcome_grpo_v2_pilot_INELIGIBLE
+  steps: 80000
+  deterministic: true
+  log_every: 20
+  ckpt_every: 200
+  keep_last: 0
+  wandb_mode: online
+
+data:
+  source: libero
+  embodiments: [libero_franka]
+  batch_per_gpu: 8
+  action_free: false
+  sampling: uniform_task
+  trajectory_split: train
+  holdout_demo_keys: [demo_49]
+  recurrent_burn_in: 4
+
+optim:
+  lr: 3.0e-4
+  warmup: 2000
+  min_lr_ratio: 0.05
+  grad_clip: 1.0
+  betas: [0.9, 0.95]
+  weight_decay: 0.05
+  eps: 1.0e-8
+  lr_scales:
+    estimator: 0.0
+    bank: 0.0
+    q_delta: 0.0
+    q_action: 0.0
+    ema: 0.0
+    decoder: 0.0
+    proposal: 0.0125
+  reset_state_modules: [proposal]
+  update_ema: false
+
+losses:
+  dyn:       {enabled: false, weight: 0.0}
+  act:       {enabled: false, weight: 0.0}
+  potential: {enabled: false, weight: 0.0}
+  grpo:
+    enabled: true
+    weight: 1.0
+    group: 8
+    clip_eps: 0.2
+    reward: terminal_libero_success_only
+    baseline_arms: [0, 1, 2, 3, 4, 5, 6, 7]
+    ratio_arms: [1, 2, 3, 4, 5, 6, 7]
+  # wA: unresolved because every audited alpha in {0,.1,.25,.5,.75,1}
+  # retained a harmful mean heldout raw-gradient direction.
+  proposal:
+    enabled: true
+    weight: null
+    coefficient_status: PENDING_OBJECTIVE_DIAGNOSIS
+    zero_weight_semantics: sparse_anchor_term_disabled_anchor_states_retained_for_demo_reference
+    mode: sparse_ce
+    temperature: 1.0
+    detach_belief: true
+  balance:
+    enabled: true
+    weight: 1.0e-2
+    source: proposal
+  recovery_reference:
+    enabled: true
+    kind: sampled_pl_forward_kl_control_variate
+    atom: expm1(current_minus_old_logprob)-current_minus_old_logprob
+    arms: [1, 2, 3, 4, 5, 6, 7]
+    arm0: forbidden
+    aggregation: equal_replan_within_arm_then_equal_arm
+    controller_weight: outcome_grpo_v2.recovery_kl_controller.beta
+  # lambdaD: unresolved. This is categorical KL on exact train-anchor states,
+  # not a claim that the scalar equals full top-k Plackett-Luce KL.
+  demo_reference:
+    enabled: true
+    weight: null
+    coefficient_status: PENDING_OBJECTIVE_DIAGNOSIS
+    kind: frozen_seed_dense_categorical_forward_kl
+    states: train_anchor_exact_states_all_horizons
+    distribution: base_categorical_identifying_pl_distribution
+    seed_requires_grad: false
+    seed_in_optimizer: false
+    seed_in_checkpoint: false
+
+train_modules: [proposal]
+
+fsdp:
+  shard: []
+  replicate: [proposal]
+  activation_checkpointing: false
+
+outcome_grpo_v2:
+  format_version: 2
+  trainer_kind: loom_outcome_grpo_v2_proposal_pilot
+  method_status: INELIGIBLE_UNFROZEN_PILOT
+  seed_checkpoint: runs/r0a_deploy_s1_eval/ckpt_000049666.pt
+  seed_global_step: 49666
+  seed_config_hash: a199324a6205bb6d
+  seed_checkpoint_sha256: 15f286c268caa5327d5aa3abf1f67ebd0555c426a509fef22cb7f537bf6ab4e1
+  start_step: 49666
+  stop_step: 50466
+  snapshot_steps: [49866, 50066, 50266, 50466]
+  world_size: 8
+  groups_per_train_fold: 200
+  minimum_informative_groups_per_fold: 100
+  authentication:
+    chunk_replans: 32
+    proposal_scoring_batch_size: 1
+    proposal_scoring_dtype: float32
+    proposal_scoring_autocast: false
+    cuda_matmul_tf32: false
+    cudnn_tf32: false
+    float32_matmul_precision: highest
+    proposal_scoring_module_mode: eval
+    behaviour_logprob_atol: 0.0
+    behaviour_logprob_rtol: 0.0
+    behaviour_coeff_atol: 0.0
+    behaviour_coeff_rtol: 0.0
+    identity_max_abs_logratio: 0.0
+    identity_max_coeff_error: 0.0
+    initial_ratio_min_ess_fraction: 1.0
+  authenticated_data_lineage:
+    kind: exact_outcome_recovery_manifest_closure_v1
+    collection_format_version: 1
+    collector_source:
+      scheme: sha256(path-nul-bytes-nul)-v1
+      sha256: 1622aee21022347a98f82c4e587154f1e13128528441e4d87d96d0d609be1223
+      files:
+        - contracts.py
+        - loom/data/adapters/libero.py
+        - loom/data/canonical.py
+        - loom/data/tower.py
+        - loom/eval/__init__.py
+        - loom/eval/libero.py
+        - loom/eval/outcome_recovery.py
+        - loom/eval/policy.py
+        - loom/eval/runner.py
+        - loom/heads/decoder.py
+        - loom/heads/proposal.py
+        - loom/model/estimator.py
+        - scripts/outcome_recovery.py
+    training:
+      - split: train0
+        path: runs/outcome_recovery_s49666_train0
+        manifest_sha256: f92f50960e1640b32f2f50c6e9a7c61603204ea21369c6e2493d3770b3683c17
+        identity_digest: 6aae6bbb5f6226de726de64bd8b57d6f4fb673a63c5e23c49ad136a03dd75433
+      - split: train1
+        path: runs/outcome_recovery_s49666_train1
+        manifest_sha256: 8c45d514454598eb1c53c0d3ea3a12b3606f84baae612e5d3c2dc50bfd904421
+        identity_digest: 331c812f62a8249d6c4be6a368b2bc9c5bbe6e352a67f6e8ac89a4deeaf984a0
+      - split: train2
+        path: runs/outcome_recovery_s49666_train2
+        manifest_sha256: 4a53fca9490840e90319d2fde986f8f6c12a6d236869c5000e5b4f0e1555b29b
+        identity_digest: 302d7a4a95c45526338e1bfffd6008a893825ba1eb6157217169cfe661fd77ee
+      - split: train3
+        path: runs/outcome_recovery_s49666_train3
+        manifest_sha256: 289c0d6796d1bfccf471bb519c3145b0837147280b5059ae62d821a5b7d3594e
+        identity_digest: f6c0eb2f6b11a477f84be6323ef1a94f720dfe30e8fd854fd1d0c3d25bcef35e
+      - split: train4
+        path: runs/outcome_recovery_s49666_train4
+        manifest_sha256: 025a8a81556a733da4401fb489306222e93e72535f3ca8266c4780fc76f9857b
+        identity_digest: 206fb752eb2f345284286a35bdc277eee03573c916563abb724c8d3f67dad13c
+      - split: train5
+        path: runs/outcome_recovery_s49666_train5
+        manifest_sha256: 61253c67af3ea3c5cda710a78498e098bd2ea54082ba557ad2145a79e14a1700
+        identity_digest: 8b19c20610d4dcfed619ca2854e548b6bac5ca2d7a0bc26dd00182d2614f7ea7
+    exposed_development:
+      split: validation
+      path: runs/outcome_recovery_s49666_validation
+      manifest_sha256: c7a59139bfe4cc8412a82f735b9668f4865f753e5248957b3430617b3e6b9272
+      identity_digest: 758b046c52a401c83fccba21523c9ea6add3aef0966ffa623deee581dafeccee
+  sampler:
+    kind: pure_step_interleaved_fold_rank_disjoint_v3
+    formula: d=(step-start)*world+rank;fold=d%6;q=d//6
+    total_updates: 800
+    contexts_per_arm: 2
+    informative_training_groups: only
+  folds:
+    - {split: train0, path: runs/outcome_recovery_s49666_train0}
+    - {split: train1, path: runs/outcome_recovery_s49666_train1}
+    - {split: train2, path: runs/outcome_recovery_s49666_train2}
+    - {split: train3, path: runs/outcome_recovery_s49666_train3}
+    - {split: train4, path: runs/outcome_recovery_s49666_train4}
+    - {split: train5, path: runs/outcome_recovery_s49666_train5}
+  anchor_manifest:
+    digest: sha256:f61c453864dc8a84e274a65e834e037a83ef8407ed4e9635f84c78d814fe2e7e
+    n_tasks: 40
+    n_trajectories: 1960
+    n_windows: 47271
+  recovery_kl_controller:
+    kind: one_sided_recovery_pl_forward_kl_v1
+    interval: 20
+    metric: global_all_rank_mean_pre_update_recovery_kl
+    initial_beta: null
+    target_kl: null
+    eta: null
+    max_beta: null
+    decrease_allowed: false
+    coefficient_status: PENDING_CONTROLLER_RESUME_SMOKE
+  train_trust_panel:
+    kind: locked_train_only_trust_panel_v1
+    every: 200
+    data_scope: TRAIN_ONLY_LOCKED_BEFORE_TRAINING
+    source_splits: [train0, train1, train2, train3, train4, train5]
+    uses_validation: false
+    uses_holdout: false
+    demo_panel:
+      source: frozen_authenticated_train_anchor_batches
+      anchor_manifest_digest: sha256:f61c453864dc8a84e274a65e834e037a83ef8407ed4e9635f84c78d814fe2e7e
+      batches: 16
+      start_step: 49666
+      uses_validation: false
+      uses_holdout: false
+    manifest_sha256: null
+    item_count: null
+    thresholds:
+      recovery_forward_kl_max: null
+      clip_fraction_max: null
+      ess_fraction_min: null
+      arm0_coeff_drift_p95_l2_max: null
+      arm0_topk_overlap_change_min: null
+      max_abs_logratio_max: null
+      demo_categorical_forward_kl_max: null
+      demo_topk_overlap_change_min: null
+    threshold_status: PENDING_OBJECTIVE_AND_CONTROLLER_DIAGNOSIS
+  validation_lineage:
+    decision_status: UNRESOLVED_FREEZE_BEFORE_FRESH_FORMAL_COLLECTION
+    current_development_collection:
+      split: validation
+      path: runs/outcome_recovery_s49666_validation
+      collection_format_version: 1
+      manifest_sha256: c7a59139bfe4cc8412a82f735b9668f4865f753e5248957b3430617b3e6b9272
+      observed_identity_digest: 758b046c52a401c83fccba21523c9ea6add3aef0966ffa623deee581dafeccee
+      identity_status: OBSERVED_DEVELOPMENT_ONLY_NOT_FORMAL_FROZEN
+      status: DEVELOPMENT_EXPOSED_DO_NOT_FORMAL_GATE
+      exposures:
+        - v1_terminal_selection
+        - early_curve_diagnostic
+        - component_gradient_projection
+        - round_robin_direction_audit
+    formal_terminal_collection:
+      split: null
+      path: null
+      collector_seed: null
+      collection_format_version: null
+      manifest_sha256: null
+      identity_digest: null
+      collector_source:
+        scheme: null
+        sha256: null
+        files: null
+      identity_status: NOT_COLLECTED_METHOD_FREEZE_REQUIRED_FIRST
+    formalization:
+      pilot_terminal_report_sha256: null
+      method_freeze_receipt_sha256: null
+      method_freeze_receipt_created_utc: null
+      receipt_frozen_recipe_sha256: null
+      formal_collection_started_utc: null
+      chronology_status: NOT_AVAILABLE_PILOT_MUST_PASS_FIRST
+  freeze_evidence:
+    component_projection_report_sha256: null
+    round_robin_direction_audit_report_sha256: null
+    controller_resume_smoke_report_sha256: null
+    frozen_recipe_sha256: null
+  artifact_policy:
+    role: development_pilot
+    candidate_emission: forbidden
+    promotion: forbidden
+    official_evaluation: forbidden
+    pilot_checkpoint_only: true
+
+slurm:
+  nodes: 1
+  gpus_per_node: 8
+  n_links: 1
+
+# A pilot cannot authorize promotion. A later formal recipe needs a distinct
+# frozen config, fresh run directory, and lineage-approved terminal gate.
+promotion_gate:
+  required: false
+  eligible: false
+  reason: v2_pilot_is_diagnostic_only

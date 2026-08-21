@@ -1,0 +1,90 @@
+# Iteration 3a: action-anchored operator-bank fit.
+#
+# Seed a fresh run directory later from every verified r0a_deploy_s1 shard at
+# step 49,666, preserving global step and every non-bank Adam state while
+# explicitly clearing the bank moments for this new objective. Do NOT seed from
+# the rejected B4 proposal weights. The first 8k gate ends at 57,666; keep the
+# absolute cosine horizon fixed at 80k and use --stop_at only as a link boundary.
+
+extends: r0a_deploy.yaml
+
+run:
+  name: r0a_bank_ca
+  steps: 80000
+  ckpt_every: 500
+
+data:
+  sampling: uniform_window
+  # Reserve one complete demonstration per LIBERO task. Training sees the
+  # complement; scripts/bank_ca_gate.py switches this exact selector to `gate`
+  # through build_gate_loader, so no window from a heldout trajectory can leak.
+  trajectory_split: train
+  holdout_demo_keys: [demo_49]
+  # Reuse the verified B4 history construction, but not its learned proposal.
+  recurrent_burn_in: 4
+
+optim:
+  # Both online and EMA estimator coordinates remain checkpoint-exact. Only the
+  # bank moves; c_a is a detached frozen semantic anchor.
+  update_ema: false
+  # Applied once when the seed checkpoint's config hash transitions to this
+  # recipe. Same-hash requeues retain the bank moments accumulated afterward.
+  reset_state_modules: [bank]
+  lr_scales:
+    estimator: 0.0
+    bank: 0.1
+    q_delta: 0.0
+    q_action: 0.0
+    ema: 0.0
+    proposal: 0.0
+    decoder: 0.0
+    potential: 0.0
+
+losses:
+  dyn:
+    enabled: true
+    weight: 1.0
+    coeff_source: q_action
+    negatives: within_trajectory
+    min_gap: 2
+    neg_weight: 1.0
+    neg_margin: 0.1
+    cosine: per_slot
+  act:       {enabled: false, weight: 0.0, align_to: q_a,
+              decode_from: proposal}
+  proposal:  {enabled: false, weight: 0.0, mode: sparse_ce,
+              temperature: 1.0, detach_belief: true}
+  balance:   {enabled: false, weight: 0.0}
+  potential: {enabled: false, weight: 0.0}
+  grpo:      {enabled: false, weight: 0.0, group: 8}
+
+train_modules: [bank]
+
+convergence:
+  start_step: 49666
+  block: 2000
+  blocks: 4
+  tol: 0.02
+  primary: [loss/dyn]
+  watch: [dyn/pos, dyn/neg, delta_op, delta_sel/h1, delta_sel/h2,
+          delta_sel/h3, delta_sel/h4, grad_norm]
+  # A scalar phase-clock check is only a coarse early rejection. The required
+  # per-horizon confidence bounds live in the offline gate below.
+  floor_checks: [delta_sel]
+
+# Run only after convergence, against the consolidated candidate checkpoint.
+# All three lower bounds must be strictly above zero. Direct LIBERO evaluation
+# is intentionally forbidden: the direct R0 policy does not execute the bank.
+offline_gate:
+  script: scripts/bank_ca_gate.py
+  confidence: 0.95
+  bootstrap_samples: 2000
+  seed: 0
+  windows: 256
+  candidates: 32
+  requirements:
+    delta_sel_ci_low_per_horizon: 0.0
+    identity_minus_rollout_ci_low_per_horizon: 0.0
+    proposal_candidate_leaf_spread_ci_low: 0.0
+  direct_e2e: false
+  required: true

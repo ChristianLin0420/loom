@@ -1,0 +1,952 @@
+{
+  "aggregation": {
+    "contexts_per_arm": 2,
+    "distributed": "production_SUM_over_world_mean_of_world_scaled_rank_local_contributions_equals_explicit_SUM",
+    "execution": "fixed_order_one_group_graph_then_detached_gradient_accumulation_demo_once",
+    "group_local_weight": "1/(40*groups_for_task_in_shard)",
+    "macro": "equal_group_within_task_then_equal_40_tasks",
+    "partition_interpretation": "prospective_design_unbiased_deterministic_balanced_three_minibatch_one_pass",
+    "per_group": "equal_context_within_arm_then_equal_7_arms",
+    "production_mean_reducer_prescale": 8,
+    "rank_local_task_weight_sum": "5/40=1/8",
+    "scope": "equal_group_within_task_then_equal_40_tasks_per_macro",
+    "tasks_per_rank": 5,
+    "three_macro_average_not_equal_to_one_shot_full_pool_group_mean": true,
+    "weight_application": "direct_group_scalar_before_autograd"
+  },
+  "domain": "pa-full-coverage-equal-task-v1",
+  "format_version": 1,
+  "kind": "loom_task_balanced_positive_advantage_selection",
+  "method_status": "FROZEN_SELECTION_NONLAUNCHABLE",
+  "partition": {
+    "assignment_sha256": "79f2a7a3980fbf744d3652256205083b94681d04597b3f79780c956d0c2d1920",
+    "context_selection": {
+      "arms": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "assignment_sha256": "64cef16c7662615655c84cce12077a95c015e9f83d8d9db691e9ce9036d13634",
+      "atoms": 12642,
+      "contexts_per_arm": 2,
+      "prior_round_robin_24_draw_equivalence_required": true,
+      "sampler_kind": "pure_step_interleaved_fold_rank_disjoint_v3",
+      "sampler_seed": 0,
+      "stable_seed_domain": "outcome-v2-replan-v3",
+      "visit": 0
+    },
+    "rank_rows": [
+      {
+        "groups_by_shard": [
+          39,
+          39,
+          38
+        ],
+        "local_group_weight_sum_per_shard": [
+          0.125,
+          0.125,
+          0.125
+        ],
+        "rank": 0,
+        "sidecar_bytes_by_shard": [
+          9769985322,
+          9950958570,
+          8975309412
+        ],
+        "tasks": [
+          "libero_long/task=00",
+          "libero_long/task=03",
+          "libero_long/task=05",
+          "libero_object/task=05",
+          "libero_object/task=06"
+        ]
+      },
+      {
+        "groups_by_shard": [
+          40,
+          42,
+          41
+        ],
+        "local_group_weight_sum_per_shard": [
+          0.125,
+          0.125,
+          0.125
+        ],
+        "rank": 1,
+        "sidecar_bytes_by_shard": [
+          7955141808,
+          8404222524,
+          8047430838
+        ],
+        "tasks": [
+          "libero_goal/task=00",
+          "libero_goal/task=01",
+          "libero_object/task=07",
+          "libero_spatial/task=02",
+          "libero_spatial/task=05"
+        ]
+      },
+      {
+        "groups_by_shard": [
+          36,
+          35,
+          36
+        ],
+        "local_group_weight_sum_per_shard": [
+          0.125,
+          0.125,
+          0.125
+        ],
+        "rank": 2,
+        "sidecar_bytes_by_shard": [
+          7558186264,
+          7441884178,
+          7653172504
+        ],
+        "tasks": [
+          "libero_goal/task=02",
+          "libero_goal/task=08",
+          "libero_goal/task=09",
+          "libero_long/task=06",
+          "libero_spatial/task=04"
+        ]
+      },
+      {
+        "groups_by_shard": [
+          33,
+          30,
+          31
+        ],
+        "local_group_weight_sum_per_shard": [
+          0.125,
+          0.125,
+          0.125
+        ],
+        "rank": 3,
+        "sidecar_bytes_by_shard": [
+          6681857414,
+          6094502580,
+          6351494010
+        ],
+        "tasks": [
+          "libero_goal/task=04",
+          "libero_long/task=08",
+          "libero_object/task=03",
+          "libero_spatial/task=01",
+          "libero_spatial/task=07"
+        ]
+      },
+      {
+        "groups_by_shard": [
+          34,
+          35,
+          35
+        ],
+        "local_group_weight_sum_per_shard": [
+          0.125,
+          0.125,
+          0.125
+        ],
+        "rank": 4,
+        "sidecar_bytes_by_shard": [
+          8393843404,
+          8807362834,
+          9000884434
+        ],
+        "tasks": [
+          "libero_goal/task=03",
+          "libero_long/task=01",
+          "libero_long/task=09",
+          "libero_object/task=02",
+          "libero_object/task=04"
+        ]
+      },
+      {
+        "groups_by_shard": [
+          41,
+          43,
+          42
+        ],
+        "local_group_weight_sum_per_shard": [
+          0.125,
+          0.125,
+          0.125
+        ],
+        "rank": 5,
+        "sidecar_bytes_by_shard": [
+          10338023222,
+          10716468674,
+          10237565436
+        ],
+        "tasks": [
+          "libero_goal/task=06",
+          "libero_long/task=02",
+          "libero_object/task=00",
+          "libero_spatial/task=03",
+          "libero_spatial/task=08"
+        ]
+      },
+      {
+        "groups_by_shard": [
+          37,
+          36,
+          37
+        ],
+        "local_group_weight_sum_per_shard": [
+          0.125,
+          0.125,
+          0.125
+        ],
+        "rank": 6,
+        "sidecar_bytes_by_shard": [
+          8619368158,
+          7885717080,
+          8175109470
+        ],
+        "tasks": [
+          "libero_goal/task=07",
+          "libero_long/task=07",
+          "libero_object/task=08",
+          "libero_object/task=09",
+          "libero_spatial/task=06"
+        ]
+      },
+      {
+        "groups_by_shard": [
+          41,
+          41,
+          41
+        ],
+        "local_group_weight_sum_per_shard": [
+          0.125,
+          0.125,
+          0.125
+        ],
+        "rank": 7,
+        "sidecar_bytes_by_shard": [
+          8375430326,
+          9711670006,
+          8889779702
+        ],
+        "tasks": [
+          "libero_goal/task=05",
+          "libero_long/task=04",
+          "libero_object/task=01",
+          "libero_spatial/task=00",
+          "libero_spatial/task=09"
+        ]
+      }
+    ],
+    "shard_rows": [
+      {
+        "assignment_sha256": "b1d65040c77c55e2fea506800b89e0010d6b6e0e73245a9e3ac086d2d42c08ad",
+        "context_assignment_sha256": "26a5a25222d963ff384deab793744cae8f9aebce6ce965badca6b67e420da837",
+        "global_step": 49666,
+        "groups": 301,
+        "groups_by_rank": [
+          39,
+          40,
+          36,
+          33,
+          34,
+          41,
+          37,
+          41
+        ],
+        "macro_offset": 0,
+        "maximum_rank_sidecar_bytes": 10338023222,
+        "maximum_to_mean_sidecar_bytes": 1.2217748958114467,
+        "shard": 0,
+        "sidecar_bytes": 67691835918,
+        "sidecar_bytes_by_rank": [
+          9769985322,
+          7955141808,
+          7558186264,
+          6681857414,
+          8393843404,
+          10338023222,
+          8619368158,
+          8375430326
+        ],
+        "tasks": 40
+      },
+      {
+        "assignment_sha256": "b9783d45b5b8182f22dc944f97756d3b1c66fcddf49462281f7d2d9a1f32e0a3",
+        "context_assignment_sha256": "fa2a178e8100e57d64ecaebe829b6c7e07cfbdff420e4dd4eb13213a6c0d5b51",
+        "global_step": 49667,
+        "groups": 301,
+        "groups_by_rank": [
+          39,
+          42,
+          35,
+          30,
+          35,
+          43,
+          36,
+          41
+        ],
+        "macro_offset": 1,
+        "maximum_rank_sidecar_bytes": 10716468674,
+        "maximum_to_mean_sidecar_bytes": 1.242258917614955,
+        "shard": 1,
+        "sidecar_bytes": 69012786446,
+        "sidecar_bytes_by_rank": [
+          9950958570,
+          8404222524,
+          7441884178,
+          6094502580,
+          8807362834,
+          10716468674,
+          7885717080,
+          9711670006
+        ],
+        "tasks": 40
+      },
+      {
+        "assignment_sha256": "404b44b0b41d75be4de98a8b20e67c5da9648705cefb6a12c7771c9bf6462c70",
+        "context_assignment_sha256": "e1ec2e11cb8febf3393b43927cb7d82d1f22b88e8e6064465cc69b66708268b0",
+        "global_step": 49668,
+        "groups": 301,
+        "groups_by_rank": [
+          38,
+          41,
+          36,
+          31,
+          35,
+          42,
+          37,
+          41
+        ],
+        "macro_offset": 2,
+        "maximum_rank_sidecar_bytes": 10237565436,
+        "maximum_to_mean_sidecar_bytes": 1.2163911524755702,
+        "shard": 2,
+        "sidecar_bytes": 67330745806,
+        "sidecar_bytes_by_rank": [
+          8975309412,
+          8047430838,
+          7653172504,
+          6351494010,
+          9000884434,
+          10237565436,
+          8175109470,
+          8889779702
+        ],
+        "tasks": 40
+      }
+    ],
+    "shards": 3,
+    "task_order_sha256": "e895c9cb3fd95298f8eb84c17a8919905bc4688dc3b50952a96e05dd8a4a5e71",
+    "task_rows": [
+      {
+        "assignment_sha256": "2a63af6e591ca143fadb413d00b33ee07bea962f4ab938afc88a0fbfee48046a",
+        "groups_by_shard": [
+          8,
+          8,
+          7
+        ],
+        "rank": 0,
+        "rotation": 0,
+        "task_key": "libero_long/task=03",
+        "task_position": 0,
+        "total_groups": 23
+      },
+      {
+        "assignment_sha256": "c242944dc359d5aa6379ab08e32ce57264263ce27c6bbc9276f94eda37311ea2",
+        "groups_by_shard": [
+          9,
+          10,
+          10
+        ],
+        "rank": 1,
+        "rotation": 1,
+        "task_key": "libero_spatial/task=05",
+        "task_position": 1,
+        "total_groups": 29
+      },
+      {
+        "assignment_sha256": "62e2f9251447ba565d778af80ed92369e1aa155b332fed32f35fb0b3e49230d1",
+        "groups_by_shard": [
+          8,
+          8,
+          9
+        ],
+        "rank": 2,
+        "rotation": 2,
+        "task_key": "libero_spatial/task=04",
+        "task_position": 2,
+        "total_groups": 25
+      },
+      {
+        "assignment_sha256": "776a3f8c14a4c60d3927d377edc7ca82fc42209f507fbd52dbc8534764a6ed53",
+        "groups_by_shard": [
+          5,
+          4,
+          4
+        ],
+        "rank": 3,
+        "rotation": 0,
+        "task_key": "libero_goal/task=04",
+        "task_position": 3,
+        "total_groups": 13
+      },
+      {
+        "assignment_sha256": "db351c86ff97551abd60c4227edafa6a116ec8316442086f23725e895d108a1e",
+        "groups_by_shard": [
+          7,
+          8,
+          8
+        ],
+        "rank": 4,
+        "rotation": 1,
+        "task_key": "libero_object/task=04",
+        "task_position": 4,
+        "total_groups": 23
+      },
+      {
+        "assignment_sha256": "7c1e2daef1a20d2e1df35f63525aa4638c8d09fee1bfcf7b612fc0faae02a732",
+        "groups_by_shard": [
+          9,
+          9,
+          10
+        ],
+        "rank": 5,
+        "rotation": 2,
+        "task_key": "libero_spatial/task=03",
+        "task_position": 5,
+        "total_groups": 28
+      },
+      {
+        "assignment_sha256": "8e3a5223d8e1ae2a7c00e63c9aa3705b117b9d917f07b55f97ceb8cfe47400cd",
+        "groups_by_shard": [
+          7,
+          6,
+          6
+        ],
+        "rank": 6,
+        "rotation": 0,
+        "task_key": "libero_long/task=07",
+        "task_position": 6,
+        "total_groups": 19
+      },
+      {
+        "assignment_sha256": "4715a091a626ecae931a98a527268e131348e11339123e04fd3fccaff0473870",
+        "groups_by_shard": [
+          9,
+          10,
+          9
+        ],
+        "rank": 7,
+        "rotation": 1,
+        "task_key": "libero_spatial/task=09",
+        "task_position": 7,
+        "total_groups": 28
+      },
+      {
+        "assignment_sha256": "553189ac76f2d93c9f28fab1beb74f9f5091dea81b600710aab362bec7318463",
+        "groups_by_shard": [
+          7,
+          7,
+          7
+        ],
+        "rank": 0,
+        "rotation": 2,
+        "task_key": "libero_long/task=00",
+        "task_position": 8,
+        "total_groups": 21
+      },
+      {
+        "assignment_sha256": "0cc93d5dfc9710d1b3f7349bd7c21cd6571747c1ee68158711d5acf2b3657513",
+        "groups_by_shard": [
+          9,
+          9,
+          8
+        ],
+        "rank": 1,
+        "rotation": 0,
+        "task_key": "libero_goal/task=01",
+        "task_position": 9,
+        "total_groups": 26
+      },
+      {
+        "assignment_sha256": "dc4cc0d86c74f48f812f3a5f2415d21d0faa5d501357703a3cf13756884810a4",
+        "groups_by_shard": [
+          4,
+          4,
+          4
+        ],
+        "rank": 2,
+        "rotation": 1,
+        "task_key": "libero_goal/task=09",
+        "task_position": 10,
+        "total_groups": 12
+      },
+      {
+        "assignment_sha256": "50694d0f55454ea1287222dde2bfcdfdee0ca07f0de45651aee68387aafd5e4b",
+        "groups_by_shard": [
+          10,
+          10,
+          10
+        ],
+        "rank": 3,
+        "rotation": 2,
+        "task_key": "libero_spatial/task=01",
+        "task_position": 11,
+        "total_groups": 30
+      },
+      {
+        "assignment_sha256": "87bb4930aeae549eaee8acc6d29d093f6e1cf15e65da38096634f79e4c4dbd70",
+        "groups_by_shard": [
+          9,
+          9,
+          9
+        ],
+        "rank": 4,
+        "rotation": 0,
+        "task_key": "libero_long/task=01",
+        "task_position": 12,
+        "total_groups": 27
+      },
+      {
+        "assignment_sha256": "d8fac955bc1d96c3dc80c3cceb6d0dc56d469e9f2fb62930dc7136fbfd93fdde",
+        "groups_by_shard": [
+          9,
+          10,
+          9
+        ],
+        "rank": 5,
+        "rotation": 1,
+        "task_key": "libero_object/task=00",
+        "task_position": 13,
+        "total_groups": 28
+      },
+      {
+        "assignment_sha256": "940aec58c5d4553e41be71e2058afc8dfaf8316d3780ad2a7240f5dc027b5c54",
+        "groups_by_shard": [
+          8,
+          8,
+          9
+        ],
+        "rank": 6,
+        "rotation": 2,
+        "task_key": "libero_object/task=08",
+        "task_position": 14,
+        "total_groups": 25
+      },
+      {
+        "assignment_sha256": "b1eb8ad15cd801841c6d5bf8cefc98a3a0f9a89cc30b221ec1be7db7c87d3fe6",
+        "groups_by_shard": [
+          6,
+          5,
+          5
+        ],
+        "rank": 7,
+        "rotation": 0,
+        "task_key": "libero_long/task=04",
+        "task_position": 15,
+        "total_groups": 16
+      },
+      {
+        "assignment_sha256": "1d77f0588284a0f6209c5e0b142412e58e363a9923837b3510bb221f1dd3c6fd",
+        "groups_by_shard": [
+          8,
+          9,
+          8
+        ],
+        "rank": 0,
+        "rotation": 1,
+        "task_key": "libero_object/task=06",
+        "task_position": 16,
+        "total_groups": 25
+      },
+      {
+        "assignment_sha256": "a0a7e0ba8051d43df9b6d9d7eb117eeb3b1e4072001b007f5a9671270a6e8c79",
+        "groups_by_shard": [
+          8,
+          8,
+          9
+        ],
+        "rank": 1,
+        "rotation": 2,
+        "task_key": "libero_goal/task=00",
+        "task_position": 17,
+        "total_groups": 25
+      },
+      {
+        "assignment_sha256": "38a4dafe6e7c65ffe577b3e5f1420d867c9f0d4335d40f1eedeaf4d098e6b8c3",
+        "groups_by_shard": [
+          10,
+          9,
+          9
+        ],
+        "rank": 2,
+        "rotation": 0,
+        "task_key": "libero_goal/task=08",
+        "task_position": 18,
+        "total_groups": 28
+      },
+      {
+        "assignment_sha256": "a2f9170745f0a1468764e29e81c7e5f5e89992214a63d3027dd691cbc9644326",
+        "groups_by_shard": [
+          2,
+          2,
+          2
+        ],
+        "rank": 3,
+        "rotation": 1,
+        "task_key": "libero_long/task=08",
+        "task_position": 19,
+        "total_groups": 6
+      },
+      {
+        "assignment_sha256": "085fb65316ba17d7554988e06987c412638110a696ee69469a92b516ce44b9d3",
+        "groups_by_shard": [
+          7,
+          7,
+          7
+        ],
+        "rank": 4,
+        "rotation": 2,
+        "task_key": "libero_object/task=02",
+        "task_position": 20,
+        "total_groups": 21
+      },
+      {
+        "assignment_sha256": "621bf2d0c8c1c1df27e78e42071f30a6a55395e3e0efe06d078089ece95cea49",
+        "groups_by_shard": [
+          7,
+          7,
+          7
+        ],
+        "rank": 5,
+        "rotation": 0,
+        "task_key": "libero_spatial/task=08",
+        "task_position": 21,
+        "total_groups": 21
+      },
+      {
+        "assignment_sha256": "2f508b8f999c9f1434ecbccb280b8828b0da6cba1449648e1f504bc654309ff1",
+        "groups_by_shard": [
+          5,
+          6,
+          6
+        ],
+        "rank": 6,
+        "rotation": 1,
+        "task_key": "libero_object/task=09",
+        "task_position": 22,
+        "total_groups": 17
+      },
+      {
+        "assignment_sha256": "640191b2e5d666732af403a29fc21da4c176a188f63a5de19aad0ce2448be17b",
+        "groups_by_shard": [
+          9,
+          9,
+          10
+        ],
+        "rank": 7,
+        "rotation": 2,
+        "task_key": "libero_spatial/task=00",
+        "task_position": 23,
+        "total_groups": 28
+      },
+      {
+        "assignment_sha256": "2dbcfaddc424888b052b4c9bc30a11cc7a9bfe43547b0c6230a1f28f5bad2fe5",
+        "groups_by_shard": [
+          8,
+          8,
+          8
+        ],
+        "rank": 0,
+        "rotation": 0,
+        "task_key": "libero_long/task=05",
+        "task_position": 24,
+        "total_groups": 24
+      },
+      {
+        "assignment_sha256": "72b1d6f5c69a56c6c0d4f604a1e4b5680396eadaad01500f2e4cfe3c4bed821a",
+        "groups_by_shard": [
+          8,
+          9,
+          8
+        ],
+        "rank": 1,
+        "rotation": 1,
+        "task_key": "libero_object/task=07",
+        "task_position": 25,
+        "total_groups": 25
+      },
+      {
+        "assignment_sha256": "176b6204dbd87252d6ba2d27cad3df40913fd9e05445ffb436ae509d754ab269",
+        "groups_by_shard": [
+          8,
+          7,
+          8
+        ],
+        "rank": 2,
+        "rotation": 2,
+        "task_key": "libero_goal/task=02",
+        "task_position": 26,
+        "total_groups": 23
+      },
+      {
+        "assignment_sha256": "187322933fccd5bb323c8700999725da4659f67d861f630d7f7d9c08f258b92e",
+        "groups_by_shard": [
+          8,
+          7,
+          7
+        ],
+        "rank": 3,
+        "rotation": 0,
+        "task_key": "libero_spatial/task=07",
+        "task_position": 27,
+        "total_groups": 22
+      },
+      {
+        "assignment_sha256": "ee653a028dd9d35a5711630ab30c04e023138423a1f5cba082b5d2bc40112e15",
+        "groups_by_shard": [
+          6,
+          6,
+          6
+        ],
+        "rank": 4,
+        "rotation": 1,
+        "task_key": "libero_goal/task=03",
+        "task_position": 28,
+        "total_groups": 18
+      },
+      {
+        "assignment_sha256": "bbfaf438ff52b7deb981d2cddd4d2793ec34680b6e19fba2f26d9a0b43f1d377",
+        "groups_by_shard": [
+          9,
+          9,
+          9
+        ],
+        "rank": 5,
+        "rotation": 2,
+        "task_key": "libero_long/task=02",
+        "task_position": 29,
+        "total_groups": 27
+      },
+      {
+        "assignment_sha256": "f70bc842d401f0d88b3d920dea1689de402f52b94cf3360e2ac7fe0ec6060362",
+        "groups_by_shard": [
+          7,
+          7,
+          6
+        ],
+        "rank": 6,
+        "rotation": 0,
+        "task_key": "libero_goal/task=07",
+        "task_position": 30,
+        "total_groups": 20
+      },
+      {
+        "assignment_sha256": "7a644df1a6b1da8a1aa60f6fa753aef0df6081e833401da16b610f555ff9919f",
+        "groups_by_shard": [
+          10,
+          10,
+          10
+        ],
+        "rank": 7,
+        "rotation": 1,
+        "task_key": "libero_goal/task=05",
+        "task_position": 31,
+        "total_groups": 30
+      },
+      {
+        "assignment_sha256": "d07c619202c0c60eb7fae3695f2a9f0a072087425a12f16d1645a1a8e37fb423",
+        "groups_by_shard": [
+          8,
+          7,
+          8
+        ],
+        "rank": 0,
+        "rotation": 2,
+        "task_key": "libero_object/task=05",
+        "task_position": 32,
+        "total_groups": 23
+      },
+      {
+        "assignment_sha256": "a5874a57974be5dc6ef19b1a15be0fefeb8fb9c404830137797e17acf97e1a35",
+        "groups_by_shard": [
+          6,
+          6,
+          6
+        ],
+        "rank": 1,
+        "rotation": 0,
+        "task_key": "libero_spatial/task=02",
+        "task_position": 33,
+        "total_groups": 18
+      },
+      {
+        "assignment_sha256": "4d4c1f5f199c9a5c99d1dc9f68d3b986fcf9069acec314e3d667fe0f408d172e",
+        "groups_by_shard": [
+          6,
+          7,
+          6
+        ],
+        "rank": 2,
+        "rotation": 1,
+        "task_key": "libero_long/task=06",
+        "task_position": 34,
+        "total_groups": 19
+      },
+      {
+        "assignment_sha256": "6774eff65c8e2d6c100dbb1c1f397de6f94d41d460571a94cdd59531998e4c4c",
+        "groups_by_shard": [
+          8,
+          7,
+          8
+        ],
+        "rank": 3,
+        "rotation": 2,
+        "task_key": "libero_object/task=03",
+        "task_position": 35,
+        "total_groups": 23
+      },
+      {
+        "assignment_sha256": "70980231060a358edad5ce0bcb6eabab42689f5d1041c42bc03dd6b24083ec5d",
+        "groups_by_shard": [
+          5,
+          5,
+          5
+        ],
+        "rank": 4,
+        "rotation": 0,
+        "task_key": "libero_long/task=09",
+        "task_position": 36,
+        "total_groups": 15
+      },
+      {
+        "assignment_sha256": "70291964affee0b7628d82e2343f9a52bdd31262b5b540f76b26e17523287b07",
+        "groups_by_shard": [
+          7,
+          8,
+          7
+        ],
+        "rank": 5,
+        "rotation": 1,
+        "task_key": "libero_goal/task=06",
+        "task_position": 37,
+        "total_groups": 22
+      },
+      {
+        "assignment_sha256": "6bf7dec43cfecd90763a8877bf9ae3753ed70f5db65316b6b8d6fe7bfa6ba0f0",
+        "groups_by_shard": [
+          10,
+          9,
+          10
+        ],
+        "rank": 6,
+        "rotation": 2,
+        "task_key": "libero_spatial/task=06",
+        "task_position": 38,
+        "total_groups": 29
+      },
+      {
+        "assignment_sha256": "8534c4cc0330ffa7acee9968e3dfc7b4b46344b91286a16576e7095a2e66c96a",
+        "groups_by_shard": [
+          7,
+          7,
+          7
+        ],
+        "rank": 7,
+        "rotation": 0,
+        "task_key": "libero_object/task=01",
+        "task_position": 39,
+        "total_groups": 21
+      }
+    ],
+    "validation": {
+      "informative_groups": 903,
+      "maximum_per_task_shard_count_difference": 1,
+      "minimum_groups_per_task_shard": 2,
+      "passed": true,
+      "shard_totals": [
+        301,
+        301,
+        301
+      ],
+      "tasks": 40,
+      "tasks_per_rank": 5
+    }
+  },
+  "pool": {
+    "all_groups_used_exactly_once": true,
+    "informative_definition": "inherited_int_distinct_over_8_exact_binary_terminal_rewards",
+    "informative_groups": 903,
+    "raw_groups": 1200,
+    "sidecar_bytes": 204035368170,
+    "tasks": 40,
+    "union_sha256": "1b831f4845413f4104c5dd25497ced3a00e17e47f147867264714d6875c3e7fd"
+  },
+  "resume": {
+    "actual_macro_updates": 3,
+    "one_full_903_group_pass": true,
+    "start_step": 49666,
+    "stop_step": 49669
+  },
+  "scheme": "sha256-domain-task-and-group-order-then-task-position-rotated-mod3-v1",
+  "sources": [
+    {
+      "identity_digest": "6aae6bbb5f6226de726de64bd8b57d6f4fb673a63c5e23c49ad136a03dd75433",
+      "informative_groups": 146,
+      "manifest_groups": 200,
+      "manifest_sha256": "f92f50960e1640b32f2f50c6e9a7c61603204ea21369c6e2493d3770b3683c17",
+      "observed_informative_groups": 146,
+      "path": "runs/outcome_recovery_s49666_train0",
+      "split": "train0"
+    },
+    {
+      "identity_digest": "331c812f62a8249d6c4be6a368b2bc9c5bbe6e352a67f6e8ac89a4deeaf984a0",
+      "informative_groups": 159,
+      "manifest_groups": 200,
+      "manifest_sha256": "8c45d514454598eb1c53c0d3ea3a12b3606f84baae612e5d3c2dc50bfd904421",
+      "observed_informative_groups": 159,
+      "path": "runs/outcome_recovery_s49666_train1",
+      "split": "train1"
+    },
+    {
+      "identity_digest": "302d7a4a95c45526338e1bfffd6008a893825ba1eb6157217169cfe661fd77ee",
+      "informative_groups": 143,
+      "manifest_groups": 200,
+      "manifest_sha256": "4a53fca9490840e90319d2fde986f8f6c12a6d236869c5000e5b4f0e1555b29b",
+      "observed_informative_groups": 143,
+      "path": "runs/outcome_recovery_s49666_train2",
+      "split": "train2"
+    },
+    {
+      "identity_digest": "f6c0eb2f6b11a477f84be6323ef1a94f720dfe30e8fd854fd1d0c3d25bcef35e",
+      "informative_groups": 148,
+      "manifest_groups": 200,
+      "manifest_sha256": "289c0d6796d1bfccf471bb519c3145b0837147280b5059ae62d821a5b7d3594e",
+      "observed_informative_groups": 148,
+      "path": "runs/outcome_recovery_s49666_train3",
+      "split": "train3"
+    },
+    {
+      "identity_digest": "206fb752eb2f345284286a35bdc277eee03573c916563abb724c8d3f67dad13c",
+      "informative_groups": 148,
+      "manifest_groups": 200,
+      "manifest_sha256": "025a8a81556a733da4401fb489306222e93e72535f3ca8266c4780fc76f9857b",
+      "observed_informative_groups": 148,
+      "path": "runs/outcome_recovery_s49666_train4",
+      "split": "train4"
+    },
+    {
+      "identity_digest": "8b19c20610d4dcfed619ca2854e548b6bac5ca2d7a0bc26dd00182d2614f7ea7",
+      "informative_groups": 159,
+      "manifest_groups": 200,
+      "manifest_sha256": "61253c67af3ea3c5cda710a78498e098bd2ea54082ba557ad2145a79e14a1700",
+      "observed_informative_groups": 159,
+      "path": "runs/outcome_recovery_s49666_train5",
+      "split": "train5"
+    }
+  ]
+}

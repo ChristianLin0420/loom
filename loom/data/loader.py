@@ -18,9 +18,13 @@ There is no stateful sampler
 Sampling is a pure function. ``sampler.batch_at(step, rank)`` is the whole
 interface; nothing accumulates. Resume therefore needs only ``global_step``,
 which is exactly why Team D's checkpoint deliberately stores no sampler cursor.
-Within one embodiment the schedule is epoch-permutation based: for a given
-epoch every rank takes a disjoint slice, so an epoch is covered with no
-duplicates within a rank and none across ranks either.
+Within one embodiment the default ``uniform_window`` schedule is
+epoch-permutation based: for a given epoch every rank takes a disjoint slice,
+so an epoch is covered with no duplicates within a rank and none across ranks
+either. ``uniform_task`` instead cycles uniformly over task identities and
+draws without replacement from each task's own window pool. Both modes are pure
+functions of ``(seed, global_step, rank)`` and therefore resume without a
+cursor.
 
 The schedule block
 ------------------
@@ -52,6 +56,7 @@ worker/prefetch queue to what fits, down to an in-process loader, and
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import time
 from dataclasses import dataclass, replace
@@ -69,10 +74,11 @@ from .canonical import CanonicalTrajectory, WindowIndex, segment, window_actions
 
 __all__ = [
     "STARVATION_MARGIN", "DEFAULT_CONSUMPTION_HZ",
+    "SAMPLING_MODES", "TRAJECTORY_SPLITS",
     "HomogeneousSampler", "CachedWindowDataset", "collate_window",
     "LoomLoader", "Throughput", "measure_throughput",
     "shm_free_bytes", "shm_headroom", "fit_workers",
-    "build_loader", "resolve_cache_root", "DataConfigError",
+    "build_loader", "build_gate_loader", "resolve_cache_root", "DataConfigError",
 ]
 
 #: PLAN §4.A: the pipeline must produce at least this multiple of what training eats.
@@ -87,6 +93,17 @@ STARVATION_MARGIN = 1.3
 #: asserts a stricter requirement than R0-A actually imposes, and it does not
 #: have to be revisited when the model gets faster on 16 GPUs.
 DEFAULT_CONSUMPTION_HZ = float(os.environ.get("LOOM_TRAIN_STEP_HZ", "5.0"))
+
+#: ``uniform_window`` preserves the original flat-window data distribution.
+#: ``uniform_task`` matches LIBERO's macro task metric: task -> window, both
+#: uniformly. The config spelling is intentionally closed so a typo cannot
+#: silently launch the old recipe.
+SAMPLING_MODES = ("uniform_window", "uniform_task")
+
+#: Whole-trajectory selection is separate from window sampling. ``all`` is the
+#: backward-compatible default; ``train`` and ``gate`` are complements defined
+#: by exact demo leaf names such as LIBERO's ``demo_49``.
+TRAJECTORY_SPLITS = ("all", "train", "gate")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -142,6 +159,8 @@ class HomogeneousSampler:
         seed: int = 0,
         weights: Mapping[str, float] | None = None,
         block: int = 64,
+        sampling: str = "uniform_window",
+        task_indices: Mapping[str, Mapping[str, Sequence[int]]] | None = None,
     ) -> None:
         if not sizes:
             raise ValueError("no bodies")
@@ -154,6 +173,11 @@ class HomogeneousSampler:
         self.seed = int(seed)
         self.block = int(block)
         self.per_step = self.batch_size * self.world_size
+        self.sampling = str(sampling)
+        if self.sampling not in SAMPLING_MODES:
+            raise ValueError(
+                f"sampling must be one of {SAMPLING_MODES}, got {self.sampling!r}"
+            )
 
         for name, n in self.sizes.items():
             if n < self.per_step:
@@ -168,9 +192,44 @@ class HomogeneousSampler:
         )
         self.counts = _apportion(w, self.block)           # slots per body per block
         self._perm_memo: dict[tuple[str, int], np.ndarray] = {}
+        self._task_order_memo: dict[tuple[str, int], np.ndarray] = {}
+        self._task_perm_memo: dict[tuple[str, int, int], np.ndarray] = {}
+        self._task_names: dict[str, tuple[str, ...]] = {}
+        self._task_pools: dict[str, tuple[np.ndarray, ...]] = {}
+        if self.sampling == "uniform_task":
+            self._init_task_pools(task_indices)
+
+    def _init_task_pools(
+        self, task_indices: Mapping[str, Mapping[str, Sequence[int]]] | None
+    ) -> None:
+        """Validate one exact partition of every body's windows into tasks."""
+        if task_indices is None:
+            raise ValueError("sampling='uniform_task' requires task_indices")
+        for body, size in self.sizes.items():
+            groups = task_indices.get(body)
+            if not groups:
+                raise ValueError(f"{body}: uniform_task sampling found no task groups")
+            names = tuple(sorted(str(k) for k in groups))
+            pools = tuple(np.asarray(groups[name], dtype=np.int64).reshape(-1) for name in names)
+            if any(pool.size == 0 for pool in pools):
+                empty = [name for name, pool in zip(names, pools) if pool.size == 0]
+                raise ValueError(f"{body}: empty task window pools {empty}")
+            flat = np.concatenate(pools)
+            if flat.size != size or not np.array_equal(np.sort(flat), np.arange(size)):
+                raise ValueError(
+                    f"{body}: task window pools must partition indices [0, {size}); "
+                    f"got {flat.size} entries"
+                )
+            self._task_names[body] = names
+            self._task_pools[body] = pools
 
     # ── schedule ─────────────────────────────────────────────────────────
     def steps_per_epoch(self, body: str) -> int:
+        if self.sampling == "uniform_task":
+            pools = self._task_pools[body]
+            # One balanced epoch visits the largest task once and oversamples
+            # every smaller task to the same number of draws.
+            return len(pools) * max(len(pool) for pool in pools) // self.per_step
         return self.sizes[body] // self.per_step
 
     def _pattern(self, block_index: int) -> np.ndarray:
@@ -203,11 +262,60 @@ class HomogeneousSampler:
             self._perm_memo[key] = perm
         return perm
 
+    def _task_order(self, body: str, cycle: int) -> np.ndarray:
+        """One seeded permutation of all tasks; each appears once per cycle."""
+        key = (body, cycle)
+        order = self._task_order_memo.get(key)
+        if order is None:
+            rng = np.random.default_rng(_seed_of(self.seed, "task_order", body, cycle))
+            order = rng.permutation(len(self._task_pools[body]))
+            if len(self._task_order_memo) > 64:
+                self._task_order_memo.clear()
+            self._task_order_memo[key] = order
+        return order
+
+    def _task_permutation(self, body: str, task: int, epoch: int) -> np.ndarray:
+        """Permutation within one task, independent of every other task's size."""
+        key = (body, task, epoch)
+        perm = self._task_perm_memo.get(key)
+        if perm is None:
+            name = self._task_names[body][task]
+            rng = np.random.default_rng(_seed_of(self.seed, "task_perm", body, name, epoch))
+            perm = rng.permutation(len(self._task_pools[body][task]))
+            if len(self._task_perm_memo) > 64:
+                self._task_perm_memo.clear()
+            self._task_perm_memo[key] = perm
+        return perm
+
+    def _uniform_task_batch(self, body: str, local_step: int, rank: int) -> np.ndarray:
+        """Uniform task -> uniform window for one rank's contiguous global slice.
+
+        Global sample ordinal ``q`` is divided into cycles of ``n_tasks``. Each
+        cycle contains every task exactly once in a seeded order. A task's cycle
+        number is also its occurrence number, which indexes a separate seeded
+        permutation of that task's windows. This gives exact task balance,
+        disjoint rank slices until a per-task epoch rolls over, and O(batch)
+        resume at an arbitrary step.
+        """
+        n_tasks = len(self._task_pools[body])
+        start = local_step * self.per_step + rank * self.batch_size
+        out = np.empty(self.batch_size, dtype=np.int64)
+        for j, q in enumerate(range(start, start + self.batch_size)):
+            cycle, pos = divmod(q, n_tasks)
+            task = int(self._task_order(body, cycle)[pos])
+            pool = self._task_pools[body][task]
+            epoch, within = divmod(cycle, len(pool))
+            pick = int(self._task_permutation(body, task, epoch)[within])
+            out[j] = pool[pick]
+        return out
+
     def batch_at(self, step: int, rank: int = 0) -> tuple[str, np.ndarray]:
         if not (0 <= rank < self.world_size):
             raise ValueError(f"rank {rank} outside world_size {self.world_size}")
         body = self.embodiment_at(step)
         ls = self.local_step(step)
+        if self.sampling == "uniform_task":
+            return body, self._uniform_task_batch(body, ls, rank)
         spe = self.steps_per_epoch(body)
         perm = self._permutation(body, ls // spe)
         k = ls % spe
@@ -218,6 +326,169 @@ class HomogeneousSampler:
 # ═══════════════════════════════════════════════════════════════════════════
 #  DATASET
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _libero_trajectory_identity(traj_id: str) -> tuple[str, str]:
+    """Return (suite/task, demo key) from the adapter's canonical id."""
+    parts = str(traj_id).split("/")
+    if len(parts) != 3 or any(not part for part in parts):
+        raise DataConfigError(
+            "LIBERO whole-trajectory splitting requires canonical ids "
+            f"'suite/task/demo_key'; got {traj_id!r}"
+        )
+    return f"{parts[0]}/{parts[1]}", parts[2]
+
+
+def _trajectory_split_config(dcfg: Mapping) -> tuple[str, tuple[str, ...], bool]:
+    """Validate and canonicalise the optional whole-trajectory split block."""
+    configured = "trajectory_split" in dcfg or "holdout_demo_keys" in dcfg
+    split = str(dcfg.get("trajectory_split", "all"))
+    if split not in TRAJECTORY_SPLITS:
+        raise DataConfigError(
+            f"data.trajectory_split must be one of {TRAJECTORY_SPLITS}, got {split!r}"
+        )
+
+    raw = dcfg.get("holdout_demo_keys", ())
+    if raw is None:
+        raw = ()
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise DataConfigError(
+            "data.holdout_demo_keys must be a list of exact demo leaf names, "
+            f"for example [demo_49]; got {raw!r}"
+        )
+    keys = tuple(sorted(str(key) for key in raw))
+    if any(not key or "/" in key for key in keys):
+        raise DataConfigError(
+            "data.holdout_demo_keys entries must be non-empty demo leaf names "
+            f"without '/'; got {list(keys)!r}"
+        )
+    if len(set(keys)) != len(keys):
+        raise DataConfigError(
+            f"data.holdout_demo_keys contains duplicates: {list(keys)!r}"
+        )
+    if split != "all" and not keys:
+        raise DataConfigError(
+            f"data.trajectory_split={split!r} requires non-empty "
+            "data.holdout_demo_keys"
+        )
+    return split, keys, configured
+
+
+def _libero_manifest(
+    trajectories: Sequence[CanonicalTrajectory],
+    *,
+    split: str,
+    holdout_demo_keys: Sequence[str],
+) -> dict:
+    """Stable, path-independent provenance for a selected trajectory set."""
+    tasks: dict[str, list[str]] = {}
+    for traj in sorted(trajectories, key=lambda item: item.traj_id):
+        task_id, _ = _libero_trajectory_identity(traj.traj_id)
+        tasks.setdefault(task_id, []).append(traj.traj_id)
+    tasks = {task: sorted(ids) for task, ids in sorted(tasks.items())}
+    trajectory_ids = sorted(t.traj_id for t in trajectories)
+    payload = {
+        "version": 1,
+        "source": "libero",
+        "split": split,
+        "holdout_demo_keys": sorted(str(key) for key in holdout_demo_keys),
+        "n_tasks": len(tasks),
+        "n_trajectories": len(trajectory_ids),
+        "tasks": tasks,
+        "trajectory_ids": trajectory_ids,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    payload["digest"] = f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+    return payload
+
+
+def _select_libero_trajectories(
+    trajectories: Sequence[CanonicalTrajectory],
+    *,
+    split: str,
+    holdout_demo_keys: Sequence[str],
+    expected_task_ids: Sequence[str] | None = None,
+) -> tuple[list[CanonicalTrajectory], dict]:
+    """Select an exact whole-trajectory complement and return its manifest.
+
+    Selection never depends on adapter order, rank, seed, or sampler state. For
+    ``train``/``gate``, every expected task must contain every requested demo
+    key and must retain at least one non-heldout trajectory. This deliberately
+    makes ``max_demos: 49`` with ``demo_49`` fail instead of silently leaking or
+    constructing an incomplete gate.
+    """
+    if split not in TRAJECTORY_SPLITS:
+        raise DataConfigError(
+            f"trajectory split must be one of {TRAJECTORY_SPLITS}, got {split!r}"
+        )
+    keys = tuple(sorted(str(key) for key in holdout_demo_keys))
+    ordered = sorted(trajectories, key=lambda item: item.traj_id)
+    ids = [traj.traj_id for traj in ordered]
+    if len(ids) != len(set(ids)):
+        seen: set[str] = set()
+        dupes: set[str] = set()
+        for traj_id in ids:
+            if traj_id in seen:
+                dupes.add(traj_id)
+            else:
+                seen.add(traj_id)
+        raise DataConfigError(f"duplicate LIBERO trajectory ids: {sorted(dupes)}")
+
+    by_task: dict[str, list[tuple[CanonicalTrajectory, str]]] = {}
+    for traj in ordered:
+        task_id, demo_key = _libero_trajectory_identity(traj.traj_id)
+        by_task.setdefault(task_id, []).append((traj, demo_key))
+    expected = set(str(task) for task in (expected_task_ids or by_task))
+    missing_tasks = sorted(expected - set(by_task))
+    if missing_tasks:
+        raise DataConfigError(
+            "LIBERO cache is missing every trajectory for expected tasks: "
+            + ", ".join(missing_tasks)
+        )
+
+    if split in ("train", "gate"):
+        wanted = set(keys)
+        missing_keys: dict[str, list[str]] = {}
+        no_train: list[str] = []
+        for task_id in sorted(expected):
+            present = {demo_key for _, demo_key in by_task[task_id]}
+            missing = sorted(wanted - present)
+            if missing:
+                missing_keys[task_id] = missing
+            if not (present - wanted):
+                no_train.append(task_id)
+        if missing_keys:
+            detail = "; ".join(
+                f"{task}: {missing}" for task, missing in missing_keys.items()
+            )
+            raise DataConfigError(
+                "configured LIBERO holdout demos are absent from task(s) "
+                f"({detail}). Check data.max_demos and cache completeness."
+            )
+        if no_train:
+            raise DataConfigError(
+                "LIBERO holdout leaves no training trajectory for task(s): "
+                + ", ".join(no_train)
+            )
+        selected = [
+            traj for traj in ordered
+            if ((_libero_trajectory_identity(traj.traj_id)[1] in wanted)
+                == (split == "gate"))
+        ]
+    else:
+        selected = ordered
+
+    selected_tasks = {
+        _libero_trajectory_identity(traj.traj_id)[0] for traj in selected
+    }
+    if selected_tasks != expected:
+        missing = sorted(expected - selected_tasks)
+        raise DataConfigError(
+            f"LIBERO trajectory split {split!r} omits task(s): {missing}"
+        )
+    return selected, _libero_manifest(
+        selected, split=split, holdout_demo_keys=keys,
+    )
+
 
 class CachedWindowDataset:
     """Windows of ONE embodiment, features served from a ``FeatureCache``.
@@ -231,6 +502,8 @@ class CachedWindowDataset:
         trajectories: Sequence[CanonicalTrajectory],
         cache: FeatureCache,
         stride: int = H_OP,
+        recurrent_burn_in: int = 0,
+        data_manifest: Mapping | None = None,
     ) -> None:
         if not trajectories:
             raise ValueError("no trajectories")
@@ -251,33 +524,125 @@ class CachedWindowDataset:
         self.dof = EMBODIMENTS[self.embodiment].dof
         self.cache = cache
         self.stride = int(stride)
+        if (isinstance(recurrent_burn_in, bool)
+                or not isinstance(recurrent_burn_in, int)
+                or recurrent_burn_in < 0):
+            raise ValueError(
+                "recurrent_burn_in must be a non-negative integer number of "
+                f"operator-boundary observations, got {recurrent_burn_in!r}"
+            )
+        self.recurrent_burn_in = recurrent_burn_in
+        trajectory_ids = tuple(t.traj_id for t in trajectories)
+        if len(set(trajectory_ids)) != len(trajectory_ids):
+            raise ValueError("duplicate trajectory ids in CachedWindowDataset")
+        self.trajectory_ids = trajectory_ids
         self.actions: dict[str, np.ndarray | None] = {t.traj_id: t.actions for t in trajectories}
+        self._traj = {t.traj_id: t for t in trajectories}
+        self._data_manifest: dict | None = None
+        self._task_id_by_trajectory: dict[str, str] = {}
+        if data_manifest is not None:
+            # JSON round-trip both validates serialisability and prevents a
+            # caller from mutating the provenance after dataset construction.
+            manifest = json.loads(json.dumps(dict(data_manifest)))
+            manifest_ids = tuple(manifest.get("trajectory_ids", ()))
+            if manifest_ids != tuple(sorted(trajectory_ids)):
+                raise ValueError(
+                    "data manifest trajectory_ids do not exactly match the dataset"
+                )
+            for task_id, ids in manifest.get("tasks", {}).items():
+                for traj_id in ids:
+                    if traj_id in self._task_id_by_trajectory:
+                        raise ValueError(
+                            f"data manifest assigns trajectory {traj_id!r} twice"
+                        )
+                    self._task_id_by_trajectory[str(traj_id)] = str(task_id)
+            if set(self._task_id_by_trajectory) != set(trajectory_ids):
+                raise ValueError(
+                    "data manifest tasks do not partition the dataset trajectories"
+                )
+            self._data_manifest = manifest
         self.windows: list[WindowIndex] = []
         for t in trajectories:
-            self.windows.extend(segment(t, stride=stride))
-        self._traj = {t.traj_id: t for t in trajectories}
+            windows = segment(t, stride=stride)
+            if self.recurrent_burn_in:
+                # Burn-in counts policy replans, whose canonical spacing is H_OP,
+                # not dataset-window strides or raw source frames. Earlier windows
+                # remain in the cache and supply these prefix observations.
+                first = self.recurrent_burn_in * H_OP
+                windows = [w for w in windows if w.start >= first]
+            self.windows.extend(windows)
 
     def __len__(self) -> int:
         return len(self.windows)
 
+    def trajectory_manifest(self) -> dict:
+        """Return an isolated JSON-ready copy of split/source provenance."""
+        if self._data_manifest is None:
+            raise ValueError("this dataset was built without trajectory split provenance")
+        return json.loads(json.dumps(self._data_manifest))
+
+    def task_indices(self) -> dict[str, np.ndarray]:
+        """Task identity -> local window indices, using cache metadata first.
+
+        LIBERO's cache records both suite and task, so identically named tasks in
+        different suites cannot collide. ``CanonicalTrajectory.lang`` is the
+        portable fallback for synthetic and future adapters; a trajectory id is
+        used only when neither source supplied a task identity.
+        """
+        groups: dict[str, list[int]] = {}
+        entries = getattr(self.cache, "entries", {})
+        for i, window in enumerate(self.windows):
+            traj = self._traj[window.traj_id]
+            meta = entries.get(window.traj_id, {}).get("meta", {})
+            task = str(meta.get("task") or traj.lang or window.traj_id)
+            suite = str(meta.get("suite") or "")
+            key = f"{suite}/{task}" if suite else task
+            groups.setdefault(key, []).append(i)
+        return {key: np.asarray(idx, dtype=np.int64) for key, idx in groups.items()}
+
     def __getitem__(self, i: int) -> dict:
         w = self.windows[i]
-        blob = self.cache.read(w.traj_id, w.obs_src_index)
-        views = torch.from_numpy(np.ascontiguousarray(blob["views"]))       # (5,V,P,F)
-        proprio = torch.from_numpy(np.ascontiguousarray(blob["proprio"]))   # (5,dof)
+        traj = self._traj[w.traj_id]
+        prefix_src = tuple(
+            int(traj.obs_src_index[t])
+            for t in range(
+                w.start - self.recurrent_burn_in * H_OP,
+                w.start,
+                H_OP,
+            )
+        )
+        blob = self.cache.read(w.traj_id, prefix_src + w.obs_src_index)
+        views = torch.from_numpy(np.ascontiguousarray(blob["views"]))
+        proprio = torch.from_numpy(np.ascontiguousarray(blob["proprio"]))
         lang = torch.from_numpy(np.ascontiguousarray(blob["lang"]))         # (L,F)
-        feats = [
+        all_feats = [
             ObsFeats(views=views[s], proprio=proprio[s], lang=lang)
-            for s in range(N_STATES)
+            for s in range(self.recurrent_burn_in + N_STATES)
         ]
-        a = window_actions(self._traj[w.traj_id], w)
-        return {
-            "feats": feats,
+        a = window_actions(traj, w)
+        out = {
+            "feats": all_feats[self.recurrent_burn_in:],
             "actions": None if a is None else torch.from_numpy(np.ascontiguousarray(a)),
             "lang": lang,
             "embodiment": w.embodiment,
             "src_fps": w.src_fps,
         }
+        if self._data_manifest is not None:
+            out["data_meta"] = {
+                "source": self._data_manifest["source"],
+                "split": self._data_manifest["split"],
+                "manifest_digest": self._data_manifest["digest"],
+                "task_id": self._task_id_by_trajectory[w.traj_id],
+                "trajectory_id": w.traj_id,
+                # Bootstrap/resampling clusters are complete demonstrations,
+                # never individual windows from the same demonstration.
+                "trajectory_cluster_id": w.traj_id,
+            }
+        # Omit the optional key at B=0 so every existing source and consumer sees
+        # precisely the historical TransitionWindow dictionary.
+        if self.recurrent_burn_in:
+            out["burn_in_feats"] = all_feats[:self.recurrent_burn_in]
+        return out
 
 
 def collate_window(samples: Sequence[dict]) -> TransitionWindow:
@@ -294,24 +659,52 @@ def collate_window(samples: Sequence[dict]) -> TransitionWindow:
         raise ValueError(f"batch mixes source rates {sorted(rates)}")
     body = samples[0]["embodiment"]
 
-    feats: list[ObsFeats] = []
-    for s in range(N_STATES):
-        feats.append(ObsFeats(
-            views=torch.stack([x["feats"][s]["views"] for x in samples]),
-            proprio=torch.stack([x["feats"][s]["proprio"] for x in samples]),
-            lang=torch.stack([x["feats"][s]["lang"] for x in samples]),
-        ))
+    def _stack(key: str, n: int) -> list[ObsFeats]:
+        return [ObsFeats(
+            views=torch.stack([x[key][s]["views"] for x in samples]),
+            proprio=torch.stack([x[key][s]["proprio"] for x in samples]),
+            lang=torch.stack([x[key][s]["lang"] for x in samples]),
+        ) for s in range(n)]
+
+    feats = _stack("feats", N_STATES)
+    prefix_lengths = {len(x.get("burn_in_feats", ())) for x in samples}
+    if len(prefix_lengths) != 1:
+        raise ValueError(
+            f"batch mixes recurrent burn-in lengths {sorted(prefix_lengths)}"
+        )
+    n_prefix = next(iter(prefix_lengths))
     action_free = [x["actions"] is None for x in samples]
     if any(action_free) and not all(action_free):
         raise ValueError("batch mixes action-labelled and action-free windows")
     actions = None if action_free[0] else torch.stack([x["actions"] for x in samples])
-    return TransitionWindow(
+    out = TransitionWindow(
         feats=feats,
         actions=actions,
         lang=torch.stack([x["lang"] for x in samples]),
         embodiment=body,
         src_fps=float(samples[0]["src_fps"]),
     )
+    if n_prefix:
+        out["burn_in_feats"] = _stack("burn_in_feats", n_prefix)
+    has_meta = ["data_meta" in sample for sample in samples]
+    if any(has_meta) and not all(has_meta):
+        raise ValueError("batch mixes windows with and without data provenance")
+    if all(has_meta):
+        metadata = [sample["data_meta"] for sample in samples]
+        common_keys = ("source", "split", "manifest_digest")
+        for key in common_keys:
+            values = {item[key] for item in metadata}
+            if len(values) != 1:
+                raise ValueError(f"batch mixes data provenance {key}: {sorted(values)}")
+        out["data_meta"] = {
+            **{key: metadata[0][key] for key in common_keys},
+            "task_ids": tuple(item["task_id"] for item in metadata),
+            "trajectory_ids": tuple(item["trajectory_id"] for item in metadata),
+            "trajectory_cluster_ids": tuple(
+                item["trajectory_cluster_id"] for item in metadata
+            ),
+        }
+    return out
 
 
 def shm_free_bytes() -> int:
@@ -425,17 +818,23 @@ class LoomLoader:
         prefetch_factor: int = 2,
         pin_memory: bool = False,
         block: int = 64,
+        sampling: str = "uniform_window",
     ) -> None:
         for name, ds in datasets.items():
             if ds.embodiment != name:
                 raise ValueError(f"dataset keyed {name!r} holds body {ds.embodiment!r}")
         self.datasets = dict(datasets)
         self.concat = _ConcatBodies(self.datasets)
+        task_indices = (
+            {name: ds.task_indices() for name, ds in self.datasets.items()}
+            if sampling == "uniform_task" else None
+        )
         self.sampler = HomogeneousSampler(
             {k: len(v) for k, v in self.datasets.items()},
             batch_size=batch_size, world_size=world_size, seed=seed,
-            weights=weights, block=block,
+            weights=weights, block=block, sampling=sampling, task_indices=task_indices,
         )
+        self.sampling = self.sampler.sampling
         self.batch_size = int(batch_size)
         self.rank = int(rank)
         self.num_workers = int(num_workers)
@@ -451,6 +850,18 @@ class LoomLoader:
     @property
     def n_windows(self) -> int:
         return len(self.concat)
+
+    def trajectory_manifest(self, body: str | None = None) -> dict:
+        """Manifest for one body; LIBERO's single body needs no argument."""
+        if body is None:
+            if len(self.datasets) != 1:
+                raise ValueError(
+                    "body is required when requesting a multi-embodiment manifest"
+                )
+            body = next(iter(self.datasets))
+        if body not in self.datasets:
+            raise KeyError(f"loader has no dataset for embodiment {body!r}")
+        return self.datasets[body].trajectory_manifest()
 
     # ── shared memory ────────────────────────────────────────────────────
     def bytes_per_batch(self) -> int:
@@ -640,6 +1051,12 @@ def build_loader(
     bodies = list(dcfg.get("embodiments", []) or [])
     if not bodies:
         raise DataConfigError("data.embodiments is empty; nothing to load")
+    trajectory_split, holdout_keys, _ = _trajectory_split_config(dcfg)
+    if source != "libero" and (trajectory_split != "all" or holdout_keys):
+        raise DataConfigError(
+            "whole-trajectory holdout_demo_keys are currently implemented only "
+            f"for data.source='libero', not {source!r}"
+        )
 
     root = resolve_cache_root(cfg, cache_root)
     cache = _open_cache(root)
@@ -654,6 +1071,7 @@ def build_loader(
         world_size=int(world),
         rank=int(rank),
         seed=seed,
+        sampling=str(dcfg.get("sampling", "uniform_window")),
         num_workers=int(dcfg.get("num_workers", 0)),
         prefetch_factor=int(dcfg.get("prefetch_factor", 2)),
         # the loop hands us device="cpu" and moves tensors itself, so pinning is
@@ -667,8 +1085,12 @@ def build_loader(
     spec = cache.spec
     print(
         f"[data] real loader: source={source} cache={root} "
-        f"trajectories={len(cache)} windows={loader.n_windows} "
+        f"trajectories={sum(len(ds.trajectory_ids) for ds in datasets.values())}/"
+        f"{len(cache)} windows={loader.n_windows} "
         f"bodies={sorted(datasets)} batch_per_gpu={batch} world={world} rank={rank} "
+        f"sampling={loader.sampling} recurrent_burn_in="
+        f"{int(dcfg.get('recurrent_burn_in', 0))} "
+        f"trajectory_split={trajectory_split} "
         f"codec={spec.codec} V={spec.n_views} P={spec.n_patches} F={spec.feat_dim} "
         f"L={spec.lang_len} "
         f"workers={loader.effective_workers}/{loader.num_workers} "
@@ -680,11 +1102,40 @@ def build_loader(
     return loader
 
 
+def build_gate_loader(
+    cfg: Mapping,
+    *,
+    rank: int = 0,
+    world: int = 1,
+    seed: int | None = None,
+    device: str = "cpu",
+    cache_root: str | os.PathLike | None = None,
+) -> LoomLoader:
+    """Build only the configured heldout whole trajectories.
+
+    The standalone offline gate can consume the training config directly; this
+    wrapper changes only ``data.trajectory_split`` to ``gate`` and leaves its
+    exact ``holdout_demo_keys`` and all loader/sampler settings untouched.
+    """
+    gate_cfg = dict(cfg)
+    gate_cfg["data"] = {**dict(cfg.get("data", {})), "trajectory_split": "gate"}
+    return build_loader(
+        gate_cfg, rank=rank, world=world, seed=seed, device=device,
+        cache_root=cache_root,
+    )
+
+
 def _dataset_for(
     body: str, source: str, cache: FeatureCache, dcfg: Mapping
 ) -> CachedWindowDataset:
     """One embodiment's windows, from the cache plus that adapter's metadata."""
+    trajectory_split, holdout_keys, split_configured = _trajectory_split_config(dcfg)
     if source == "robotwin" and body == "robotwin_aloha":
+        if trajectory_split != "all" or holdout_keys:
+            raise DataConfigError(
+                "whole-trajectory holdout_demo_keys are currently implemented "
+                "only for LIBERO"
+            )
         from dataclasses import replace  # noqa: PLC0415
 
         from .adapters import robotwin as RT  # noqa: PLC0415
@@ -703,7 +1154,10 @@ def _dataset_for(
             )
         if dcfg.get("action_free", False):
             trajs = [replace(t, actions=None) for t in trajs]
-        return CachedWindowDataset(trajs, cache, stride=RT.WINDOW_STRIDE)
+        return CachedWindowDataset(
+            trajs, cache, stride=RT.WINDOW_STRIDE,
+            recurrent_burn_in=dcfg.get("recurrent_burn_in", 0),
+        )
 
     if source != "libero" or body != "libero_franka":
         raise DataConfigError(
@@ -727,6 +1181,10 @@ def _dataset_for(
         ) from e
 
     produced = [t.traj_id for t in trajs]
+    expected_task_ids = (
+        sorted({_libero_trajectory_identity(t.traj_id)[0] for t in trajs})
+        if split_configured else None
+    )
     trajs = [t for t in trajs if t.traj_id in cache]
     if not trajs:
         raise DataConfigError(
@@ -736,9 +1194,21 @@ def _dataset_for(
             f"{(produced[0] if produced else '<none>')!r}. The two must agree — "
             f"re-encode, or fix data.suites / $LOOM_DATA_ROOT."
         )
+    data_manifest = None
+    if split_configured:
+        trajs, data_manifest = _select_libero_trajectories(
+            trajs,
+            split=trajectory_split,
+            holdout_demo_keys=holdout_keys,
+            expected_task_ids=expected_task_ids,
+        )
     if dcfg.get("action_free", False):
         trajs = [replace(t, actions=None) for t in trajs]
-    return CachedWindowDataset(trajs, cache, stride=LB.WINDOW_STRIDE)
+    return CachedWindowDataset(
+        trajs, cache, stride=LB.WINDOW_STRIDE,
+        recurrent_burn_in=dcfg.get("recurrent_burn_in", 0),
+        data_manifest=data_manifest,
+    )
 
 
 @dataclass
@@ -782,6 +1252,11 @@ class Throughput:
 
 def _batch_bytes(w: TransitionWindow) -> int:
     n = sum(f[k].nbytes for f in w["feats"] for k in ("views", "proprio", "lang"))
+    n += sum(
+        f[k].nbytes
+        for f in w.get("burn_in_feats", ())
+        for k in ("views", "proprio", "lang")
+    )
     if w["actions"] is not None:
         n += w["actions"].nbytes
     return int(n)

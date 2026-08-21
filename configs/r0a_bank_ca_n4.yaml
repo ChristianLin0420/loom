@@ -1,0 +1,15 @@
+# Iteration 3a-N4: one-scalar discrimination-strength fallback.
+#
+# Start again from the verified step-49,666 deploy shards, never from the
+# rejected r0a_bank_ca_s1 state.  Everything remains identical to the
+# action-anchored bank fit except the weight on its already-active,
+# same-trajectory hinge.
+
+extends: r0a_bank_ca.yaml
+
+run:
+  name: r0a_bank_ca_n4
+
+losses:
+  dyn:
+    neg_weight: 4.0

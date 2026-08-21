@@ -346,6 +346,14 @@ def test_cached_features_carry_no_autograd_history():
     with pytest.raises(RuntimeError, match="frozen tower is in the training graph"):
         fsdp_mod.assert_features_are_cached(w)
 
+    w = S.make_window(b=1)
+    w["burn_in_feats"] = [S.make_obs_feats(b=1)]
+    w["burn_in_feats"][0]["lang"] = (
+        w["burn_in_feats"][0]["lang"].clone().requires_grad_(True)
+    )
+    with pytest.raises(RuntimeError, match="burn_in_feats"):
+        fsdp_mod.assert_features_are_cached(w)
+
 
 def test_belief_is_pinned_to_the_compute_dtype():
     """The L_dyn rollout must not silently leave bf16.
@@ -369,13 +377,116 @@ def test_belief_is_pinned_to_the_compute_dtype():
         assert z.dtype is torch.bfloat16, "EMA target belief left the compute dtype"
 
 
+def _marked_recurrent_window(prefix=(1.0, 2.0, 3.0, 4.0), main=(5., 6., 7., 8., 9.)):
+    w = S.make_window(b=1)
+
+    def marked(template, value):
+        out = {key: tensor.clone() for key, tensor in template.items()}
+        out["proprio"].fill_(value)
+        return out
+
+    w["burn_in_feats"] = [marked(w["feats"][0], value) for value in prefix]
+    w["feats"] = [marked(w["feats"][0], value) for value in main]
+    return w
+
+
+def test_burn_in_replays_online_and_ema_independently_before_main_states():
+    class Accumulator(nn.Module):
+        def __init__(self, offset):
+            super().__init__()
+            self.offset = float(offset)
+            self.calls = []
+
+        def forward(self, feats, z_prev):
+            value = feats["proprio"][:, :1].view(-1, 1, 1)
+            previous = None if z_prev is None else float(z_prev.item())
+            self.calls.append((float(value.item()), previous, torch.is_grad_enabled()))
+            if z_prev is None:
+                return value + self.offset
+            return z_prev + value
+
+    cfg = {"data": {"embodiments": ["libero_franka"]},
+           "model": {"use_stubs": True}, "losses": {}}
+    model = build_model(cfg)
+    online, target = Accumulator(10.0), Accumulator(100.0)
+    model.estimator = online
+    model.ema = target
+    w = _marked_recurrent_window(prefix=(1., 2.), main=(3., 4., 5., 6., 7.))
+
+    zs = model.beliefs(w)
+    zts = model.target_beliefs(w)
+
+    assert [c[0] for c in online.calls] == [1., 2., 3., 4., 5., 6., 7.]
+    assert [c[0] for c in target.calls] == [1., 2., 3., 4., 5., 6., 7.]
+    assert online.calls[0][1] is None and target.calls[0][1] is None
+    assert online.calls[2][1] == pytest.approx(13.0)
+    assert target.calls[2][1] == pytest.approx(103.0)
+    assert [c[2] for c in online.calls] == [False, False, True, True, True, True, True]
+    assert all(c[2] is False for c in target.calls)
+    assert [float(z.item()) for z in zs] == [16., 20., 25., 31., 38.]
+    assert [float(z.item()) for z in zts] == [106., 110., 115., 121., 128.]
+
+
+def test_online_burn_in_is_no_grad_and_detached_before_five_state_graph():
+    class ScalarRecurrence(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+            self.grad_enabled = []
+
+        def forward(self, feats, z_prev):
+            self.grad_enabled.append(torch.is_grad_enabled())
+            value = feats["proprio"][:, :1].view(-1, 1, 1)
+            update = self.weight * value
+            return update if z_prev is None else z_prev + update
+
+    cfg = {"data": {"embodiments": ["libero_franka"]},
+           "model": {"use_stubs": True}, "losses": {}}
+    model = build_model(cfg)
+    recurrence = ScalarRecurrence()
+    model.estimator = recurrence
+    w = _marked_recurrent_window(prefix=(2., 3.), main=(1., 1., 1., 1., 1.))
+
+    zs = model.beliefs(w)
+    zs[-1].sum().backward()
+
+    assert recurrence.grad_enabled == [False, False, True, True, True, True, True]
+    # Only the unchanged five main updates contribute: the 2+3 prefix is outside
+    # the graph and its terminal state is detached at the window boundary.
+    assert recurrence.weight.grad == pytest.approx(torch.tensor(5.0))
+
+
+def test_no_prefix_beliefs_are_bitwise_backward_compatible():
+    cfg = {"data": {"embodiments": ["libero_franka"]},
+           "model": {"use_stubs": True}, "losses": {}}
+    model = build_model(cfg)
+    w = S.make_window(b=1)
+    explicit_empty = dict(w, burn_in_feats=[])
+
+    torch.manual_seed(123)
+    old_online = model.beliefs(w)
+    torch.manual_seed(123)
+    new_online = model.beliefs(explicit_empty)
+    torch.manual_seed(456)
+    old_target = model.target_beliefs(w)
+    torch.manual_seed(456)
+    new_target = model.target_beliefs(explicit_empty)
+
+    assert all(torch.equal(a, b) for a, b in zip(old_online, new_online))
+    assert all(torch.equal(a, b) for a, b in zip(old_target, new_target))
+
+
 def test_to_device_casts_only_float_tensors():
     from loom.train.loop import _to_device
 
     w = S.make_window(b=1)
+    w["burn_in_feats"] = [S.make_obs_feats(b=1), S.make_obs_feats(b=1)]
     w["step_id"] = torch.tensor([3, 4])
     out = _to_device(w, "cpu", torch.bfloat16)
     assert out["feats"][0]["views"].dtype is torch.bfloat16
+    assert all(f["views"].dtype is torch.bfloat16 for f in out["burn_in_feats"])
+    assert all(f["proprio"].dtype is torch.bfloat16 for f in out["burn_in_feats"])
+    assert all(f["lang"].dtype is torch.bfloat16 for f in out["burn_in_feats"])
     assert out["lang"].dtype is torch.bfloat16
     assert out["actions"].dtype is torch.bfloat16
     assert out["step_id"].dtype is torch.int64, "an index tensor was cast to bf16"
@@ -906,6 +1017,233 @@ def test_checkpoint_round_trips_the_whole_state():
             == fresh.optimizer.state_dict()["state"].keys())
 
 
+def test_selective_optimizer_reset_preserves_resume_state_and_is_one_time():
+    from loom.train.loop import (
+        _optimizer_group_config, _optimizer_state_reset_modules,
+        _reapply_optimizer_group_config,
+        _reset_optimizer_state_for_config_transition,
+    )
+
+    state = stub_train_state()
+    sum((p.sum() for p in state.model.parameters()), torch.zeros(())).backward()
+    state.optimizer.step()  # populate Adam state for bank and non-bank parameters
+    state.global_step, state.samples_seen = 49666, 123456
+    state.sampler.cursor = 31
+    payload = ckpt_mod.build_state(state, config_hash="deploy-hash", world_size=1)
+
+    fresh = stub_train_state()
+    configured_groups = _optimizer_group_config(fresh.optimizer)
+    configured_scheduler = CosineWithWarmup(2e-4, 0, 80000).state_dict()
+    got = ckpt_mod.restore(payload, fresh)
+    _reapply_optimizer_group_config(fresh.optimizer, configured_groups)
+    fresh.scheduler.load_state_dict(configured_scheduler)
+
+    model_before = {k: v.detach().clone() for k, v in fresh.model.state_dict().items()}
+    ema_before = {k: v.detach().clone() for k, v in fresh.ema.state_dict().items()}
+    scheduler_before = fresh.scheduler.state_dict().copy()
+    non_bank = {
+        p for group in fresh.optimizer.param_groups if group["module"] != "bank"
+        for p in group["params"]
+    }
+    bank = {
+        p for group in fresh.optimizer.param_groups if group["module"] == "bank"
+        for p in group["params"]
+    }
+    assert bank and all(p in fresh.optimizer.state for p in bank | non_bank)
+
+    def clone_state(parameters):
+        return {
+            p: {k: v.clone() if torch.is_tensor(v) else v
+                for k, v in fresh.optimizer.state[p].items()}
+            for p in parameters
+        }
+
+    non_bank_before = clone_state(non_bank)
+    modules = _optimizer_state_reset_modules(fresh.optimizer, ["bank"])
+    cleared = _reset_optimizer_state_for_config_transition(
+        fresh.optimizer, modules,
+        checkpoint_config_hash=got["config_hash"],
+        current_config_hash="bank-ca-hash",
+    )
+
+    assert cleared == {"bank": len(bank)}
+    assert all(p not in fresh.optimizer.state for p in bank)
+    assert set(fresh.optimizer.state) == non_bank
+    for p, expected in non_bank_before.items():
+        assert fresh.optimizer.state[p].keys() == expected.keys()
+        for key, value in expected.items():
+            actual = fresh.optimizer.state[p][key]
+            if torch.is_tensor(value):
+                assert torch.equal(actual, value)
+            else:
+                assert actual == value
+    assert fresh.global_step == 49666 and fresh.samples_seen == 123456
+    assert fresh.sampler.cursor == 31
+    assert fresh.scheduler.state_dict() == scheduler_before == configured_scheduler
+    for key, value in model_before.items():
+        assert torch.equal(fresh.model.state_dict()[key], value)
+    for key, value in ema_before.items():
+        assert torch.equal(fresh.ema.state_dict()[key], value)
+
+    # Once a checkpoint carries this config hash, an ordinary requeue must keep
+    # the new bank moments instead of resetting them at every Slurm link.
+    for p in bank:
+        fresh.optimizer.state[p] = {
+            "step": torch.tensor(7.0),
+            "exp_avg": torch.full_like(p, 0.25),
+            "exp_avg_sq": torch.full_like(p, 0.5),
+        }
+    bank_before = clone_state(bank)
+    assert _reset_optimizer_state_for_config_transition(
+        fresh.optimizer, modules,
+        checkpoint_config_hash="bank-ca-hash",
+        current_config_hash="bank-ca-hash",
+    ) is None
+    for p, expected in bank_before.items():
+        for key, value in expected.items():
+            assert torch.equal(fresh.optimizer.state[p][key], value)
+
+
+def test_joint_bank_q_action_reset_is_transition_only_and_preserves_others():
+    from loom.train.loop import (
+        _optimizer_state_reset_modules,
+        _reset_optimizer_state_for_config_transition,
+    )
+
+    model = nn.Module()
+    model.estimator = nn.Linear(2, 2)
+    model.bank = nn.Linear(2, 2)
+    model.q_action = nn.Linear(2, 2)
+    optimizer = build_optimizer(model, lr=1e-3, module_names=MODULE_NAMES)
+    sum((p.sum() for p in model.parameters()), torch.zeros(())).backward()
+    optimizer.step()
+    selected = {
+        p for group in optimizer.param_groups
+        if group.get("module") in {"bank", "q_action"}
+        for p in group["params"]
+    }
+    retained = set(optimizer.state) - selected
+    assert selected and retained
+    modules = _optimizer_state_reset_modules(
+        optimizer, ["bank", "q_action"],
+    )
+    cleared = _reset_optimizer_state_for_config_transition(
+        optimizer, modules,
+        checkpoint_config_hash="deploy",
+        current_config_hash="qa",
+    )
+    assert cleared == {
+        "bank": sum(
+            len(group["params"]) for group in optimizer.param_groups
+            if group.get("module") == "bank"
+        ),
+        "q_action": sum(
+            len(group["params"]) for group in optimizer.param_groups
+            if group.get("module") == "q_action"
+        ),
+    }
+    assert not (selected & set(optimizer.state))
+    assert set(optimizer.state) == retained
+    assert _reset_optimizer_state_for_config_transition(
+        optimizer, modules,
+        checkpoint_config_hash="qa",
+        current_config_hash="qa",
+    ) is None
+
+
+def test_identity_centered_parameter_reset_is_transition_only_and_omega_only():
+    from loom.train.loop import _reset_parameters_for_config_transition
+
+    class TinyBank(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.log_r = nn.Parameter(torch.full((2, 3), 0.25))
+            self.omega = nn.Parameter(torch.full((2, 3), 1.75))
+            self.b_raw = nn.Parameter(torch.full((2, 3), -0.5))
+
+    model = nn.Module()
+    model.bank = TinyBank()
+    model.q_action = nn.Linear(3, 2)
+    configured = {
+        "source_config_hash": "a199324a6205bb6d",
+        "tensors": {"bank.omega": "zero"},
+    }
+    before = {name: value.detach().clone()
+              for name, value in model.state_dict().items()}
+    reset = _reset_parameters_for_config_transition(
+        model, configured,
+        checkpoint_config_hash="a199324a6205bb6d",
+        current_config_hash="7a5e8a24327ecc0c",
+    )
+    assert reset == {"bank.omega": model.bank.omega.numel()}
+    assert torch.count_nonzero(model.bank.omega) == 0
+    for name, expected in before.items():
+        if name != "bank.omega":
+            assert torch.equal(model.state_dict()[name], expected), name
+
+    # A learned post-transition omega must survive every same-hash safety link.
+    with torch.no_grad():
+        model.bank.omega.fill_(0.375)
+    learned = model.bank.omega.detach().clone()
+    assert _reset_parameters_for_config_transition(
+        model, configured,
+        checkpoint_config_hash="7a5e8a24327ecc0c",
+        current_config_hash="7a5e8a24327ecc0c",
+    ) is None
+    assert torch.equal(model.bank.omega, learned)
+
+    # A shard from any experiment other than the declared deploy source fails
+    # before changing the live parameter.
+    with pytest.raises(ValueError, match="source mismatch"):
+        _reset_parameters_for_config_transition(
+            model, configured,
+            checkpoint_config_hash="0ec8af0a26135ecc",
+            current_config_hash="7a5e8a24327ecc0c",
+        )
+    assert torch.equal(model.bank.omega, learned)
+
+
+@pytest.mark.parametrize("configured, match", [
+    ([], "must be a mapping"),
+    ({"source_config_hash": "a199324a6205bb6d"}, "exactly"),
+    ({"source_config_hash": "NOT-A-HASH",
+      "tensors": {"bank.omega": "zero"}}, "lowercase hexadecimal"),
+    ({"source_config_hash": "a199324a6205bb6d",
+      "tensors": {"bank.log_r": "zero"}}, "must be exactly"),
+    ({"source_config_hash": "a199324a6205bb6d",
+      "tensors": {"bank.omega": "one"}}, "must be exactly"),
+])
+def test_identity_centered_parameter_reset_config_is_fail_closed(configured, match):
+    from loom.train.loop import _reset_parameters_for_config_transition
+
+    model = nn.Module()
+    model.bank = nn.Module()
+    model.bank.omega = nn.Parameter(torch.ones(2))
+    with pytest.raises(ValueError, match=match):
+        _reset_parameters_for_config_transition(
+            model, configured,
+            checkpoint_config_hash="a199324a6205bb6d",
+            current_config_hash="7a5e8a24327ecc0c",
+        )
+
+
+@pytest.mark.parametrize(
+    "configured, match",
+    [
+        ("bank", "must be a list"),
+        (["bank", "bank"], "duplicate"),
+        (["not_a_module"], "no optimizer group"),
+        ([""], "non-empty strings"),
+    ],
+)
+def test_optimizer_state_reset_config_is_validated(configured, match):
+    from loom.train.loop import _optimizer_state_reset_modules
+
+    optimizer = build_optimizer(tiny_model(), lr=1e-3, module_names=MODULE_NAMES)
+    with pytest.raises(ValueError, match=match):
+        _optimizer_state_reset_modules(optimizer, configured)
+
+
 def test_every_module_buffer_reaches_the_checkpoint():
     """register_buffer(persistent=False) silently drops out of a state_dict."""
     model = build_model({"data": {"embodiments": ["libero_franka"]},
@@ -924,6 +1262,7 @@ LINK_LOCAL = [["--stop_at", "3"], ["--budget_s", "120"], ["--safety_s", "30"],
               ["--allow_reshard"]]
 SCHEDULE = [["--steps", "2000"], ["--seed", "1"], ["--lr", "1e-4"],
             ["--batch", "4"], ["--set", "optim.warmup=100"],
+            ["--set", 'optim.reset_state_modules=["bank"]'],
             ["--set", "losses.act.enabled=false"]]
 
 
@@ -1009,6 +1348,656 @@ def _stub_cfg(**over) -> dict:
     for k, v in over.items():
         cfg[k] = {**cfg.get(k, {}), **v} if isinstance(v, dict) else v
     return cfg
+
+
+def test_dense_proposal_hard_weight_config_is_optional_and_validated():
+    base = _stub_cfg(losses={
+        "proposal": {"enabled": True, "mode": "dense_kl"},
+    })
+    assert build_model(base).proposal_hard_weight == 0.0
+
+    hybrid = _stub_cfg(losses={
+        "proposal": {"enabled": True, "mode": "dense_kl", "hard_weight": 0.25},
+    })
+    assert build_model(hybrid).proposal_hard_weight == pytest.approx(0.25)
+
+    for bad in (-0.1, float("inf")):
+        cfg = _stub_cfg(losses={
+            "proposal": {"enabled": True, "mode": "dense_kl", "hard_weight": bad},
+        })
+        with pytest.raises(ValueError, match="hard_weight"):
+            build_model(cfg)
+    with pytest.raises(ValueError, match="only valid"):
+        build_model(_stub_cfg(losses={
+            "proposal": {"enabled": True, "mode": "pl", "hard_weight": 0.1},
+        }))
+    assert build_model(_stub_cfg(losses={
+        "proposal": {"enabled": True, "mode": "sparse_ce"},
+    })).proposal_mode == "sparse_ce"
+
+
+def test_act_decode_from_is_optional_and_validated():
+    assert build_model(_stub_cfg()).act_decode_from == "q_action"
+    assert build_model(_stub_cfg(losses={
+        "act": {"enabled": True, "decode_from": "proposal"},
+    })).act_decode_from == "proposal"
+    with pytest.raises(ValueError, match="decode_from"):
+        build_model(_stub_cfg(losses={
+            "act": {"enabled": True, "decode_from": "future_pixels"},
+        }))
+
+
+def test_dyn_coefficient_source_defaults_to_transition_and_is_validated():
+    default = build_model(_stub_cfg())
+    assert default.dyn_coeff_source == "q_delta"
+    assert default.dyn_detach_coeff is True
+    attached = build_model(_stub_cfg(losses={
+        "dyn": {"enabled": True, "coeff_source": "q_action"},
+    }))
+    assert attached.dyn_coeff_source == "q_action"
+    assert attached.dyn_detach_coeff is True
+    assert build_model(_stub_cfg(losses={
+        "dyn": {"enabled": True, "coeff_source": "q_action",
+                "detach_coeff": False},
+    })).dyn_detach_coeff is False
+    with pytest.raises(ValueError, match="coeff_source"):
+        build_model(_stub_cfg(losses={
+            "dyn": {"enabled": True, "coeff_source": "language"},
+        }))
+    for bad in (0, 1, None, "false", []):
+        with pytest.raises(ValueError, match="detach_coeff must be a boolean"):
+            build_model(_stub_cfg(losses={
+                "dyn": {"enabled": True, "coeff_source": "q_action",
+                        "detach_coeff": bad},
+            }))
+
+
+def test_explicit_q_delta_source_is_bitwise_and_metric_backward_compatible():
+    implicit_cfg = _stub_cfg()
+    explicit_cfg = _stub_cfg(losses={
+        "dyn": {"enabled": True, "negatives": "within_trajectory",
+                "coeff_source": "q_delta"},
+    })
+    torch.manual_seed(31)
+    implicit = build_model(implicit_cfg)
+    explicit = build_model(explicit_cfg)
+    explicit.load_state_dict(implicit.state_dict())
+    window = S.make_window(b=4)
+
+    torch.manual_seed(97)
+    implicit_loss, implicit_metrics = implicit.compute_losses(window, 11, 0, 5)
+    torch.manual_seed(97)
+    explicit_loss, explicit_metrics = explicit.compute_losses(window, 11, 0, 5)
+
+    assert torch.equal(explicit_loss, implicit_loss)
+    assert explicit_metrics == implicit_metrics
+
+
+def test_action_labelled_dyn_routes_one_q_action_forward_into_loss_and_guards(
+        monkeypatch):
+    from loom.train import loop as loop_mod
+
+    class RecordingQAction(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.tensor(1.0))
+            self.actions = []
+            self.coeffs = []
+
+        def forward(self, a_seg, z, return_logits=False):
+            self.actions.append(a_seg.detach().clone())
+            idx = len(self.actions) - 1
+            coeff = torch.zeros(z.shape[0], C.M, device=z.device, dtype=z.dtype)
+            coeff[:, idx:C.TOPK + idx] = 1.0 / C.TOPK
+            coeff = coeff * self.scale
+            self.coeffs.append(coeff.detach().clone())
+            logits = coeff * 10.0
+            return (coeff, logits) if return_logits else coeff
+
+    seen = {}
+
+    def fake_dyn(bank, z0, c_seq, z_targets, **kwargs):
+        seen["loss"] = c_seq.detach().clone()
+        seen["loss_requires_grad"] = c_seq.requires_grad
+        zero = next(bank.parameters()).sum() * 0.0
+        return {
+            "loss": zero,
+            "dyn": zero.detach(),
+            "neg": zero.detach(),
+            "cos_pos": zero.detach(),
+            "per_h": torch.zeros(C.DEPTH),
+            "z_hat1": z0,
+        }
+
+    cfg = _stub_cfg(losses={
+        "dyn": {"enabled": True, "coeff_source": "q_action",
+                "negatives": "within_trajectory"},
+        "act": {"enabled": True, "align_to": "q_a"},
+        "proposal": {"enabled": False},
+        "balance": {"enabled": False},
+    })
+    model = build_model(cfg)
+    qa = RecordingQAction()
+    model.q_action.inner["libero_franka"] = qa
+    monkeypatch.setattr(loop_mod, "dyn_loss", fake_dyn)
+
+    def delta_op(zs, zts, coeffs, *args):
+        seen["delta_op"] = torch.stack(coeffs, 1).detach().clone()
+        seen["delta_op_requires_grad"] = any(c.requires_grad for c in coeffs)
+        return 0.1
+
+    def delta_sel(zs, zts, coeffs):
+        seen["delta_sel"] = torch.stack(coeffs, 1).detach().clone()
+        seen["delta_sel_requires_grad"] = any(c.requires_grad for c in coeffs)
+        return {"delta_sel": 0.1, **{
+            f"delta_sel/h{h + 1}": 0.1 for h in range(C.DEPTH)
+        }}
+
+    model._delta_op = delta_op
+    model._delta_sel = delta_sel
+    window = WindowSampler(cfg, rank=0, world=1, seed=0).next(0)
+    _, metrics = model.compute_losses(window, 0, 0, 0)
+
+    assert len(qa.actions) == C.DEPTH, "q_a must be evaluated once, not once per loss"
+    for h in range(C.DEPTH):
+        torch.testing.assert_close(qa.actions[h], window["actions"][:, h])
+    expected = torch.stack(qa.coeffs, 1)
+    torch.testing.assert_close(seen["loss"], expected)
+    torch.testing.assert_close(seen["delta_op"], expected)
+    torch.testing.assert_close(seen["delta_sel"], expected)
+    assert seen["loss_requires_grad"] is False
+    assert seen["delta_op_requires_grad"] is False
+    assert seen["delta_sel_requires_grad"] is False
+    assert "dyn/uses_q_action" not in metrics
+    assert not any(key.startswith("dyn/pos_h") for key in metrics)
+
+
+def test_action_dyn_requires_labelled_segments_instead_of_masking_mismatch():
+    cfg = _stub_cfg(losses={
+        "dyn": {"enabled": True, "coeff_source": "q_action"},
+        "act": {"enabled": False},
+        "balance": {"enabled": False},
+    })
+    model = build_model(cfg)
+    window = WindowSampler(cfg, rank=0, world=1, seed=0).next(0)
+    window["actions"] = None
+
+    with pytest.raises(ValueError, match="requires labelled action segments"):
+        model.compute_losses(window, 0, 0, 0)
+
+
+def test_action_anchored_bank_recipe_has_no_frozen_coordinate_gradients():
+    class ForbiddenQDelta(nn.Module):
+        def forward(self, *args, **kwargs):
+            raise AssertionError("q_delta must not enter action-anchored bank fit")
+
+    cfg = read_config(CONFIGS / "r0a_bank_ca.yaml")
+    cfg["model"]["use_stubs"] = True
+    model = build_model(cfg)
+    model.q_delta = ForbiddenQDelta()
+    trainable = set(cfg["train_modules"])
+    for name in MODULE_NAMES:
+        sub = getattr(model, name, None)
+        if sub is not None:
+            sub.requires_grad_(name in trainable)
+
+    window = S.make_window(b=4)
+    loss, _ = model.compute_losses(window, 49666, 0, 0)
+    loss.backward()
+
+    assert any(p.grad is not None and p.grad.abs().sum() > 0
+               for p in model.bank.parameters())
+    for name in ("estimator", "q_delta", "q_action", "decoder", "proposal"):
+        assert all(p.grad is None for p in getattr(model, name).parameters()), name
+    assert all(p.grad is None for p in model.ema.parameters())
+
+
+def test_joint_action_dyn_calls_q_action_once_and_only_trains_declared_modules():
+    cfg = read_config(CONFIGS / "r0a_bank_ca_qa.yaml")
+    cfg["model"]["use_stubs"] = True
+    model = build_model(cfg)
+    trainable = set(cfg["train_modules"])
+    for name in MODULE_NAMES:
+        sub = getattr(model, name, None)
+        if sub is not None:
+            sub.requires_grad_(name in trainable)
+
+    calls = []
+    body = model.q_action.inner["libero_franka"]
+    handle = body.register_forward_hook(lambda *args: calls.append(1))
+    try:
+        loss, _ = model.compute_losses(S.make_window(b=4), 49666, 0, 0)
+    finally:
+        handle.remove()
+    loss.backward()
+
+    assert len(calls) == C.DEPTH, "one q_action call per labelled segment"
+    for name in ("bank", "q_action"):
+        assert any(p.grad is not None and p.grad.abs().sum() > 0
+                   for p in getattr(model, name).parameters()), name
+    for name in ("estimator", "q_delta", "decoder", "proposal"):
+        assert all(p.grad is None for p in getattr(model, name).parameters()), name
+    assert all(p.grad is None for p in model.ema.parameters())
+
+
+def test_proposal_conditioned_act_uses_deployed_sparse_c_and_backpropagates():
+    from loom.heads.proposal import argmax_coeff
+
+    class TinyProposal(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bias = nn.Parameter(torch.linspace(-1.0, 1.0, C.M))
+
+        def logits(self, z, lang):
+            signal = z.mean((1, 2)).unsqueeze(-1)
+            slope = torch.linspace(-0.02, 0.02, C.M, device=z.device,
+                                   dtype=z.dtype).unsqueeze(0)
+            return self.bias.to(z).unsqueeze(0) + signal * slope
+
+    class RecordingDecoder(nn.Module):
+        def __init__(self, dof):
+            super().__init__()
+            self.scale = nn.Parameter(torch.tensor(0.1))
+            self.dof = dof
+            self.seen = []
+
+        def loss(self, proprio, c, a_seg):
+            self.seen.append(c.detach().clone())
+            pred = self.scale * c[:, :self.dof].unsqueeze(1).expand_as(a_seg)
+            return (pred - a_seg).pow(2).mean()
+
+    cfg = _stub_cfg(losses={
+        "dyn": {"enabled": False},
+        "act": {"enabled": True, "weight": 1.0, "align_to": "q_a",
+                "decode_from": "proposal"},
+        "proposal": {"enabled": True, "weight": 1.0, "mode": "sparse_ce",
+                     "temperature": 1.0, "detach_belief": True},
+        "balance": {"enabled": False},
+    })
+    model = build_model(cfg)
+    model.proposal = TinyProposal()
+    rec = RecordingDecoder(C.EMBODIMENTS["libero_franka"].dof)
+    model.decoder.inner["libero_franka"] = rec
+    for name in MODULE_NAMES:
+        sub = getattr(model, name, None)
+        if sub is not None:
+            sub.requires_grad_(name in ("decoder", "proposal"))
+    # The real deploy run first enters compute_losses on a grad-probe step.
+    # Frozen q_delta logits must not be handed to Tensor.retain_grad().
+    model._probe_grad = True
+    window = WindowSampler(cfg, rank=0, world=1, seed=0).next(0)
+
+    zs = model.beliefs(window)
+    expected = [argmax_coeff(model.proposal.logits(zs[h], window["lang"]),
+                             C.TOPK, C.M, straight_through=True)
+                for h in range(C.DEPTH)]
+    loss, metrics = model.compute_losses(window, 0, 0, 0)
+
+    assert len(rec.seen) == C.DEPTH
+    for got, want in zip(rec.seen, expected):
+        torch.testing.assert_close(got, want.detach())
+    assert 0.0 <= metrics["act/deploy_topk_overlap"] <= 1.0
+    assert metrics["act/deploy_c_l2"] >= 0.0
+    loss.backward()
+    assert model.proposal.bias.grad is not None
+    assert model.proposal.bias.grad.abs().sum() > 0
+    assert rec.scale.grad is not None
+    for name in ("estimator", "bank", "q_delta", "q_action"):
+        assert all(p.grad is None for p in getattr(model, name).parameters()), name
+
+    # Iteration 2 freezes the now-deployed decoder. Its differentiable input path
+    # must still teach the proposal, without accumulating a decoder gradient.
+    model.zero_grad(set_to_none=True)
+    rec.scale.requires_grad_(False)
+    frozen_loss, _ = model.compute_losses(window, 1, 0, 0)
+    frozen_loss.backward()
+    assert model.proposal.bias.grad is not None
+    assert model.proposal.bias.grad.abs().sum() > 0
+    assert rec.scale.grad is None
+
+
+def test_r0a_deploy_recipe_updates_only_deployed_policy_modules():
+    cfg = read_config(CONFIGS / "r0a_deploy.yaml")
+    assert cfg["losses"]["act"]["decode_from"] == "proposal"
+    assert cfg["losses"]["proposal"]["mode"] == "sparse_ce"
+    assert cfg["train_modules"] == ["decoder", "proposal"]
+    assert cfg["optim"]["lr_scales"]["decoder"] == pytest.approx(0.3)
+    assert cfg["optim"]["lr_scales"]["proposal"] == pytest.approx(0.05)
+    for name in ("estimator", "bank", "q_delta", "q_action", "ema"):
+        assert cfg["optim"]["lr_scales"][name] == 0.0
+
+
+def test_ema_update_switch_defaults_on_and_can_hold_coordinates_exactly():
+    class SpyTarget(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def update(self, estimator):
+            self.calls += 1
+
+    default = build_model(_stub_cfg())
+    assert default.update_ema is True
+
+    held = build_model(_stub_cfg(optim={"update_ema": False}))
+    spy = SpyTarget()
+    held.ema = spy
+    held.update_target()
+    assert spy.calls == 0
+    held.update_ema = True
+    held.update_target()
+    assert spy.calls == 1
+
+    with pytest.raises(ValueError, match="optim.update_ema"):
+        build_model(_stub_cfg(optim={"update_ema": "false"}))
+
+
+def test_r0a_burnin_recipe_is_proposal_only_and_has_complete_gates():
+    cfg = read_config(CONFIGS / "r0a_burnin.yaml")
+    assert cfg["run"]["steps"] == 80000
+    assert cfg["data"]["sampling"] == "uniform_window"
+    assert cfg["data"]["recurrent_burn_in"] == 4
+    assert cfg["train_modules"] == ["proposal"]
+    assert cfg["optim"]["update_ema"] is False
+    assert cfg["optim"]["lr_scales"]["proposal"] == pytest.approx(0.05)
+    for name in ("estimator", "bank", "q_delta", "q_action", "decoder", "ema"):
+        assert cfg["optim"]["lr_scales"][name] == 0.0
+    assert cfg["losses"]["dyn"]["enabled"] is False
+    assert cfg["losses"]["balance"]["enabled"] is False
+    assert cfg["losses"]["act"]["decode_from"] == "proposal"
+    assert cfg["losses"]["proposal"]["mode"] == "sparse_ce"
+    assert cfg["losses"]["proposal"]["detach_belief"] is True
+    assert cfg["convergence"] == {
+        "start_step": 49666,
+        "block": 2000,
+        "blocks": 4,
+        "tol": 0.02,
+        "primary": ["act/decode", "loss/proposal"],
+        "watch": ["act/deploy_c_l2", "act/deploy_topk_overlap",
+                  "proposal/topk_overlap", "grad_norm"],
+        "floor_checks": ["loss/proposal"],
+    }
+    assert cfg["efficacy_gate"] == {
+        "metric": "act/decode",
+        "reference": "first_post_start_block",
+        "comparison": "final_convergence_block",
+        "min_relative_improvement": 0.05,
+        "required": True,
+    }
+
+
+def test_r0a_bank_ca_recipe_changes_only_action_labelled_dynamics():
+    cfg = read_config(CONFIGS / "r0a_bank_ca.yaml")
+    assert cfg["run"]["steps"] == 80000
+    assert cfg["data"]["sampling"] == "uniform_window"
+    assert cfg["data"]["recurrent_burn_in"] == 4
+    assert cfg["train_modules"] == ["bank"]
+    assert cfg["optim"]["update_ema"] is False
+    assert cfg["optim"]["reset_state_modules"] == ["bank"]
+    assert cfg["optim"]["lr_scales"]["bank"] == pytest.approx(BANK_LR_MULT)
+    for name in ("estimator", "q_delta", "q_action", "decoder", "proposal",
+                 "potential", "ema"):
+        assert cfg["optim"]["lr_scales"][name] == 0.0
+    assert cfg["losses"]["dyn"]["enabled"] is True
+    assert cfg["losses"]["dyn"]["coeff_source"] == "q_action"
+    assert cfg["losses"]["dyn"]["negatives"] == "within_trajectory"
+    for name in ("act", "proposal", "balance", "potential", "grpo"):
+        assert cfg["losses"][name]["enabled"] is False
+    assert cfg["convergence"] == {
+        "start_step": 49666,
+        "block": 2000,
+        "blocks": 4,
+        "tol": 0.02,
+        "primary": ["loss/dyn"],
+        "watch": ["dyn/pos", "dyn/neg", "delta_op", "delta_sel/h1",
+                  "delta_sel/h2", "delta_sel/h3", "delta_sel/h4", "grad_norm"],
+        "floor_checks": ["delta_sel"],
+    }
+    assert cfg["offline_gate"] == {
+        "script": "scripts/bank_ca_gate.py",
+        "confidence": 0.95,
+        "bootstrap_samples": 2000,
+        "seed": 0,
+        "windows": 256,
+        "candidates": 32,
+        "requirements": {
+            "delta_sel_ci_low_per_horizon": 0.0,
+            "identity_minus_rollout_ci_low_per_horizon": 0.0,
+            "proposal_candidate_leaf_spread_ci_low": 0.0,
+        },
+        "direct_e2e": False,
+        "required": True,
+    }
+
+
+def test_r0a_bank_ca_n4_changes_only_the_existing_hinge_weight():
+    base = read_config(CONFIGS / "r0a_bank_ca.yaml")
+    n4 = read_config(CONFIGS / "r0a_bank_ca_n4.yaml")
+
+    assert n4["run"]["name"] == "r0a_bank_ca_n4"
+    assert n4["losses"]["dyn"]["neg_weight"] == pytest.approx(4.0)
+
+    # Ignore the two declared experiment-identity fields; the resolved recipes
+    # must otherwise remain identical.
+    n4["run"]["name"] = base["run"]["name"]
+    n4["losses"]["dyn"]["neg_weight"] = base["losses"]["dyn"]["neg_weight"]
+    assert n4 == base
+
+
+def test_r0a_bank_ca_qa_changes_only_the_declared_joint_gradient_route():
+    n4 = read_config(CONFIGS / "r0a_bank_ca_n4.yaml")
+    joint = read_config(CONFIGS / "r0a_bank_ca_qa.yaml")
+
+    assert joint["run"]["name"] == "r0a_bank_ca_qa"
+    assert joint["run"]["seed"] == 0
+    assert joint["train_modules"] == ["bank", "q_action"]
+    assert joint["optim"]["reset_state_modules"] == ["bank", "q_action"]
+    assert joint["optim"]["lr_scales"]["bank"] == pytest.approx(BANK_LR_MULT)
+    assert joint["optim"]["lr_scales"]["q_action"] == pytest.approx(1.0)
+    assert joint["losses"]["dyn"]["detach_coeff"] is False
+    assert joint["losses"]["dyn"]["neg_weight"] == pytest.approx(4.0)
+    assert joint["losses"]["act"] == {
+        "enabled": True,
+        "weight": 1.0,
+        "align_to": "q_a",
+        "decode_from": "q_action",
+    }
+    assert joint["convergence"]["primary"] == ["loss/dyn", "act/decode"]
+    assert joint["efficacy_gate"] == {
+        "metric": "act/decode",
+        "reference": "first_post_start_block",
+        "comparison": "final_convergence_block",
+        "max_relative_worsening": 0.0,
+        "required": True,
+    }
+    assert joint["offline_gate"]["preservation"] == {
+        "reference_checkpoint_sha256":
+            "15f286c268caa5327d5aa3abf1f67ebd0555c426a509fef22cb7f537bf6ab4e1",
+        "reference_config_hash": "a199324a6205bb6d",
+        "reference_global_step": 49666,
+        "action_decode_improvement_ci_low": 0.0,
+        "proposal_support_overlap_change_ci_low": -0.05,
+        "q_action_residual_max": 0.5,
+        "max_root_exhaustion_rate": 0.01,
+    }
+    assert joint["liveness_gate"] == {
+        "start_exclusive": 50666,
+        "end_inclusive": 52666,
+        "rows": 2000,
+        "requirements": {
+            "delta_op_median_strict_gt": 0.01,
+            "gnorm_bank_median_strict_gt": 1.0e-4,
+            "gnorm_q_action_median_strict_gt": 1.0e-4,
+            "skipped_rate_strict_lt": 0.01,
+            "unexpected_module_gradients": False,
+            "nonfinite": False,
+        },
+        "required": True,
+    }
+
+    joint["run"]["name"] = n4["run"]["name"]
+    joint["train_modules"] = n4["train_modules"]
+    joint["optim"]["reset_state_modules"] = n4["optim"]["reset_state_modules"]
+    joint["optim"]["lr_scales"]["q_action"] = n4["optim"]["lr_scales"]["q_action"]
+    del joint["losses"]["dyn"]["detach_coeff"]
+    joint["losses"]["act"] = n4["losses"]["act"]
+    joint["convergence"] = n4["convergence"]
+    del joint["efficacy_gate"]
+    del joint["liveness_gate"]
+    del joint["offline_gate"]["preservation"]
+    assert joint == n4
+
+
+def test_r0a_bank_ca_qa_omega0_changes_only_the_declared_transition_reset():
+    joint = read_config(CONFIGS / "r0a_bank_ca_qa.yaml")
+    omega0 = read_config(CONFIGS / "r0a_bank_ca_qa_omega0.yaml")
+
+    assert omega0["run"]["name"] == "r0a_bank_ca_qa_omega0"
+    assert omega0["optim"]["transition_parameter_reset"] == {
+        "source_config_hash": "a199324a6205bb6d",
+        "tensors": {"bank.omega": "zero"},
+    }
+    assert config_hash(omega0) == "7a5e8a24327ecc0c"
+
+    omega0["run"]["name"] = joint["run"]["name"]
+    del omega0["optim"]["transition_parameter_reset"]
+    assert omega0 == joint
+
+
+def test_fresh_r0_phase_a_only_delays_dynamics_and_bank():
+    base = read_config(CONFIGS / "r0a.yaml")
+    phase = read_config(CONFIGS / "r0a_fresh_phase_a.yaml")
+
+    assert phase["run"]["name"] == "r0a_fresh_staged"
+    assert phase["run"]["steps"] == base["run"]["steps"] == 32000
+    assert phase["losses"]["dyn"]["enabled"] is False
+    assert phase["losses"]["dyn"]["weight"] == 0.0
+    assert phase["train_modules"] == [
+        "estimator", "q_delta", "q_action", "decoder", "proposal",
+    ]
+    assert "bank" not in phase["train_modules"]
+    gate = phase["phase_gate"]
+    assert (gate["start_exclusive"], gate["end_inclusive"], gate["rows"]) == (
+        1000, 2000, 1000,
+    )
+    assert gate["requirements"]["live_ops_q_a_median_gte"] == 16
+    assert gate["requirements"]["live_ops_q_delta_median_gte"] == 16
+    assert gate["requirements"]["bank_gradients"] is False
+    assert gate["required"] is True
+
+
+def test_fresh_r0_phase_b_is_exact_full_r0_with_locked_gates():
+    base = read_config(CONFIGS / "r0a.yaml")
+    phase = read_config(CONFIGS / "r0a_fresh_phase_b.yaml")
+
+    assert phase["run"]["name"] == "r0a_fresh_staged"
+    assert phase["run"]["steps"] == base["run"]["steps"] == 32000
+    assert phase["optim"]["reset_state_modules"] == []
+    assert phase["losses"] == base["losses"]
+    assert phase["train_modules"] == base["train_modules"]
+    gate = phase["liveness_gate"]
+    assert (gate["start_exclusive"], gate["end_inclusive"], gate["rows"]) == (
+        2000, 4000, 2000,
+    )
+    assert gate["requirements"]["delta_op_median_strict_gt"] == pytest.approx(0.01)
+    assert gate["requirements"]["delta_sel_horizon_medians_strict_gt"] == 0.0
+    assert gate["requirements"]["live_ops_q_delta_median_gte"] == 16
+    assert phase["convergence"]["start_step"] == 24000
+    assert phase["convergence"]["primary"] == [
+        "loss/dyn", "act/decode", "act/align", "loss/proposal",
+    ]
+    assert phase["terminal_gate"]["window_end_inclusive"] == 32000
+    assert phase["evaluation_gate"]["success_rate_gte"] == pytest.approx(0.41)
+
+
+def test_dense_proposal_hybrid_adds_detached_hard_pl_nll():
+    from loom.heads.proposal import Proposal
+    from loom.heads.q_delta import topk_simplex_st
+
+    class DenseTransitionHead(nn.Module):
+        def forward(self, z_t, z_next, return_logits=False):
+            base = torch.linspace(-1.0, 1.0, C.M, device=z_t.device,
+                                  dtype=z_t.dtype).unsqueeze(0)
+            slope = torch.linspace(-0.05, 0.05, C.M, device=z_t.device,
+                                   dtype=z_t.dtype).unsqueeze(0)
+            signal = z_t.mean((1, 2)).unsqueeze(-1)
+            logits = base + signal * slope
+            coeff = topk_simplex_st(logits)
+            return (coeff, logits) if return_logits else coeff
+
+    hard_weight = 0.25
+    cfg = _stub_cfg(losses={
+        "dyn": {"enabled": False},
+        "act": {"enabled": False},
+        "balance": {"enabled": False},
+        "proposal": {"enabled": True, "weight": 1.0, "mode": "dense_kl",
+                     "temperature": 1.0, "detach_belief": True,
+                     "hard_weight": hard_weight},
+    })
+    torch.manual_seed(7)
+    model = build_model(cfg)
+    model.q_delta = DenseTransitionHead()
+    model.proposal = Proposal(width=16, n_blocks=1, n_heads=4, mlp_ratio=2.0)
+
+    hard_calls = []
+    real_log_prob = model.proposal.log_prob
+
+    def log_prob_spy(z, lang, c):
+        hard_calls.append((z.requires_grad, c.requires_grad))
+        return real_log_prob(z, lang, c)
+
+    model.proposal.log_prob = log_prob_spy
+    window = WindowSampler(cfg, rank=0, world=1, seed=0).next(0)
+    loss, metrics = model.compute_losses(window, 0, 0, 0)
+
+    assert len(hard_calls) == C.DEPTH
+    assert hard_calls == [(False, False)] * C.DEPTH
+    assert metrics["proposal/hard_nll"] > 0.0
+    assert metrics["proposal/dense_kl"] >= 0.0
+    assert metrics["loss/proposal"] == pytest.approx(
+        metrics["proposal/dense_kl"]
+        + hard_weight * metrics["proposal/hard_nll"], rel=1e-6,
+    )
+
+    loss.backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0
+               for p in model.proposal.parameters())
+    assert all(p.grad is None for p in model.estimator.parameters()), (
+        "detach_belief must apply to both dense KL and the hard PL component"
+    )
+
+
+def test_sparse_ce_loop_uses_q_a_topk_weights_without_dense_teacher_logits():
+    class SparseProposal(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bias = nn.Parameter(torch.linspace(-0.5, 0.5, C.M))
+
+        def logits(self, z, lang):
+            slope = torch.linspace(-0.01, 0.01, C.M, device=z.device,
+                                   dtype=z.dtype).unsqueeze(0)
+            return self.bias.to(z).unsqueeze(0) + z.mean((1, 2)).unsqueeze(-1) * slope
+
+    cfg = _stub_cfg(losses={
+        "dyn": {"enabled": False},
+        # q_a's frozen stub returns sparse coefficients only, deliberately no
+        # return_logits support. sparse_ce must not require the rejected dense tail.
+        "act": {"enabled": True, "weight": 0.0},
+        "balance": {"enabled": False},
+        "proposal": {"enabled": True, "weight": 1.0, "mode": "sparse_ce",
+                     "temperature": 1.0, "detach_belief": True},
+    })
+    model = build_model(cfg)
+    model.proposal = SparseProposal()
+    window = WindowSampler(cfg, rank=0, world=1, seed=0).next(0)
+    loss, metrics = model.compute_losses(window, 0, 0, 0)
+
+    assert torch.isfinite(loss)
+    assert metrics["proposal/sparse_ce"] > 0.0
+    assert metrics["loss/proposal"] == pytest.approx(metrics["proposal/sparse_ce"])
+    assert 0.0 <= metrics["proposal/topk_overlap"] <= 1.0
+    loss.backward()
+    assert model.proposal.bias.grad is not None
 
 
 def test_decoder_is_given_proprio_and_never_the_belief():
@@ -1371,6 +2360,29 @@ def test_param_groups_cover_every_parameter_exactly_once():
     assert len(seen) == len(set(seen)), "a parameter is in two LR groups"
     assert set(seen) == {id(p) for p in model.parameters()}
     assert all(g["weight_decay"] == 0.0 for g in groups if "nodecay" in g["name"])
+
+
+def test_resume_keeps_moments_but_uses_current_optimizer_group_recipe():
+    """A tuning continuation must not silently inherit the old head LR scale."""
+    from loom.train.loop import _optimizer_group_config, _reapply_optimizer_group_config
+
+    model = tiny_model()
+    old = build_optimizer(model, lr=3e-4, lr_scales={"q_delta": 1.0},
+                          module_names=MODULE_NAMES)
+    sum((p.sum() for p in model.parameters()), torch.zeros(())).backward()
+    old.step()  # populate Adam moments
+    saved = old.state_dict()
+
+    current = build_optimizer(model, lr=1e-4, lr_scales={"q_delta": 0.3},
+                              module_names=MODULE_NAMES)
+    wanted = _optimizer_group_config(current)
+    current.load_state_dict(saved)
+    _reapply_optimizer_group_config(current, wanted)
+
+    tuned = [g for g in current.param_groups if g.get("module") == "q_delta"]
+    assert tuned and all(g["lr_scale"] == 0.3 for g in tuned)
+    assert all(g["lr"] == 1e-4 for g in current.param_groups)
+    assert current.state, "Adam moments were discarded while restoring config fields"
 
 
 def test_spectral_parameters_are_not_weight_decayed():

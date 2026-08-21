@@ -1,0 +1,238 @@
+# Positive-advantage (PA) conditional-imitation direction-audit scaffold.
+#
+# THIS FILE IS INTENTIONALLY NOT LAUNCHABLE. It is a prospective, diagnostic-
+# only recipe receipt created only after the authenticated direct-GRPO audit
+# aborted. It inherits the already authenticated seed/data/sampler/optimizer
+# geometry, but replaces the TRAIN objective declaration completely. Null
+# pilot/formal fields are unresolved gates, never runtime defaults.
+
+extends: r0a_outcome_grpo_v2_pilot.yaml
+
+run:
+  name: r0a_outcome_positive_advantage_audit_NONLAUNCHABLE
+  steps: null
+  deterministic: true
+  log_every: null
+  ckpt_every: null
+  keep_last: 0
+  wandb_mode: disabled
+
+losses:
+  grpo:
+    enabled: false
+    weight: 0.0
+  proposal:
+    enabled: false
+    weight: 0.0
+    coefficient_status: FIXED_DISABLED
+    zero_weight_semantics: sparse_ce_graph_absent
+  balance:
+    enabled: false
+    weight: 0.0
+  positive_advantage:
+    enabled: true
+    weight: 1.0
+    kind: clipped_positive_advantage_conditional_imitation
+    rewards: all_8_terminal_rewards
+    standardisation: subtract_mean_divide_population_rms
+    positive_weight: max_standardised_advantage_0
+    scored_arms: [1, 2, 3, 4, 5, 6, 7]
+    arm0: baseline_and_scale_only_never_scored_or_weighted
+    aggregation: equal_context_within_arm_then_equal_7_arms
+    zero_weight_arms: retained_as_explicit_terms
+    ratio_clip: [0.8, 1.2]
+    minimized_atom: -min(rho*w,clamp(rho,0.8,1.2)*w)
+  recovery_reference:
+    enabled: true
+    weight: 1.0
+    coefficient_status: FIXED_FOR_DIRECTION_AUDIT
+    kind: sampled_pl_forward_kl_control_variate
+    atom: expm1(current_minus_old_logprob)-current_minus_old_logprob
+    arms: [1, 2, 3, 4, 5, 6, 7]
+    arm0: forbidden
+    aggregation: equal_replan_within_arm_then_equal_arm
+    controller_weight: null
+  demo_reference:
+    enabled: true
+    weight: 1.0
+    coefficient_status: FIXED_FOR_DIRECTION_AUDIT
+    kind: exact_analytic_vjp_dense_categorical_forward_kl
+    orientation: KL_softmax_seed_parallel_softmax_current
+    current_vjp: p_current_minus_p_seed
+    states: exact_authenticated_train_demo_anchor_states_all_horizons
+    horizon_aggregation: equal_mean
+    live_seed_forward: identical_inputs_and_autocast_then_logits_fp32
+    seed_requires_grad: false
+    seed_in_optimizer: false
+    seed_in_checkpoint: false
+
+# An empty module list plus null run horizon makes this receipt unusable by the
+# ordinary training loop. The audit constructs only disposable optimizer clones.
+train_modules: []
+
+# The inherited v2 namespace is retained only because it is the authenticated
+# seed/data/sampler/optimizer receipt consumed by the diagnostic. Explicitly
+# revoke every inherited training-horizon/checkpoint permission so this merged
+# config cannot be mistaken for the retired 800-update v2 pilot scaffold.
+outcome_grpo_v2:
+  method_status: RETIRED_TRAIN_RECIPE_AUTHENTICATED_INPUTS_ONLY
+  stop_step: null
+  snapshot_steps: []
+  sampler:
+    total_updates: null
+  train_trust_panel:
+    every: null
+  validation_lineage:
+    current_development_collection:
+      exposures:
+        - v1_terminal_selection
+        - early_curve_diagnostic
+        - component_gradient_projection
+        - round_robin_direction_audit
+        - positive_advantage_direction_audit
+  artifact_policy:
+    role: inherited_authenticated_inputs_only
+    candidate_emission: forbidden
+    promotion: forbidden
+    official_evaluation: forbidden
+    pilot_checkpoint_only: false
+
+outcome_positive_advantage_audit:
+  format_version: 2
+  audit_kind: loom_outcome_positive_advantage_round_robin_direction_audit
+  method_status: DIAGNOSTIC_ONLY_NONLAUNCHABLE
+  objective_name: positive_advantage_conditional_imitation
+  training_loop_present: false
+  launcher_role: no_update_direction_audit_only
+  seed_checkpoint: runs/r0a_deploy_s1_eval/ckpt_000049666.pt
+  seed_global_step: 49666
+  world_size: 8
+  round_robin_offsets: [0, 1, 2]
+  train_draws: 24
+  contexts_per_arm: 2
+  instrumentation_history:
+    - job_id: 32580600
+      format_version: 1
+      terminal_state: FAILED
+      exit_code: "2:0"
+      classification: INVALID_NO_SCIENTIFIC_EVIDENCE
+      cause: canonical_PA_disabled_sparse_target_was_passed_to_demo_anchor_constructor
+      report_emitted: false
+      panel_statistics_reached: false
+  inherited_authenticated_recipe:
+    path: configs/r0a_outcome_grpo_v2_pilot.yaml
+    raw_sha256: 249a221d84032f8c3801a7430e48597a364fa16b02b378e9a17d30c8a56cdf44
+    resolved_hash: 67277938c51075d2
+    v2_source_closure_sha256: fae8a7117e76934f3f58efe226359dff6a666812888c7348243ee09f638f4c50
+    semantic_scope:
+      - authenticated_seed
+      - exact_scoring
+      - optimizer_and_schedule
+      - train_and_exposed_development_data_lineage
+      - round_robin_sampler
+      - eight_a100_geometry
+    excluded_semantic_scope:
+      - train_objective
+      - coefficient_selection
+      - launch_readiness
+  source_provenance:
+    positive_advantage_core_file_sha256: c70dfa6239ff8ef1eda9cf16b167c7bf5d3b7de00c918b8fa3c0b69faa69a358
+    positive_advantage_core_closure_sha256: caf8d616e93d21522c6ebbaf448b86775ff4f76c83e9a421190f64c9b8121366
+    immutable_direct_v2_helper_file_sha256: 0e9a163f288ec57183493294e829a2d02960fa3af0db0d77aed629e93bc19977
+    immutable_direct_v2_diagnostic_closure_sha256: 5fc13990ff04793d4eccfeeca01daf0a72bae60b98bb4e34a5f5a718950df9b7
+    own_diagnostic_closure:
+      scheme: sha256(path-nul-sha256-nul)-v1
+      files:
+        - configs/r0a_outcome_positive_advantage_audit.yaml
+        - scripts/outcome_positive_advantage_direction_audit.py
+        - scripts/outcome_positive_advantage_direction_audit.sbatch
+      binding: computed_at_authenticated_start_rechecked_after_use_and_frozen_before_submission
+  trigger:
+    required: true
+    report_path: runs/diagnostics/outcome_round_robin_direction_audit/outcome_round_robin_direction_audit_v2_s49666_32577492.json
+    report_sha256: 1f3c4af95ba97a5976e2cdacee8fc50fda6ff88f725886fca25b9304e4ef9e1f
+    required_kind: loom_outcome_grpo_v2_round_robin_direct_direction_audit
+    required_format_version: 2
+    required_status: ABORT_OUTCOME_OBJECTIVE
+    required_execution_validated: true
+    required_decision_passed: false
+  frozen_direction_recipe:
+    positive_advantage_weight: 1.0
+    recovery_reference_weight: 1.0
+    demo_reference_weight: 1.0
+    grpo_train_weight: 0.0
+    switch_balance_weight: 0.0
+    sparse_ce_weight: 0.0
+    tuning_or_sweep: forbidden
+    coefficient_switching: forbidden
+    train_scoring_geometry: read_only_authentication_replay_plus_two_objective_graph_exact_B1_passes_per_train_point
+    authentication_replay: exact_selected_context_identity_no_objective_graph
+    first_objective_graph_scorer_pass: authoritative_positive_advantage_same_selected_rows_order_old
+    second_objective_graph_scorer_pass: recovery_k3_only_same_selected_rows_order_old
+    second_pass_scorer_authentication: exact_current_float_equals_stored_old_per_selected_row_or_INVALID
+    second_pass_identity_evidence: exact_zero_recovery_value_and_bitwise_zero_gradient
+    demo_logit_authentication: exact_live_seed_logits_per_horizon_or_INVALID
+    demo_anchor_construction:
+      config_source: authenticated_inherited_v2_resolved_config
+      source_path: configs/r0a_outcome_grpo_v2_pilot.yaml
+      source_raw_sha256: 249a221d84032f8c3801a7430e48597a364fa16b02b378e9a17d30c8a56cdf44
+      source_resolved_hash: 67277938c51075d2
+      canonical_pa_proposal_target: {enabled: false, weight: 0.0}
+      inherited_construction_target:
+        enabled: true
+        weight: null
+        mode: sparse_ce
+        temperature: 1.0
+        detach_belief: true
+      v2_core_internal_target_producer_weight: 1.0
+      scope: construction_only_state_and_target_producer
+      canonical_pa_config_mutated: false
+      sparse_ce_scalar_computed: false
+      sparse_ce_graph_constructed: false
+    reference_identity_classification:
+      missing_disconnected_nonfinite_auth_or_ratio_failure: INVALID_NO_REPORT
+      complete_finite_nonzero_recovery_or_demo_vjp: SCIENTIFIC_ABORT
+      pass_requires_local_and_synchronised_bitwise_zero: true
+    heldout_gradient: signed_grpo_negative_clipped_surrogate_loss
+    primary_endpoints:
+      - pa_only_cumulative_clipped_sgd
+      - pa_full_beta1_lambda1_cumulative_clipped_sgd
+      - pa_full_beta1_lambda1_reset_adamw_with_production_decay
+  data_scope:
+    train_direction: authenticated_train0_through_train5_only
+    heldout_direction: exposed_development_validation_only
+    official_evaluation: forbidden
+  eligibility:
+    diagnostic_only: true
+    exposed_development_only: true
+    full_training_eligible: false
+    candidate_eligible: false
+    official_evaluation_eligible: false
+    promotion_eligible: false
+    maximum_authority_on_pass: separate_64_update_ineligible_pa_pilot_freeze_only
+    live_optimizer_steps: 0
+    live_parameter_perturbations: 0
+    checkpoint_emitted: false
+    candidate_emitted: false
+  unresolved_pilot:
+    launchable_config_path: null
+    source_closure_sha256: null
+    train_only_trust_panel_sha256: null
+    pilot_run_dir: null
+  unresolved_formal:
+    method_freeze_receipt_sha256: null
+    fresh_formal_collection_path: null
+    fresh_formal_collection_sha256: null
+    candidate_gate: null
+
+artifact_policy:
+  role: exposed_development_diagnostic_only
+  checkpoint_emission: forbidden
+  candidate_emission: forbidden
+  promotion: forbidden
+  official_evaluation: forbidden
+
+promotion_gate:
+  required: false
+  eligible: false
+  reason: pa_direction_audit_is_exposed_development_diagnostic_only

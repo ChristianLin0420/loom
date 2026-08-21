@@ -1,0 +1,66 @@
+# Fresh R0 staged rebuild, phase B (updates 2,001..32,000).
+#
+# Resume the phase-A checkpoint, optimizer/EMA/sampler/global step, then enable
+# the unchanged full R0 objective and bank.  No optimizer state is reset: the
+# bank has no phase-A moments, while every action-space module retains its
+# established state.  This is the current r0a.yaml method, not another variant.
+
+extends: r0a.yaml
+
+run:
+  name: r0a_fresh_staged
+  steps: 32000
+  ckpt_every: 500
+
+optim:
+  reset_state_modules: []
+
+train_modules: [estimator, bank, q_delta, q_action, decoder, proposal]
+
+liveness_gate:
+  start_exclusive: 2000
+  end_inclusive: 4000
+  rows: 2000
+  requirements:
+    delta_op_median_strict_gt: 0.01
+    delta_sel_horizon_medians_strict_gt: 0.0
+    live_ops_q_delta_median_gte: 16
+    c_delta_spread_median_strict_gt: 0.10
+    gnorm_bank_median_strict_gt: 1.0e-4
+    gnorm_q_delta_median_strict_gt: 1.0e-4
+    skipped_rate_strict_lt: 0.15
+    unexpected_module_gradients: false
+    nonfinite: false
+  required: true
+
+convergence:
+  start_step: 24000
+  block: 2000
+  blocks: 4
+  tol: 0.02
+  primary: [loss/dyn, act/decode, act/align, loss/proposal]
+  watch: [delta_op, delta_sel/h1, delta_sel/h2, delta_sel/h3,
+          delta_sel/h4, act/c_a_spread, act/c_delta_spread,
+          bank/live_ops_q_a, bank/live_ops_q_delta, grad_norm]
+  floor_checks: [loss/proposal, delta_sel]
+
+terminal_gate:
+  window_start_exclusive: 30000
+  window_end_inclusive: 32000
+  requirements:
+    delta_op_median_strict_gt: 0.01
+    delta_sel_horizon_medians_strict_gt: 0.0
+    act_align_median_strict_lt: 0.50
+    live_ops_q_a_median_gte: 16
+    live_ops_q_delta_median_gte: 16
+    proposal_loss_median_strict_lt: 4.852030263919617
+    skipped_rate_strict_lt: 0.01
+  required: true
+
+evaluation_gate:
+  seed0_conditions: 400
+  success_rate_gte: 0.41
+  paired_new_only_strict_gt_old_only: true
+  max_suite_regression_points: 5.0
+  authoritative_replicates: 3
+  required: true
