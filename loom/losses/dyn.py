@@ -69,6 +69,7 @@ a plain latent policy — flip `negatives` to `"within_trajectory"` (or raise
 from __future__ import annotations
 
 import copy
+import math
 
 import torch
 import torch.nn.functional as F
@@ -78,7 +79,8 @@ from contracts import DYN_WEIGHTS, EMA_TAU, TOPK, Bank
 
 __all__ = [
     "NEGATIVE_MODES", "ln_cosine", "ln_cosine_distance", "sequential_rollout",
-    "sample_within_trajectory_negatives", "random_simplex_like",
+    "sample_within_trajectory_negatives", "sample_within_trajectory_negative_set",
+    "random_simplex_like",
     "ema_update", "EmaEstimator", "dyn_loss", "DynLoss",
 ]
 
@@ -204,6 +206,60 @@ def sample_within_trajectory_negatives(
     return c_seq.detach().gather(1, pick[..., None].expand(b, depth, m))
 
 
+def sample_within_trajectory_negative_set(
+    c_seq: Tensor,
+    n_negatives: int,
+    min_gap: int = 2,
+    generator: torch.Generator | None = None,
+) -> Tensor:
+    """Draw several same-trajectory negatives for every segment.
+
+    Args:
+        c_seq:       coefficients shaped ``(B, H, M)``.
+        n_negatives: number of negatives per segment. Sampling uses replacement
+                     because some valid sets contain only one element (for
+                     example H=4, min_gap=2 at the two middle segments).
+        min_gap:     minimum absolute segment-index distance.
+        generator:   optional CPU or device generator. Equal generator states
+                     produce exactly equal sets.
+
+    Returns detached coefficients shaped ``(B, N, H, M)``.  Candidate ``n`` at
+    horizon ``h`` always comes from the same trajectory and from an index ``j``
+    satisfying ``abs(j - h) >= min_gap``.
+
+    This is intentionally separate from
+    :func:`sample_within_trajectory_negatives`: legacy one-negative calls keep
+    their exact multinomial shape and RNG stream.
+    """
+    if c_seq.ndim != 3:
+        raise ValueError(f"expected (B, DEPTH, M), got {tuple(c_seq.shape)}")
+    if isinstance(n_negatives, bool) or not isinstance(n_negatives, int) \
+            or n_negatives <= 0:
+        raise ValueError(f"n_negatives must be a positive integer, got {n_negatives!r}")
+
+    b, depth, m = c_seq.shape
+    gen_dev = torch.device("cpu") if generator is None else generator.device
+    offs = torch.arange(depth, device=gen_dev)
+    valid = (offs[None, :] - offs[:, None]).abs() >= min_gap
+    if not bool(valid.any(-1).all()):
+        raise ValueError(
+            f"a window of {depth} segments cannot supply a negative {min_gap} segments "
+            f"away for every segment; use contrastive_weight=0 or a longer window"
+        )
+
+    # torch.multinomial samples each (trajectory, horizon) row independently.
+    # Keep N as the last dimension until after the draw, then arrange it as the
+    # public (B,N,H,M) contract expected by the contrastive branch.
+    pick = torch.multinomial(
+        valid.float().expand(b, depth, depth).reshape(b * depth, depth),
+        num_samples=n_negatives,
+        replacement=True,
+        generator=generator,
+    ).view(b, depth, n_negatives).permute(0, 2, 1).to(c_seq.device)  # (B,N,H)
+    source = c_seq.detach()[:, None].expand(b, n_negatives, depth, m)
+    return source.gather(2, pick[..., None].expand(b, n_negatives, depth, m))
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  EMA TARGET MACHINERY   (L_dyn's target lives here, so it lives in this file)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -273,8 +329,16 @@ def dyn_loss(
     weights: tuple[float, ...] = DYN_WEIGHTS,
     cosine: str = "per_slot",
     generator: torch.Generator | None = None,
+    z_contexts: Tensor | None = None,
+    z_target_prev: Tensor | None = None,
+    c_neg_set: Tensor | None = None,
+    state_weight: float = 1.0,
+    effect_weight: float = 0.0,
+    contrastive_weight: float = 0.0,
+    contrastive_temperature: float = 0.1,
+    contrastive_negatives: int = 4,
 ) -> dict[str, Tensor]:
-    """L_dyn plus the `Delta_op` build assert.
+    """State rollout loss plus optional local operator-repair objectives.
 
     Args:
         bank:      anything satisfying `contracts.Bank` (stubs.StubBank in tests).
@@ -288,6 +352,20 @@ def dyn_loss(
         neg_weight/neg_margin: hinge on the gap d_neg - d_pos.
         weights:   per-horizon weights, `contracts.DYN_WEIGHTS`.
         cosine:    "per_slot" (default) or "flat".
+        z_contexts: online beliefs immediately before each operator, shaped
+                    (B,H,K,D). Required by either repair objective.
+        z_target_prev: EMA beliefs immediately before each operator, shaped
+                       (B,H,K,D). The target effect is always detached
+                       ``z_targets - z_target_prev``.
+        c_neg_set: optional explicit detached-code candidates (B,N,H,M) for the
+                   contrastive objective. Otherwise same-trajectory candidates
+                   are sampled deterministically from ``c_seq``.
+        state_weight/effect_weight/contrastive_weight: non-negative objective
+                   multipliers. The defaults execute the legacy state/hinge
+                   path with identical arithmetic and RNG order.
+        contrastive_temperature: softmax temperature over one positive and N
+                   negative local effects.
+        contrastive_negatives: N when ``c_neg_set`` is not supplied.
 
     Returns a dict — Team D logs `delta_op` every step:
         loss       scalar, the training objective
@@ -302,6 +380,12 @@ def dyn_loss(
                    dtype, so an fp32 master-weight bank fed a bf16 coefficient
                    silently promotes the whole affine rollout, and the only
                    symptom is a memory number.
+        state/effect/contrastive: detached, unscaled objective components;
+                   ``state`` aliases ``dyn`` for explicit staged schedules.
+        effect_gap: mean ``d(negative effect) - d(positive effect)`` (positive
+                   is good), detached; zero when contrastive repair is off.
+        contrastive_top1: fraction for which the positive is the closest local
+                   effect among all candidates, detached; zero when off.
     """
     if negatives not in NEGATIVE_MODES:
         raise ValueError(f"negatives must be one of {NEGATIVE_MODES}, got {negatives!r}")
@@ -315,6 +399,63 @@ def dyn_loss(
     horizons = c_seq.shape[1]
     if horizons > len(weights):
         raise ValueError(f"{horizons} horizons but only {len(weights)} weights")
+
+    repair_weights = {
+        "state_weight": state_weight,
+        "effect_weight": effect_weight,
+        "contrastive_weight": contrastive_weight,
+    }
+    for name, value in repair_weights.items():
+        value = float(value)
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"{name} must be finite and >= 0, got {value}")
+    state_weight = float(state_weight)
+    effect_weight = float(effect_weight)
+    contrastive_weight = float(contrastive_weight)
+
+    contrastive_temperature = float(contrastive_temperature)
+    if not math.isfinite(contrastive_temperature) or contrastive_temperature <= 0.0:
+        raise ValueError(
+            "contrastive_temperature must be finite and > 0, got "
+            f"{contrastive_temperature}"
+        )
+    if isinstance(contrastive_negatives, bool) \
+            or not isinstance(contrastive_negatives, int) \
+            or contrastive_negatives <= 0:
+        raise ValueError(
+            "contrastive_negatives must be a positive integer, got "
+            f"{contrastive_negatives!r}"
+        )
+
+    repair_active = effect_weight != 0.0 or contrastive_weight != 0.0
+    if repair_active:
+        if z_contexts is None or z_target_prev is None:
+            raise ValueError(
+                "z_contexts and z_target_prev are required when effect_weight or "
+                "contrastive_weight is non-zero"
+            )
+        if z_contexts.shape != z_targets.shape:
+            raise ValueError(
+                "z_contexts must match z_targets (B,H,K,D), got "
+                f"{tuple(z_contexts.shape)} and {tuple(z_targets.shape)}"
+            )
+        if z_target_prev.shape != z_targets.shape:
+            raise ValueError(
+                "z_target_prev must match z_targets (B,H,K,D), got "
+                f"{tuple(z_target_prev.shape)} and {tuple(z_targets.shape)}"
+            )
+        if c_neg_set is not None:
+            valid_neg_shape = (
+                c_neg_set.ndim == 4
+                and c_neg_set.shape[0] == c_seq.shape[0]
+                and c_neg_set.shape[1] > 0
+                and c_neg_set.shape[2:] == c_seq.shape[1:]
+            )
+            if not valid_neg_shape:
+                raise ValueError(
+                    "c_neg_set must be (B,N,H,M) with N>0 and match c_seq, got "
+                    f"{tuple(c_neg_set.shape)} for c_seq {tuple(c_seq.shape)}"
+                )
 
     tgt = z_targets.detach()                       # sg(.) — never optional
     z_hat = sequential_rollout(bank, z0, c_seq)    # sequential, bias included
@@ -340,10 +481,92 @@ def dyn_loss(
         d_rand = ln_cosine_distance(bank.step(c_rand, z0), tgt[:, 0], cosine)
         delta_op = (d_rand - d_pos[0].detach()).mean()
 
+    # The local residual branch asks what c does at *this* state instead of
+    # letting a long sequential rollout explain the transition through context.
+    # Keep it strictly opt-in so the default call above remains numerically and
+    # stochastically identical to the original L_dyn implementation.
+    zero = torch.zeros((), device=z0.device, dtype=loss_pos.dtype)
+    loss_effect = zero
+    loss_contrastive = zero
+    effect_gap = zero
+    contrastive_top1 = zero
+    if repair_active:
+        assert z_contexts is not None and z_target_prev is not None
+        b, _, m = c_seq.shape
+        k, d = z_contexts.shape[-2:]
+
+        local_next = bank.step(
+            c_seq.reshape(b * horizons, m),
+            z_contexts.reshape(b * horizons, k, d),
+        ).reshape(b, horizons, k, d)
+        predicted_effect = local_next - z_contexts
+        target_effect = tgt - z_target_prev.detach()
+        d_effect = ln_cosine_distance(predicted_effect, target_effect, cosine)
+        loss_effect = sum(
+            float(weights[h]) * d_effect[:, h].mean() for h in range(horizons)
+        )
+
+        if contrastive_weight != 0.0:
+            negative_codes = c_neg_set
+            if negative_codes is None:
+                negative_codes = sample_within_trajectory_negative_set(
+                    c_seq, contrastive_negatives, min_gap, generator
+                )
+            negative_codes = negative_codes.detach().to(c_seq.dtype)
+            n_negatives = negative_codes.shape[1]
+
+            negative_contexts = z_contexts[:, None].expand(
+                b, n_negatives, horizons, k, d
+            )
+            negative_next = bank.step(
+                negative_codes.reshape(b * n_negatives * horizons, m),
+                negative_contexts.reshape(b * n_negatives * horizons, k, d),
+            ).reshape(b, n_negatives, horizons, k, d)
+            negative_effect = negative_next - negative_contexts
+            d_effect_neg = ln_cosine_distance(
+                negative_effect, target_effect[:, None], cosine
+            )
+
+            logits = torch.cat((-d_effect[:, None], -d_effect_neg), dim=1)
+            logits = logits / contrastive_temperature       # (B,1+N,H)
+            labels = torch.zeros(
+                b * horizons, device=logits.device, dtype=torch.long
+            )
+            per_h_contrastive = F.cross_entropy(
+                logits.permute(0, 2, 1).reshape(b * horizons, 1 + n_negatives),
+                labels,
+                reduction="none",
+            ).reshape(b, horizons)
+            loss_contrastive = sum(
+                float(weights[h]) * per_h_contrastive[:, h].mean()
+                for h in range(horizons)
+            )
+            effect_gap = (d_effect_neg.mean(dim=1) - d_effect).mean().detach()
+            contrastive_top1 = (
+                logits.argmax(dim=1).eq(0).float().mean().detach()
+            )
+
+    # Preserve the exact legacy addition at the defaults (including its
+    # floating-point rounding); only staged repair configurations take the more
+    # general weighted branch.
+    if state_weight == 1.0:
+        total = loss_pos + loss_neg
+    else:
+        total = state_weight * loss_pos + loss_neg
+    if effect_weight != 0.0:
+        total = total + effect_weight * loss_effect
+    if contrastive_weight != 0.0:
+        total = total + contrastive_weight * loss_contrastive
+
     return {
-        "loss": loss_pos + loss_neg,
+        "loss": total,
         "dyn": loss_pos.detach(),
+        "state": loss_pos.detach(),
         "neg": loss_neg.detach(),
+        "effect": loss_effect.detach(),
+        "contrastive": loss_contrastive.detach(),
+        "effect_gap": effect_gap,
+        "contrastive_top1": contrastive_top1,
         "delta_op": delta_op,
         "cos_pos": (1.0 - d_pos[0].detach().mean()),
         "per_h": torch.stack([d.detach().mean() for d in d_pos]),
@@ -367,6 +590,11 @@ class DynLoss(nn.Module):
         neg_margin: float = 0.1,
         weights: tuple[float, ...] = DYN_WEIGHTS,
         cosine: str = "per_slot",
+        state_weight: float = 1.0,
+        effect_weight: float = 0.0,
+        contrastive_weight: float = 0.0,
+        contrastive_temperature: float = 0.1,
+        contrastive_negatives: int = 4,
     ) -> None:
         super().__init__()
         if negatives not in NEGATIVE_MODES:
@@ -377,13 +605,27 @@ class DynLoss(nn.Module):
         self.neg_margin = neg_margin
         self.weights = tuple(weights)
         self.cosine = cosine
+        self.state_weight = state_weight
+        self.effect_weight = effect_weight
+        self.contrastive_weight = contrastive_weight
+        self.contrastive_temperature = contrastive_temperature
+        self.contrastive_negatives = contrastive_negatives
 
     def forward(self, bank: Bank, z0: Tensor, c_seq: Tensor, z_targets: Tensor,
                 c_neg: Tensor | None = None,
-                generator: torch.Generator | None = None) -> dict[str, Tensor]:
+                generator: torch.Generator | None = None, *,
+                z_contexts: Tensor | None = None,
+                z_target_prev: Tensor | None = None,
+                c_neg_set: Tensor | None = None) -> dict[str, Tensor]:
         return dyn_loss(
             bank, z0, c_seq, z_targets,
             negatives=self.negatives, c_neg=c_neg, min_gap=self.min_gap,
             neg_weight=self.neg_weight, neg_margin=self.neg_margin,
             weights=self.weights, cosine=self.cosine, generator=generator,
+            z_contexts=z_contexts, z_target_prev=z_target_prev,
+            c_neg_set=c_neg_set, state_weight=self.state_weight,
+            effect_weight=self.effect_weight,
+            contrastive_weight=self.contrastive_weight,
+            contrastive_temperature=self.contrastive_temperature,
+            contrastive_negatives=self.contrastive_negatives,
         )

@@ -1,0 +1,109 @@
+# R0-A operator repair — fresh, fixed-endpoint, unconditional evaluation.
+#
+# This keeps the successful dual q_action/proposal decoder path, but repairs the
+# original LOOM operator representation: q_delta learns the action-semantic
+# vocabulary through dense CE, the bank predicts residual effects and ranks
+# wrong codes contrastively, and sequence training sees real recurrent prefixes.
+# Training always runs to update 32,000. Representation diagnostics are logged;
+# none can block consolidation or the exact 1,200-episode evaluation.
+
+extends: r0a_dual_code.yaml
+
+run:
+  name: r0a_operator_repair_fresh_s0_20260821
+  project: loom-r0-operator-repair
+  seed: 0
+  steps: 32000
+  boundary_policy: fixed_max_updates
+  fresh_start_required: true
+  # On a resumed link, LATEST is the optimizer/model authority. Quarantine an
+  # exact contiguous metrics crash tail before appending, and fsync the ledger
+  # before every checkpoint publication. This never makes a training decision.
+  reconcile_metrics_on_resume: true
+  require_online_wandb: true
+  log_every: 20
+  ckpt_every: 500
+  keep_last: 4
+
+model:
+  use_stubs: false
+
+optim:
+  # A skipped optimizer step must not be counted as one of the fixed 32k
+  # updates. Non-finite/invalid execution still fails normally; there is no
+  # metric threshold that silently turns an update into a no-op.
+  spike_mult: 0
+
+data:
+  data_root: /lustre/fsw/portfolios/edgeai/users/chrislin/datasets/loom/libero
+  sampling: weighted_suite_task
+  suite_weights:
+    libero_spatial: 0.20
+    libero_object: 0.20
+    libero_goal: 0.20
+    libero_10: 0.40
+  suite_block: 20
+  recurrent_burn_in: 0
+  recurrent_prefix_choices: [0, 4, 8, 12]
+
+losses:
+  dyn:
+    enabled: true
+    weight: 1.0
+    start_update: 2001
+    ramp_updates: 500
+    coeff_source: q_action
+    detach_coeff: false
+    state_weight: 1.0
+    effect_weight: 1.0
+    contrastive_weight: 0.25
+    contrastive_temperature: 0.10
+    contrastive_negatives: 4
+    negatives: within_trajectory
+    min_gap: 2
+    neg_weight: 0.0
+    neg_margin: 0.1
+    cosine: per_slot
+    # Preserve h1 emphasis while raising h3/h4 from 13.3%/6.7% to
+    # 18.2%/18.2% of the normalized dynamics objective.
+    weights: [1.0, 0.75, 0.5, 0.5]
+  act:
+    enabled: true
+    weight: 1.0
+    align_to: q_a
+    decode_from: dual_q_action_proposal
+    align_mode: sparse_ce
+    align_temperature: 1.0
+    # Uniform-start CE is ~log(128), so 0.1 keeps its initial scale comparable
+    # to the old ~0.5 sparse-MSE term instead of monopolising global clipping.
+    align_weight: 0.10
+  proposal:
+    enabled: true
+    weight: 1.0
+    mode: sparse_ce
+    temperature: 1.0
+    detach_belief: true
+  balance:
+    enabled: true
+    weight: 0.02
+    mode: per_head
+    head_weights: {q_delta: 0.75, q_action: 0.25}
+
+train_modules: [estimator, bank, q_delta, q_action, decoder, proposal]
+
+method_receipt:
+  kind: loom_r0a_operator_repair_v1
+  fixed_endpoint_update: 32000
+  evaluation_is_unconditional: true
+  evaluation_episodes: 1200
+  evaluation_seeds: [0, 1, 2]
+  checkpoint_selection: fixed_update_only
+  health_thresholds_control_execution: false
+
+slurm:
+  nodes: 2
+  gpus_per_node: 8
+  # Six resumable allocations give the heavier history/effect objective up to
+  # ~23 hours of usable GPU time. Once step 32k is reached, remaining links
+  # authenticate the same lineage and exit without taking another update.
+  n_links: 6

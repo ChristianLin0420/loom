@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import time
 from dataclasses import dataclass, replace
@@ -75,7 +76,7 @@ from .canonical import CanonicalTrajectory, WindowIndex, segment, window_actions
 __all__ = [
     "STARVATION_MARGIN", "DEFAULT_CONSUMPTION_HZ",
     "SAMPLING_MODES", "TRAJECTORY_SPLITS",
-    "HomogeneousSampler", "CachedWindowDataset", "collate_window",
+    "BatchSpec", "HomogeneousSampler", "CachedWindowDataset", "collate_window",
     "LoomLoader", "Throughput", "measure_throughput",
     "shm_free_bytes", "shm_headroom", "fit_workers",
     "build_loader", "build_gate_loader", "resolve_cache_root", "DataConfigError",
@@ -98,7 +99,7 @@ DEFAULT_CONSUMPTION_HZ = float(os.environ.get("LOOM_TRAIN_STEP_HZ", "5.0"))
 #: ``uniform_task`` matches LIBERO's macro task metric: task -> window, both
 #: uniformly. The config spelling is intentionally closed so a typo cannot
 #: silently launch the old recipe.
-SAMPLING_MODES = ("uniform_window", "uniform_task")
+SAMPLING_MODES = ("uniform_window", "uniform_task", "weighted_suite_task")
 
 #: Whole-trajectory selection is separate from window sampling. ``all`` is the
 #: backward-compatible default; ``train`` and ``gate`` are complements defined
@@ -145,6 +146,16 @@ def _apportion(weights: np.ndarray, block: int) -> np.ndarray:
     return base
 
 
+@dataclass(frozen=True)
+class BatchSpec:
+    """One rank's deterministic batch plus rank-shared method metadata."""
+
+    body: str
+    indices: np.ndarray
+    suite: str | None = None
+    burn_in: int = 0
+
+
 class HomogeneousSampler:
     """`(seed, global_step, rank) -> (embodiment, local window indices)`. Pure.
 
@@ -161,6 +172,12 @@ class HomogeneousSampler:
         block: int = 64,
         sampling: str = "uniform_window",
         task_indices: Mapping[str, Mapping[str, Sequence[int]]] | None = None,
+        task_indices_by_burn_in: Mapping[
+            str, Mapping[int, Mapping[str, Sequence[int]]]
+        ] | None = None,
+        suite_weights: Mapping[str, float] | None = None,
+        suite_block: int = 20,
+        recurrent_prefix_choices: Sequence[int] = (0,),
     ) -> None:
         if not sizes:
             raise ValueError("no bodies")
@@ -198,6 +215,31 @@ class HomogeneousSampler:
         self._task_pools: dict[str, tuple[np.ndarray, ...]] = {}
         if self.sampling == "uniform_task":
             self._init_task_pools(task_indices)
+        self.recurrent_prefix_choices = tuple(
+            int(value) for value in recurrent_prefix_choices
+        )
+        if (
+            not self.recurrent_prefix_choices
+            or any(value < 0 for value in self.recurrent_prefix_choices)
+            or len(set(self.recurrent_prefix_choices)) != len(self.recurrent_prefix_choices)
+        ):
+            raise ValueError(
+                "recurrent_prefix_choices must be distinct non-negative integers"
+            )
+        self.suite_block = int(suite_block)
+        self._suite_names: dict[str, tuple[str, ...]] = {}
+        self._suite_counts: dict[str, np.ndarray] = {}
+        self._suite_task_names: dict[tuple[str, str], tuple[str, ...]] = {}
+        self._suite_task_pools: dict[
+            tuple[str, int, str], tuple[np.ndarray, ...]
+        ] = {}
+        self._suite_task_perm_memo: dict[
+            tuple[str, str, str, int], np.ndarray
+        ] = {}
+        if self.sampling == "weighted_suite_task":
+            self._init_suite_task_pools(
+                task_indices_by_burn_in, suite_weights=suite_weights,
+            )
 
     def _init_task_pools(
         self, task_indices: Mapping[str, Mapping[str, Sequence[int]]] | None
@@ -222,6 +264,105 @@ class HomogeneousSampler:
                 )
             self._task_names[body] = names
             self._task_pools[body] = pools
+
+    def _init_suite_task_pools(
+        self,
+        task_indices_by_burn_in: Mapping[
+            str, Mapping[int, Mapping[str, Sequence[int]]]
+        ] | None,
+        *,
+        suite_weights: Mapping[str, float] | None,
+    ) -> None:
+        """Validate suite -> task -> eligible-window pools for every prefix."""
+        if task_indices_by_burn_in is None:
+            raise ValueError(
+                "sampling='weighted_suite_task' requires task_indices_by_burn_in"
+            )
+        if not suite_weights:
+            raise ValueError(
+                "sampling='weighted_suite_task' requires data.suite_weights"
+            )
+        configured_suites = tuple(sorted(str(name) for name in suite_weights))
+        configured_weights = np.asarray(
+            [float(suite_weights[name]) for name in configured_suites],
+            dtype=np.float64,
+        )
+        counts = _apportion(configured_weights, self.suite_block)
+        for body, size in self.sizes.items():
+            by_prefix = task_indices_by_burn_in.get(body)
+            if not by_prefix:
+                raise ValueError(f"{body}: no prefix-aware task pools")
+            baseline = by_prefix.get(0)
+            if not baseline:
+                raise ValueError(f"{body}: prefix-aware pools omit burn_in=0")
+            suites_present = tuple(sorted({str(task).split("/", 1)[0]
+                                           for task in baseline}))
+            if suites_present != configured_suites:
+                raise ValueError(
+                    f"{body}: configured suites {configured_suites} do not match "
+                    f"task suites {suites_present}"
+                )
+            flat0 = np.concatenate([
+                np.asarray(indices, dtype=np.int64).reshape(-1)
+                for indices in baseline.values()
+            ])
+            if flat0.size != size or not np.array_equal(
+                np.sort(flat0), np.arange(size)
+            ):
+                raise ValueError(
+                    f"{body}: burn_in=0 task pools must partition [0, {size})"
+                )
+            self._suite_names[body] = configured_suites
+            self._suite_counts[body] = counts.copy()
+            for suite in configured_suites:
+                task_names = tuple(sorted(
+                    task for task in baseline if task.split("/", 1)[0] == suite
+                ))
+                if not task_names:
+                    raise ValueError(f"{body}: suite {suite!r} has no tasks")
+                self._suite_task_names[(body, suite)] = task_names
+                for burn_in in self.recurrent_prefix_choices:
+                    groups = by_prefix.get(burn_in)
+                    if groups is None:
+                        raise ValueError(
+                            f"{body}: task pools omit burn_in={burn_in}"
+                        )
+                    pools = tuple(
+                        np.asarray(groups.get(task, ()), dtype=np.int64).reshape(-1)
+                        for task in task_names
+                    )
+                    if any(pool.size == 0 for pool in pools):
+                        missing = [task for task, pool in zip(task_names, pools)
+                                   if pool.size == 0]
+                        raise ValueError(
+                            f"{body}: burn_in={burn_in} empties tasks {missing}"
+                        )
+                    # A single distributed batch must never reuse a window on
+                    # two ranks, including when its ordinal interval straddles
+                    # several independently shuffled task-order cycles.
+                    # A P-long ordinal interval begins at a multiple of P. Its
+                    # start residue modulo n_tasks ranges over multiples of
+                    # gcd(P, n_tasks), so it can touch this many task-order
+                    # cycles in the worst case. Independent order permutations
+                    # may select the same task once in every touched cycle.
+                    n_tasks = len(task_names)
+                    minimum = math.ceil(
+                        (
+                            self.per_step + n_tasks
+                            - math.gcd(self.per_step, n_tasks)
+                        ) / n_tasks
+                    )
+                    too_small = [
+                        task for task, pool in zip(task_names, pools)
+                        if len(pool) < minimum
+                    ]
+                    if too_small:
+                        raise ValueError(
+                            f"{body}: burn_in={burn_in} task pools {too_small} "
+                            f"cannot provide {minimum} distinct windows per "
+                            "distributed batch"
+                        )
+                    self._suite_task_pools[(body, burn_in, suite)] = pools
 
     # ── schedule ─────────────────────────────────────────────────────────
     def steps_per_epoch(self, body: str) -> int:
@@ -249,6 +390,38 @@ class HomogeneousSampler:
         pat = self._pattern(b)
         bid = int(pat[pos])
         return b * int(self.counts[bid]) + int((pat[:pos] == bid).sum())
+
+    def _suite_pattern(self, body: str, block_index: int) -> np.ndarray:
+        counts = self._suite_counts[body]
+        ids = np.repeat(np.arange(len(counts), dtype=np.int64), counts)
+        rng = np.random.default_rng(
+            _seed_of(self.seed, "suite_schedule", body, block_index)
+        )
+        return rng.permutation(ids)
+
+    def suite_at(self, step: int, body: str | None = None) -> str | None:
+        if self.sampling != "weighted_suite_task":
+            return None
+        body = self.embodiment_at(step) if body is None else body
+        local = self.local_step(step)
+        pattern = self._suite_pattern(body, local // self.suite_block)
+        return self._suite_names[body][int(pattern[local % self.suite_block])]
+
+    def _suite_local_step(self, step: int, body: str, suite: str) -> int:
+        local = self.local_step(step)
+        block_index, pos = divmod(local, self.suite_block)
+        pattern = self._suite_pattern(body, block_index)
+        suite_id = self._suite_names[body].index(suite)
+        return (
+            block_index * int(self._suite_counts[body][suite_id])
+            + int((pattern[:pos] == suite_id).sum())
+        )
+
+    def burn_in_at(self, step: int) -> int:
+        if self.sampling != "weighted_suite_task":
+            return 0
+        pick = _seed_of(self.seed, "recurrent_prefix", int(step))
+        return self.recurrent_prefix_choices[pick % len(self.recurrent_prefix_choices)]
 
     # ── indices ──────────────────────────────────────────────────────────
     def _permutation(self, body: str, epoch: int) -> np.ndarray:
@@ -309,18 +482,74 @@ class HomogeneousSampler:
             out[j] = pool[pick]
         return out
 
-    def batch_at(self, step: int, rank: int = 0) -> tuple[str, np.ndarray]:
+    def _suite_task_batch(
+        self,
+        body: str,
+        suite: str,
+        burn_in: int,
+        local_step: int,
+        rank: int,
+    ) -> np.ndarray:
+        task_names = self._suite_task_names[(body, suite)]
+        pools = self._suite_task_pools[(body, burn_in, suite)]
+        n_tasks = len(task_names)
+        start = local_step * self.per_step + rank * self.batch_size
+        out = np.empty(self.batch_size, dtype=np.int64)
+        for j, ordinal in enumerate(range(start, start + self.batch_size)):
+            cycle, pos = divmod(ordinal, n_tasks)
+            order_rng = np.random.default_rng(
+                _seed_of(self.seed, "suite_task_order", body, suite, cycle)
+            )
+            task = int(order_rng.permutation(n_tasks)[pos])
+            pool = pools[task]
+            # ``cycle`` is this task's exact occurrence count because every
+            # task appears once in each task-order cycle. Use one seeded cyclic
+            # permutation rather than independent epoch permutations: the
+            # latter can put the same window at the end of epoch e and the
+            # beginning of e+1, duplicating it across ranks in one global
+            # batch. A fixed cyclic stream is without replacement across that
+            # boundary and still gives every window exactly equal exposure.
+            key = (body, suite, task_names[task], burn_in)
+            permutation = self._suite_task_perm_memo.get(key)
+            if permutation is None:
+                perm_rng = np.random.default_rng(
+                    _seed_of(
+                        self.seed, "suite_task_perm", body, suite,
+                        task_names[task], burn_in,
+                    )
+                )
+                permutation = perm_rng.permutation(len(pool))
+                self._suite_task_perm_memo[key] = permutation
+            out[j] = pool[int(permutation[cycle % len(pool)])]
+        return out
+
+    def batch_spec_at(self, step: int, rank: int = 0) -> BatchSpec:
         if not (0 <= rank < self.world_size):
             raise ValueError(f"rank {rank} outside world_size {self.world_size}")
         body = self.embodiment_at(step)
-        ls = self.local_step(step)
+        local_step = self.local_step(step)
+        if self.sampling == "weighted_suite_task":
+            suite = self.suite_at(step, body)
+            assert suite is not None
+            burn_in = self.burn_in_at(step)
+            suite_step = self._suite_local_step(step, body, suite)
+            indices = self._suite_task_batch(
+                body, suite, burn_in, suite_step, rank,
+            )
+            return BatchSpec(body, indices, suite=suite, burn_in=burn_in)
         if self.sampling == "uniform_task":
-            return body, self._uniform_task_batch(body, ls, rank)
-        spe = self.steps_per_epoch(body)
-        perm = self._permutation(body, ls // spe)
-        k = ls % spe
-        lo = (k * self.world_size + rank) * self.batch_size
-        return body, perm[lo:lo + self.batch_size]
+            indices = self._uniform_task_batch(body, local_step, rank)
+        else:
+            spe = self.steps_per_epoch(body)
+            perm = self._permutation(body, local_step // spe)
+            k = local_step % spe
+            lo = (k * self.world_size + rank) * self.batch_size
+            indices = perm[lo:lo + self.batch_size]
+        return BatchSpec(body, indices)
+
+    def batch_at(self, step: int, rank: int = 0) -> tuple[str, np.ndarray]:
+        spec = self.batch_spec_at(step, rank)
+        return spec.body, spec.indices
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -581,7 +810,7 @@ class CachedWindowDataset:
             raise ValueError("this dataset was built without trajectory split provenance")
         return json.loads(json.dumps(self._data_manifest))
 
-    def task_indices(self) -> dict[str, np.ndarray]:
+    def task_indices(self, burn_in: int | None = None) -> dict[str, np.ndarray]:
         """Task identity -> local window indices, using cache metadata first.
 
         LIBERO's cache records both suite and task, so identically named tasks in
@@ -589,9 +818,14 @@ class CachedWindowDataset:
         portable fallback for synthetic and future adapters; a trajectory id is
         used only when neither source supplied a task identity.
         """
+        effective_burn_in = self.recurrent_burn_in if burn_in is None else int(burn_in)
+        if effective_burn_in < 0:
+            raise ValueError("burn_in must be non-negative")
         groups: dict[str, list[int]] = {}
         entries = getattr(self.cache, "entries", {})
         for i, window in enumerate(self.windows):
+            if window.start < effective_burn_in * H_OP:
+                continue
             traj = self._traj[window.traj_id]
             meta = entries.get(window.traj_id, {}).get("meta", {})
             task = str(meta.get("task") or traj.lang or window.traj_id)
@@ -600,13 +834,26 @@ class CachedWindowDataset:
             groups.setdefault(key, []).append(i)
         return {key: np.asarray(idx, dtype=np.int64) for key, idx in groups.items()}
 
-    def __getitem__(self, i: int) -> dict:
+    def __getitem__(self, i: int | tuple[int, int, str | None]) -> dict:
+        sampling_suite: str | None = None
+        burn_in = self.recurrent_burn_in
+        if isinstance(i, tuple):
+            if len(i) != 3:
+                raise ValueError("dynamic dataset index must be (index, burn_in, suite)")
+            i, burn_in, sampling_suite = i
+            i, burn_in = int(i), int(burn_in)
+            if burn_in < 0:
+                raise ValueError("dynamic burn_in must be non-negative")
         w = self.windows[i]
         traj = self._traj[w.traj_id]
+        if w.start < burn_in * H_OP:
+            raise ValueError(
+                f"window start {w.start} cannot supply burn_in={burn_in}"
+            )
         prefix_src = tuple(
             int(traj.obs_src_index[t])
             for t in range(
-                w.start - self.recurrent_burn_in * H_OP,
+                w.start - burn_in * H_OP,
                 w.start,
                 H_OP,
             )
@@ -617,11 +864,11 @@ class CachedWindowDataset:
         lang = torch.from_numpy(np.ascontiguousarray(blob["lang"]))         # (L,F)
         all_feats = [
             ObsFeats(views=views[s], proprio=proprio[s], lang=lang)
-            for s in range(self.recurrent_burn_in + N_STATES)
+            for s in range(burn_in + N_STATES)
         ]
         a = window_actions(traj, w)
         out = {
-            "feats": all_feats[self.recurrent_burn_in:],
+            "feats": all_feats[burn_in:],
             "actions": None if a is None else torch.from_numpy(np.ascontiguousarray(a)),
             "lang": lang,
             "embodiment": w.embodiment,
@@ -640,8 +887,11 @@ class CachedWindowDataset:
             }
         # Omit the optional key at B=0 so every existing source and consumer sees
         # precisely the historical TransitionWindow dictionary.
-        if self.recurrent_burn_in:
-            out["burn_in_feats"] = all_feats[:self.recurrent_burn_in]
+        if burn_in:
+            out["burn_in_feats"] = all_feats[:burn_in]
+        if sampling_suite is not None:
+            out["sampling_suite"] = str(sampling_suite)
+            out["burn_in_steps"] = burn_in
         return out
 
 
@@ -686,6 +936,18 @@ def collate_window(samples: Sequence[dict]) -> TransitionWindow:
     )
     if n_prefix:
         out["burn_in_feats"] = _stack("burn_in_feats", n_prefix)
+    sampled_suites = {sample.get("sampling_suite") for sample in samples}
+    burn_in_values = {int(sample.get("burn_in_steps", n_prefix)) for sample in samples}
+    if len(sampled_suites) > 1 or len(burn_in_values) != 1:
+        raise ValueError(
+            "batch mixes suite/prefix sampling metadata: "
+            f"suites={sorted(str(value) for value in sampled_suites)} "
+            f"burn_in={sorted(burn_in_values)}"
+        )
+    sampled_suite = next(iter(sampled_suites))
+    if sampled_suite is not None:
+        out["sampling_suite"] = sampled_suite
+        out["burn_in_steps"] = next(iter(burn_in_values))
     has_meta = ["data_meta" in sample for sample in samples]
     if any(has_meta) and not all(has_meta):
         raise ValueError("batch mixes windows with and without data provenance")
@@ -766,9 +1028,18 @@ class _ConcatBodies(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return int(self.offsets[-1])
 
-    def __getitem__(self, i: int) -> dict:
+    def __getitem__(self, i: int | tuple[int, int, str | None]) -> dict:
+        burn_in, suite = 0, None
+        if isinstance(i, tuple):
+            if len(i) != 3:
+                raise ValueError("batch index must be (global_index, burn_in, suite)")
+            i, burn_in, suite = i
+        i = int(i)
         j = int(np.searchsorted(self.offsets, i, side="right")) - 1
-        return self.datasets[j][i - int(self.offsets[j])]
+        local = i - int(self.offsets[j])
+        if suite is None and burn_in == 0:
+            return self.datasets[j][local]
+        return self.datasets[j][(local, int(burn_in), suite)]
 
 
 class _StepBatchSampler:
@@ -788,11 +1059,17 @@ class _StepBatchSampler:
     def __len__(self) -> int:
         return self.n_steps
 
-    def __iter__(self) -> Iterator[list[int]]:
+    def __iter__(self) -> Iterator[list[object]]:
         for t in range(self.start_step, self.start_step + self.n_steps):
-            body, idx = self.sampler.batch_at(t, self.rank)
-            off = self.concat.offset_of(body)
-            yield [off + int(i) for i in idx]
+            spec = self.sampler.batch_spec_at(t, self.rank)
+            off = self.concat.offset_of(spec.body)
+            if spec.suite is None and spec.burn_in == 0:
+                yield [off + int(i) for i in spec.indices]
+            else:
+                yield [
+                    (off + int(i), spec.burn_in, spec.suite)
+                    for i in spec.indices
+                ]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -819,6 +1096,9 @@ class LoomLoader:
         pin_memory: bool = False,
         block: int = 64,
         sampling: str = "uniform_window",
+        suite_weights: Mapping[str, float] | None = None,
+        suite_block: int = 20,
+        recurrent_prefix_choices: Sequence[int] = (0,),
     ) -> None:
         for name, ds in datasets.items():
             if ds.embodiment != name:
@@ -829,10 +1109,24 @@ class LoomLoader:
             {name: ds.task_indices() for name, ds in self.datasets.items()}
             if sampling == "uniform_task" else None
         )
+        prefix_choices = tuple(int(value) for value in recurrent_prefix_choices)
+        task_indices_by_burn_in = (
+            {
+                name: {
+                    burn_in: ds.task_indices(burn_in)
+                    for burn_in in prefix_choices
+                }
+                for name, ds in self.datasets.items()
+            }
+            if sampling == "weighted_suite_task" else None
+        )
         self.sampler = HomogeneousSampler(
             {k: len(v) for k, v in self.datasets.items()},
             batch_size=batch_size, world_size=world_size, seed=seed,
             weights=weights, block=block, sampling=sampling, task_indices=task_indices,
+            task_indices_by_burn_in=task_indices_by_burn_in,
+            suite_weights=suite_weights, suite_block=suite_block,
+            recurrent_prefix_choices=prefix_choices,
         )
         self.sampling = self.sampler.sampling
         self.batch_size = int(batch_size)
@@ -846,6 +1140,7 @@ class LoomLoader:
         self._bytes_per_batch: int | None = None
         self._iter: Iterator[TransitionWindow] | None = None
         self._next_step = 0
+        self.recurrent_prefix_choices = prefix_choices
 
     @property
     def n_windows(self) -> int:
@@ -867,7 +1162,17 @@ class LoomLoader:
     def bytes_per_batch(self) -> int:
         """Exact in-RAM size of one collated batch. Reads one window from disk."""
         if self._bytes_per_batch is None:
-            one = collate_window([self.concat[0]])
+            if self.sampling == "weighted_suite_task":
+                max_prefix = max(self.recurrent_prefix_choices)
+                body = self.sampler.bodies[0]
+                suite = self.sampler._suite_names[body][0]
+                pool = self.sampler._suite_task_pools[(body, max_prefix, suite)][0]
+                global_index = self.concat.offset_of(body) + int(pool[0])
+                one = collate_window([
+                    self.concat[(global_index, max_prefix, suite)]
+                ])
+            else:
+                one = collate_window([self.concat[0]])
             self._bytes_per_batch = _batch_bytes(one) * self.batch_size
         return self._bytes_per_batch
 
@@ -1061,6 +1366,15 @@ def build_loader(
     root = resolve_cache_root(cfg, cache_root)
     cache = _open_cache(root)
 
+    if (
+        str(dcfg.get("sampling", "uniform_window")) == "weighted_suite_task"
+        and int(dcfg.get("recurrent_burn_in", 0)) != 0
+    ):
+        raise DataConfigError(
+            "weighted_suite_task uses recurrent_prefix_choices and requires "
+            "data.recurrent_burn_in=0 so early windows remain eligible"
+        )
+
     datasets: dict[str, CachedWindowDataset] = {}
     for body in bodies:
         datasets[body] = _dataset_for(body, source, cache, dcfg)
@@ -1077,6 +1391,9 @@ def build_loader(
         # the loop hands us device="cpu" and moves tensors itself, so pinning is
         # keyed on whether a GPU exists at all, not on that argument
         pin_memory=bool(dcfg.get("pin_memory", False)) and torch.cuda.is_available(),
+        suite_weights=dcfg.get("suite_weights"),
+        suite_block=int(dcfg.get("suite_block", 20)),
+        recurrent_prefix_choices=dcfg.get("recurrent_prefix_choices", (0,)),
     )
     # eager, so the numbers below are the ones training will actually use and a
     # broken cache fails here rather than 40 minutes in
@@ -1090,6 +1407,7 @@ def build_loader(
         f"bodies={sorted(datasets)} batch_per_gpu={batch} world={world} rank={rank} "
         f"sampling={loader.sampling} recurrent_burn_in="
         f"{int(dcfg.get('recurrent_burn_in', 0))} "
+        f"recurrent_prefix_choices={list(loader.recurrent_prefix_choices)} "
         f"trajectory_split={trajectory_split} "
         f"codec={spec.codec} V={spec.n_views} P={spec.n_patches} F={spec.feat_dim} "
         f"L={spec.lang_len} "

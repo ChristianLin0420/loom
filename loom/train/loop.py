@@ -49,6 +49,7 @@ from torch import Tensor, nn
 import contracts as C
 import stubs as S
 from loom.heads.proposal import argmax_coeff, argmax_coeff_dense_st
+from loom.losses.act import sparse_target_ce
 from loom.losses.dyn import dyn_loss, ln_cosine_distance
 from loom.losses.proposal_bc import (
     proposal_bc_loss, proposal_distill_loss, proposal_sparse_ce_loss,
@@ -110,6 +111,8 @@ _CONFIG_DIR = _ROOT / "configs"
 _DIRECT_FORMAL_METRICS_ROLLBACK_FORMAT = (
     "loom-direct-formal-metrics-rollback-v1"
 )
+_FRESH_METRICS_ROLLBACK_FORMAT = "loom-fresh-metrics-rollback-v1"
+_EXECUTION_FAILURE_FORMAT = "loom-training-execution-failure-v1"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -251,13 +254,86 @@ def _exclusive_publish_bytes(path: Path, payload: bytes) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
-def _reconcile_direct_formal_metrics(
+def _execution_failure_payload(
+    *, config_hash_value: str, global_step: int, reason: str,
+) -> dict[str, Any]:
+    if not isinstance(config_hash_value, str) or not config_hash_value:
+        raise ValueError("execution-failure config hash must be non-empty")
+    if (
+        not isinstance(global_step, int) or isinstance(global_step, bool)
+        or global_step < 0
+    ):
+        raise ValueError("execution-failure global_step must be non-negative")
+    if reason != "logging_failure":
+        raise ValueError("unsupported durable execution-failure reason")
+    return {
+        "format": _EXECUTION_FAILURE_FORMAT,
+        "config_hash": config_hash_value,
+        "global_step": global_step,
+        "reason": reason,
+    }
+
+
+def _publish_execution_failure(
+    run_dir: Path, *, config_hash_value: str, global_step: int, reason: str,
+) -> dict[str, Any]:
+    """Idempotently publish a terminal execution failure before checkpointing."""
+    path = Path(run_dir) / "EXECUTION_FAILURE.json"
+    expected = _execution_failure_payload(
+        config_hash_value=config_hash_value,
+        global_step=global_step,
+        reason=reason,
+    )
+    encoded = (
+        json.dumps(expected, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        + "\n"
+    ).encode()
+    if not path.exists():
+        try:
+            _exclusive_publish_bytes(path, encoded)
+        except FileExistsError:
+            pass
+    if path.is_symlink() or not path.is_file() or path.read_bytes() != encoded:
+        raise RuntimeError("durable execution-failure marker differs from expected")
+    return {**expected, "path": str(path)}
+
+
+def _read_execution_failure(
+    run_dir: Path, *, config_hash_value: str,
+) -> dict[str, Any] | None:
+    path = Path(run_dir) / "EXECUTION_FAILURE.json"
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("durable execution-failure marker is nonregular")
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("durable execution-failure marker is unreadable") from error
+    if not isinstance(value, Mapping) or set(value) != {
+        "format", "config_hash", "global_step", "reason",
+    }:
+        raise RuntimeError("durable execution-failure marker is malformed")
+    expected = _execution_failure_payload(
+        config_hash_value=config_hash_value,
+        global_step=value.get("global_step"),
+        reason=value.get("reason"),
+    )
+    if value != expected:
+        raise RuntimeError("durable execution-failure marker identity changed")
+    return {**expected, "path": str(path)}
+
+
+def _reconcile_metrics_to_checkpoint(
     run_dir: Path,
     *,
     checkpoint_step: int,
     checkpoint_identity: Mapping[str, Any],
+    rollback_dir_name: str,
+    receipt_format: str,
+    ledger_label: str,
 ) -> dict[str, Any]:
-    """Authenticate a formal metrics ledger and remove only a crash tail.
+    """Authenticate a metrics ledger and remove only a crash tail.
 
     The checkpoint is the durable optimizer/model authority.  A metrics ledger
     may be ahead of it when a process dies after logging later updates but
@@ -276,6 +352,14 @@ def _reconcile_direct_formal_metrics(
         raise ValueError("checkpoint_step must be a non-negative integer")
     if not isinstance(checkpoint_identity, Mapping):
         raise ValueError("checkpoint_identity must be a mapping")
+    if (
+        not rollback_dir_name
+        or Path(rollback_dir_name).name != rollback_dir_name
+        or rollback_dir_name in {".", ".."}
+    ):
+        raise ValueError("rollback_dir_name must be one plain path component")
+    if not receipt_format or not ledger_label:
+        raise ValueError("receipt_format and ledger_label must be non-empty")
 
     metrics_path = Path(run_dir) / "metrics.jsonl"
     if not metrics_path.exists():
@@ -287,13 +371,15 @@ def _reconcile_direct_formal_metrics(
                 "metrics_sha256": hashlib.sha256(b"").hexdigest(),
             }
         raise RuntimeError(
-            "formal metrics ledger is missing behind checkpoint "
+            f"{ledger_label} metrics ledger is missing behind checkpoint "
             f"{checkpoint_step}"
         )
 
     original = metrics_path.read_bytes()
     if original and not original.endswith(b"\n"):
-        raise RuntimeError("formal metrics ledger has an unterminated final row")
+        raise RuntimeError(
+            f"{ledger_label} metrics ledger has an unterminated final row"
+        )
 
     encoded_lines = original.splitlines(keepends=True)
     rows: list[Mapping[str, Any]] = []
@@ -304,7 +390,8 @@ def _reconcile_direct_formal_metrics(
     for line_number, encoded in enumerate(encoded_lines, start=1):
         if not encoded.endswith(b"\n"):
             raise RuntimeError(
-                f"formal metrics row {line_number} is not newline-terminated"
+                f"{ledger_label} metrics row {line_number} is not "
+                "newline-terminated"
             )
         try:
             row = json.loads(
@@ -312,11 +399,11 @@ def _reconcile_direct_formal_metrics(
             )
         except (UnicodeDecodeError, ValueError) as error:
             raise RuntimeError(
-                f"formal metrics row {line_number} is malformed: {error}"
+                f"{ledger_label} metrics row {line_number} is malformed: {error}"
             ) from error
         if not isinstance(row, Mapping):
             raise RuntimeError(
-                f"formal metrics row {line_number} is not a JSON object"
+                f"{ledger_label} metrics row {line_number} is not a JSON object"
             )
         step = row.get("global_step")
         if (
@@ -325,14 +412,14 @@ def _reconcile_direct_formal_metrics(
             or step != line_number
         ):
             raise RuntimeError(
-                "formal metrics ledger is not exactly contiguous: "
+                f"{ledger_label} metrics ledger is not exactly contiguous: "
                 f"row {line_number} has global_step={step!r}"
             )
         rows.append(row)
 
     if len(rows) < checkpoint_step:
         raise RuntimeError(
-            "formal metrics ledger is behind checkpoint: "
+            f"{ledger_label} metrics ledger is behind checkpoint: "
             f"{len(rows)} rows for checkpoint {checkpoint_step}"
         )
     if len(rows) == checkpoint_step:
@@ -348,7 +435,7 @@ def _reconcile_direct_formal_metrics(
     original_sha = hashlib.sha256(original).hexdigest()
     prefix_sha = hashlib.sha256(prefix).hexdigest()
     tail_sha = hashlib.sha256(tail).hexdigest()
-    rollback_dir = Path(run_dir) / "direct_formal_metrics_rollback"
+    rollback_dir = Path(run_dir) / rollback_dir_name
     created_dir = not rollback_dir.exists()
     rollback_dir.mkdir(parents=False, exist_ok=True)
     if created_dir:
@@ -362,7 +449,7 @@ def _reconcile_direct_formal_metrics(
         f"rollback.step-{checkpoint_step:09d}.sha256-{original_sha}.json"
     )
     receipt = {
-        "format": _DIRECT_FORMAL_METRICS_ROLLBACK_FORMAT,
+        "format": receipt_format,
         "reason": "crash_tail_beyond_latest_checkpoint",
         "checkpoint": dict(checkpoint_identity),
         "ledger": {
@@ -396,8 +483,46 @@ def _reconcile_direct_formal_metrics(
     _exclusive_publish_bytes(receipt_path, receipt_bytes)
     atomic_mod.atomic_write_bytes(metrics_path, prefix)
     if metrics_path.read_bytes() != prefix:
-        raise RuntimeError("formal metrics atomic rollback verification failed")
+        raise RuntimeError(
+            f"{ledger_label} metrics atomic rollback verification failed"
+        )
     return {"action": "ROLLBACK", "receipt_path": str(receipt_path), **receipt}
+
+
+def _reconcile_direct_formal_metrics(
+    run_dir: Path,
+    *,
+    checkpoint_step: int,
+    checkpoint_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Preserve the authenticated DirectFormal rollback contract exactly."""
+
+    return _reconcile_metrics_to_checkpoint(
+        run_dir,
+        checkpoint_step=checkpoint_step,
+        checkpoint_identity=checkpoint_identity,
+        rollback_dir_name="direct_formal_metrics_rollback",
+        receipt_format=_DIRECT_FORMAL_METRICS_ROLLBACK_FORMAT,
+        ledger_label="formal",
+    )
+
+
+def _reconcile_fresh_metrics(
+    run_dir: Path,
+    *,
+    checkpoint_step: int,
+    checkpoint_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reconcile a non-DirectFormal fresh lineage without making decisions."""
+
+    return _reconcile_metrics_to_checkpoint(
+        run_dir,
+        checkpoint_step=checkpoint_step,
+        checkpoint_identity=checkpoint_identity,
+        rollback_dir_name="fresh_metrics_rollback",
+        receipt_format=_FRESH_METRICS_ROLLBACK_FORMAT,
+        ledger_label="fresh",
+    )
 
 
 def _optimizer_group_config(optimizer) -> list[dict[str, Any]]:
@@ -971,6 +1096,51 @@ class LoomModel(nn.Module):
         if self.align_to not in ("q_delta", "q_a"):
             raise ValueError(
                 f"losses.act.align_to must be 'q_delta' or 'q_a', got {self.align_to!r}")
+        act_cfg = self.loss_cfg.get("act", {})
+        self.align_mode = str(act_cfg.get("align_mode", "mse"))
+        if self.align_mode not in ("mse", "sparse_ce"):
+            raise ValueError(
+                "losses.act.align_mode must be 'mse' or 'sparse_ce', got "
+                f"{self.align_mode!r}"
+            )
+        if self.align_mode == "sparse_ce" and self.align_to != "q_a":
+            raise ValueError(
+                "sparse_ce alignment is defined only for q_delta <- q_action; "
+                "set losses.act.align_to='q_a'"
+            )
+        self.align_temperature = float(act_cfg.get("align_temperature", 1.0))
+        self.align_weight = float(act_cfg.get("align_weight", 1.0))
+        if (
+            not math.isfinite(self.align_temperature)
+            or self.align_temperature <= 0.0
+            or not math.isfinite(self.align_weight)
+            or self.align_weight < 0.0
+        ):
+            raise ValueError(
+                "act align_temperature must be >0 and align_weight must be >=0"
+            )
+        balance_cfg = self.loss_cfg.get("balance", {})
+        self.balance_mode = str(balance_cfg.get("mode", "pooled"))
+        if self.balance_mode not in ("pooled", "per_head"):
+            raise ValueError(
+                "losses.balance.mode must be 'pooled' or 'per_head', got "
+                f"{self.balance_mode!r}"
+            )
+        raw_head_weights = balance_cfg.get(
+            "head_weights", {"q_delta": 0.5, "q_action": 0.5},
+        )
+        if not isinstance(raw_head_weights, Mapping):
+            raise ValueError("losses.balance.head_weights must be a mapping")
+        self.balance_head_weights = {
+            str(name): float(value) for name, value in raw_head_weights.items()
+        }
+        if set(self.balance_head_weights) - {"q_delta", "q_action"}:
+            raise ValueError("balance head_weights names must be q_delta/q_action")
+        if any(
+            not math.isfinite(value) or value < 0.0
+            for value in self.balance_head_weights.values()
+        ):
+            raise ValueError("balance head weights must be finite and non-negative")
         # Which coefficient D_e sees while learning to realize the demonstrated
         # action.  The historical path uses q_a's action-conditioned teacher.
         # ``proposal`` uses the exact sparse coefficient deployed by R0.
@@ -1120,8 +1290,8 @@ class LoomModel(nn.Module):
         self._qd_logits = []
         c_delta = []
         need_delta_coeff = (
-            self.dyn_coeff_source == "q_delta" or self._on("act") or
-            self._on("proposal") or self._on("balance")
+            self.dyn_coeff_source == "q_delta" or self._on("act", step) or
+            self._on("proposal", step) or self._on("balance", step)
         )
         if need_delta_coeff:
             for h in range(C.DEPTH):
@@ -1143,13 +1313,13 @@ class LoomModel(nn.Module):
         c_action_all: list[Tensor] | None = None
         action_logits_all: list[Tensor | None] = []
         actions = window.get("actions")
-        action_dyn = self._on("dyn") and self.dyn_coeff_source == "q_action"
+        action_dyn = self._on("dyn", step) and self.dyn_coeff_source == "q_action"
         if action_dyn and actions is None:
             raise ValueError(
                 "losses.dyn.coeff_source='q_action' requires labelled action "
                 "segments; TransitionWindow.actions is None"
             )
-        need_action_coeff = actions is not None and (self._on("act") or action_dyn)
+        need_action_coeff = actions is not None and (self._on("act", step) or action_dyn)
         if need_action_coeff:
             qa = self.q_action[emb]
 
@@ -1162,7 +1332,7 @@ class LoomModel(nn.Module):
                 return coeffs, logits
 
             action_dyn_needs_grad = action_dyn and not self.dyn_detach_coeff
-            if self._on("act") or action_dyn_needs_grad:
+            if self._on("act", step) or action_dyn_needs_grad:
                 # One shared q_a forward serves L_act and action-anchored L_dyn.
                 # Each objective decides below whether its view remains attached.
                 c_action_all, action_logits_all = _action_coefficients()
@@ -1178,7 +1348,7 @@ class LoomModel(nn.Module):
         # `A(c) ~ I` drive to zero for free while `c` carries nothing. Every
         # config has asked for `negatives: within_trajectory` since R0-A and
         # nothing was reading it.
-        if self._on("dyn"):
+        if self._on("dyn", step):
             dcfg = self.loss_cfg.get("dyn", {})
             use_q_action = self.dyn_coeff_source == "q_action"
             if use_q_action:
@@ -1198,12 +1368,23 @@ class LoomModel(nn.Module):
                 min_gap=int(dcfg.get("min_gap", 2)),
                 neg_weight=float(dcfg.get("neg_weight", 1.0)),
                 neg_margin=float(dcfg.get("neg_margin", 0.1)),
-                weights=C.DYN_WEIGHTS,
+                weights=tuple(float(value) for value in dcfg.get(
+                    "weights", C.DYN_WEIGHTS,
+                )),
                 cosine=cosine,
                 # CPU generator: the negatives' multinomial and the delta_op
                 # draw both happen where it lives and the indices move to the
                 # coefficients' device. See `losses.dyn._draw`.
                 generator=torch_generator(seed, step, rank, tag="dyn"),
+                z_contexts=torch.stack(zs[:C.DEPTH], dim=1),
+                z_target_prev=torch.stack(zts[:C.DEPTH], dim=1),
+                state_weight=float(dcfg.get("state_weight", 1.0)),
+                effect_weight=float(dcfg.get("effect_weight", 0.0)),
+                contrastive_weight=float(dcfg.get("contrastive_weight", 0.0)),
+                contrastive_temperature=float(
+                    dcfg.get("contrastive_temperature", 0.1)
+                ),
+                contrastive_negatives=int(dcfg.get("contrastive_negatives", 4)),
             )
             if self.check_bf16:
                 fsdp_mod.assert_bf16(out["z_hat1"], "bank.step output (L_dyn rollout)")
@@ -1211,6 +1392,22 @@ class LoomModel(nn.Module):
             metrics["dyn/pos"] = float(out["dyn"])
             metrics["dyn/neg"] = float(out["neg"])
             metrics["dyn/cos_pos"] = float(out["cos_pos"])
+            # Third-party/legacy test doubles implementing the historical
+            # ``dyn_loss`` surface do not have the repair-only diagnostics.
+            # Preserve that callable contract while the real implementation
+            # always supplies all five keys. These fallbacks affect logging
+            # only; ``terms['dyn']`` above remains the authoritative scalar.
+            metrics["dyn/state"] = float(out.get("state", out["dyn"]))
+            metrics["dyn/effect"] = float(out.get("effect", zero.detach()))
+            metrics["dyn/contrastive"] = float(
+                out.get("contrastive", zero.detach())
+            )
+            metrics["dyn/effect_gap"] = float(
+                out.get("effect_gap", zero.detach())
+            )
+            metrics["dyn/contrastive_top1"] = float(
+                out.get("contrastive_top1", zero.detach())
+            )
             # The build assert, unchanged, so the number stays comparable with
             # every prior run. Delta_op says the BANK is alive; it is not the
             # discrimination test -- `Delta_sel` below is.
@@ -1220,7 +1417,7 @@ class LoomModel(nn.Module):
         # ── L_act ──────────────────────────────────────────────────────────
         c_act: list[Tensor] | None = None
         c_act_lg: list[Tensor | None] = []
-        if self._on("act") and actions is not None:
+        if self._on("act", step) and actions is not None:
             if c_action_all is None:
                 raise RuntimeError("L_act requires action coefficients")
             dec = self.decoder[emb]
@@ -1228,6 +1425,7 @@ class LoomModel(nn.Module):
             c_act_lg = action_logits_all
             l_act, l_align = zero, zero
             l_decode_teacher, l_decode_deployed = zero, zero
+            align_overlap = zero
             deploy_l2, deploy_overlap = zero, zero
             dual_decode = self.act_decode_from == "dual_q_action_proposal"
             # One rank/step stream, consumed in fixed horizon order. Each horizon
@@ -1319,12 +1517,37 @@ class LoomModel(nn.Module):
                 #   which 94% is example-dependent, and q_a duly went blind
                 #   (frac_var_a 0.988 fresh -> 0.0015 trained).
                 if self.align_to == "q_a":
-                    l_align = l_align + ((c_delta[h] - c_a.detach()) ** 2).sum(-1).mean()
+                    if self.align_mode == "sparse_ce":
+                        qd_logits = self._qd_logits[h]
+                        if qd_logits is None:
+                            raise RuntimeError(
+                                "sparse_ce alignment requires dense q_delta logits"
+                            )
+                        l_align = l_align + sparse_target_ce(
+                            qd_logits, c_a,
+                            temperature=self.align_temperature,
+                        )
+                        with torch.no_grad():
+                            qi = qd_logits.float().topk(C.TOPK, dim=-1).indices
+                            ai = c_a.detach().float().topk(C.TOPK, dim=-1).indices
+                            align_overlap = align_overlap + (
+                                (qi.unsqueeze(-1) == ai.unsqueeze(-2))
+                                .any(-1).float().mean()
+                            )
+                    else:
+                        l_align = l_align + (
+                            (c_delta[h] - c_a.detach()) ** 2
+                        ).sum(-1).mean()
                 else:
                     l_align = l_align + ((c_a - c_delta[h].detach()) ** 2).sum(-1).mean()
-            terms["act"] = (l_act + l_align) / C.DEPTH
+            terms["act"] = (l_act + self.align_weight * l_align) / C.DEPTH
             metrics["act/decode"] = float(l_act.detach()) / C.DEPTH
             metrics["act/align"] = float(l_align.detach()) / C.DEPTH
+            if self.align_mode == "sparse_ce":
+                metrics["act/align_ce"] = float(l_align.detach()) / C.DEPTH
+                metrics["act/align_topk_overlap"] = (
+                    float(align_overlap.detach()) / C.DEPTH
+                )
             if dual_decode:
                 metrics["act/decode_teacher"] = (
                     float(l_decode_teacher.detach()) / C.DEPTH
@@ -1349,7 +1572,7 @@ class LoomModel(nn.Module):
                     (cd - cd.mean(0, keepdim=True)).norm(dim=-1).mean())
 
         # ── L_proposal ─────────────────────────────────────────────────────
-        if self._on("proposal"):
+        if self._on("proposal", step):
             src = c_act if c_act is not None else c_delta
             if self.proposal_mode == "dense_kl":
                 src_logits = c_act_lg if c_act is not None else self._qd_logits
@@ -1427,12 +1650,45 @@ class LoomModel(nn.Module):
                 terms["proposal"] = -lp / C.DEPTH
 
         # ── L_balance ──────────────────────────────────────────────────────
-        if self._on("balance"):
+        if self._on("balance", step):
             allc = torch.stack(c_delta + (c_act or []), dim=0).flatten(0, -2)
             all_lg = self._qd_logits + (c_act_lg if c_act is not None else [])
             lg = (torch.stack(all_lg, 0).flatten(0, -2)
                   if all(x is not None for x in all_lg) else None)
-            terms["balance"] = _switch_balance(allc, lg)
+            if self.balance_mode == "per_head":
+                head_terms: dict[str, Tensor] = {}
+                qd_lg = (
+                    torch.stack(self._qd_logits, 0).flatten(0, -2)
+                    if all(item is not None for item in self._qd_logits) else None
+                )
+                head_terms["q_delta"] = _switch_balance(
+                    torch.stack(c_delta, 0).flatten(0, -2), qd_lg,
+                )
+                if c_act is not None:
+                    qa_lg = (
+                        torch.stack(c_act_lg, 0).flatten(0, -2)
+                        if all(item is not None for item in c_act_lg) else None
+                    )
+                    head_terms["q_action"] = _switch_balance(
+                        torch.stack(c_act, 0).flatten(0, -2), qa_lg,
+                    )
+                weights = {
+                    name: self.balance_head_weights.get(name, 0.0)
+                    for name in head_terms
+                }
+                denominator = sum(weights.values())
+                if denominator <= 0.0:
+                    raise ValueError(
+                        "per_head balance requires positive weight for a present head"
+                    )
+                terms["balance"] = sum(
+                    weights[name] / denominator * value
+                    for name, value in head_terms.items()
+                )
+                for name, value in head_terms.items():
+                    metrics[f"balance/{name}"] = float(value.detach())
+            else:
+                terms["balance"] = _switch_balance(allc, lg)
             # pooled, unchanged, so it stays comparable with the prior runs
             cbar = allc.detach().float().mean(0).clamp_min(1e-9)
             cbar = cbar / cbar.sum()
@@ -1445,25 +1701,44 @@ class LoomModel(nn.Module):
                 metrics["bank/live_ops_q_a"], metrics["bank/entropy_q_a"] = ops, ent
 
         # ── R3: potential + GRPO ───────────────────────────────────────────
-        if self._on("potential") and getattr(self, "potential", None) is not None:
+        if self._on("potential", step) and getattr(self, "potential", None) is not None:
             reward = window.get("reward")
             if reward is None:
                 reward = torch.zeros(zs[0].shape[0], device=dev, dtype=zs[0].dtype)
             phi = self.potential(zs[-1], window["lang"])
             terms["potential"] = F.mse_loss(phi.float(), reward.float())
-        if self._on("grpo") and getattr(self, "potential", None) is not None:
+        if self._on("grpo", step) and getattr(self, "potential", None) is not None:
             terms["grpo"] = self._grpo(zs[0], window, dev)
 
         total = zero
         for name, t in terms.items():
             w = float(self.loss_cfg.get(name, {}).get("weight", 1.0))
-            total = total + w * t
+            scale = self._loss_scale(name, step)
+            total = total + w * scale * t
             metrics[f"loss/{name}"] = float(t.detach())
+            metrics[f"schedule/{name}_scale"] = scale
         metrics["loss"] = float(total.detach())
         return total, metrics
 
-    def _on(self, name: str) -> bool:
-        return bool(self.loss_cfg.get(name, {}).get("enabled", False))
+    def _loss_scale(self, name: str, step: int) -> float:
+        """Config-hashed one-based start/ramp schedule for one objective."""
+        cfg = self.loss_cfg.get(name, {})
+        update = int(step) + 1
+        start = int(cfg.get("start_update", 1))
+        ramp = int(cfg.get("ramp_updates", 0))
+        if start < 1 or ramp < 0:
+            raise ValueError(
+                f"losses.{name}.start_update must be >=1 and ramp_updates >=0"
+            )
+        if update < start:
+            return 0.0
+        if ramp == 0:
+            return 1.0
+        return min(1.0, float(update - start + 1) / float(ramp))
+
+    def _on(self, name: str, step: int | None = None) -> bool:
+        enabled = bool(self.loss_cfg.get(name, {}).get("enabled", False))
+        return enabled and (step is None or self._loss_scale(name, step) > 0.0)
 
     @torch.no_grad()
     def _delta_op(self, zs, zts, c_true, step: int, rank: int, seed: int) -> float:
@@ -1882,6 +2157,12 @@ def main(argv=None) -> int:
         steps = int(rcfg.get("steps", 1000))
     log_every = int(rcfg.get("log_every", 20))
     ckpt_every = int(rcfg.get("ckpt_every", 500))
+    reconcile_metrics_on_resume_value = rcfg.get(
+        "reconcile_metrics_on_resume", False,
+    )
+    if not isinstance(reconcile_metrics_on_resume_value, bool):
+        raise ValueError("run.reconcile_metrics_on_resume must be a boolean")
+    reconcile_metrics_on_resume = reconcile_metrics_on_resume_value
     chash = config_hash(cfg)
 
     rank = int(os.environ.get("RANK", 0))
@@ -1899,9 +2180,51 @@ def main(argv=None) -> int:
     # never inherit an unrelated run merely because that directory has LATEST.
     # Authenticate the empty first-link surface before rank 0 writes config.json.
     fresh_lineage_required = bool(rcfg.get("fresh_start_required", False))
+    if reconcile_metrics_on_resume and not fresh_lineage_required:
+        raise ValueError(
+            "run.reconcile_metrics_on_resume requires "
+            "run.fresh_start_required=true"
+        )
+    if reconcile_metrics_on_resume and direct_formal:
+        raise ValueError(
+            "run.reconcile_metrics_on_resume is the non-DirectFormal ledger "
+            "contract; DirectFormal already owns its authenticated rollback"
+        )
+    resume_integrity_required = direct_formal or reconcile_metrics_on_resume
+    execution_failure_error = ""
+    if rank == 0 and reconcile_metrics_on_resume:
+        try:
+            durable_failure = _read_execution_failure(
+                run_dir, config_hash_value=chash,
+            )
+        except Exception as error:  # noqa: BLE001
+            execution_failure_error = (
+                "durable execution-failure marker is invalid: "
+                f"{type(error).__name__}: {error}"
+            )
+        else:
+            if durable_failure is not None:
+                execution_failure_error = (
+                    "lineage is terminal after durable execution failure at "
+                    f"step {durable_failure['global_step']}: "
+                    f"{durable_failure['reason']}"
+                )
+    if world > 1:
+        execution_failure_box = [execution_failure_error]
+        dist.broadcast_object_list(execution_failure_box, src=0)
+        execution_failure_error = str(execution_failure_box[0])
+    if execution_failure_error:
+        raise RuntimeError(execution_failure_error)
+    try:
+        restart_count = int(os.environ.get("LOOM_RESTART_COUNT", "0"))
+    except ValueError as error:
+        raise ValueError("LOOM_RESTART_COUNT must be an integer") from error
+    if restart_count < 0:
+        raise ValueError("LOOM_RESTART_COUNT must be non-negative")
     latest_checkpoint_step = ckpt_mod.latest_step(run_dir)
     fresh_start = latest_checkpoint_step is None
     fresh_error: str | None = None
+    bootstrap_metrics_recovery = False
     if rank == 0 and fresh_lineage_required:
         if fresh_start:
             stale: list[str] = []
@@ -1912,10 +2235,40 @@ def main(argv=None) -> int:
                 path.name for path in sorted(run_dir.glob("ckpt_*_rank*.pt"))
             )
             if stale:
-                fresh_error = (
-                    "fresh_start_required refuses prior training state in "
-                    f"{run_dir}: {stale[:8]}"
-                )
+                marker_path = run_dir / "fresh_lineage_marker.json"
+                if reconcile_metrics_on_resume and restart_count > 0:
+                    try:
+                        marker = json.loads(marker_path.read_text())
+                        previous_cfg = json.loads((run_dir / "config.json").read_text())
+                    except Exception as error:  # noqa: BLE001
+                        fresh_error = (
+                            "fresh step-0 recovery marker/config is unreadable: "
+                            f"{error}"
+                        )
+                    else:
+                        expected_marker = {
+                            "format": "loom-fresh-training-lineage-marker-v1",
+                            "config_hash": chash,
+                            "run_name": rcfg.get("name"),
+                            "metrics_rollback_format": (
+                                _FRESH_METRICS_ROLLBACK_FORMAT
+                            ),
+                        }
+                        if (
+                            marker_path.is_symlink()
+                            or marker != expected_marker
+                            or config_hash(previous_cfg) != chash
+                        ):
+                            fresh_error = (
+                                "fresh step-0 recovery lineage/config changed"
+                            )
+                        else:
+                            bootstrap_metrics_recovery = True
+                else:
+                    fresh_error = (
+                        "fresh_start_required refuses prior training state in "
+                        f"{run_dir}: {stale[:8]}"
+                    )
         else:
             config_path = run_dir / "config.json"
             try:
@@ -1930,9 +2283,10 @@ def main(argv=None) -> int:
                         f"run directory {previous_hash}, current {chash}"
                     )
     if world > 1:
-        payload_error = [fresh_error]
+        payload_error = [fresh_error, bootstrap_metrics_recovery]
         dist.broadcast_object_list(payload_error, src=0)
         fresh_error = payload_error[0]
+        bootstrap_metrics_recovery = bool(payload_error[1])
     if fresh_error is not None:
         raise RuntimeError(fresh_error)
 
@@ -1957,8 +2311,19 @@ def main(argv=None) -> int:
         ),
         "max_updates": steps,
     }
+    if reconcile_metrics_on_resume:
+        lineage_receipt["metrics_ledger"] = {
+            "format": _FRESH_METRICS_ROLLBACK_FORMAT,
+            "reconcile_crash_tail_to_latest_checkpoint": True,
+            "checkpoint_boundary_fsync": True,
+            "direct_formal_decisions": False,
+        }
     if rank == 0:
-        (run_dir / "config.json").write_text(json.dumps(cfg, indent=2, default=str))
+        config_path = run_dir / "config.json"
+        if not bootstrap_metrics_recovery:
+            atomic_mod.atomic_write_text(
+                config_path, json.dumps(cfg, indent=2, default=str),
+            )
         schedule_text = (
             f" schedule_horizon={direct_schedule.schedule_horizon}"
             if direct_schedule is not None else ""
@@ -2093,7 +2458,7 @@ def main(argv=None) -> int:
                   f"(git {got['git_sha'][:8]})", flush=True)
 
     resumed = payload is not None
-    if direct_formal:
+    if resume_integrity_required:
         local_resume_error = ""
         if latest_checkpoint_step is not None and payload is None:
             local_resume_error = (
@@ -2109,7 +2474,7 @@ def main(argv=None) -> int:
                 or state.global_step != latest_checkpoint_step
             ):
                 local_resume_error = (
-                    "formal checkpoint/LATEST step mismatch: "
+                    "authenticated checkpoint/LATEST step mismatch: "
                     f"LATEST={latest_checkpoint_step!r}, "
                     f"payload={payload_step!r}, state={state.global_step!r}"
                 )
@@ -2121,31 +2486,49 @@ def main(argv=None) -> int:
                 for index, error in enumerate(resume_errors) if error
             )
         if local_resume_error:
+            contract = "direct-formal" if direct_formal else "fresh-ledger"
             raise RuntimeError(
-                "direct-formal checkpoint resume authentication failed: "
+                f"{contract} checkpoint resume authentication failed: "
                 + local_resume_error
             )
 
     # A hard crash can leave line-buffered metrics ahead of the pointer-last
     # checkpoint. Reconcile before W&B initialization and before opening the
     # ledger for append, so a repeated update can never create duplicate steps.
-    if direct_formal and resumed:
+    if resume_integrity_required and (resumed or bootstrap_metrics_recovery):
         reconciliation_packet: dict[str, Any] | None = None
         if rank == 0:
             try:
-                assert payload is not None
                 checkpoint_identity = {
-                    "format": "loom-direct-formal-checkpoint-identity-v1",
+                    "format": (
+                        "loom-direct-formal-checkpoint-identity-v1"
+                        if direct_formal else
+                        "loom-fresh-training-checkpoint-identity-v1"
+                    ),
                     "latest_step": latest_checkpoint_step,
-                    "payload_global_step": payload.get("global_step"),
-                    "config_hash": payload.get("config_hash"),
-                    "git_sha": payload.get("git_sha"),
-                    "world_size": payload.get("world_size"),
-                    "fresh_lineage": payload.get("fresh_lineage"),
+                    "payload_global_step": (
+                        payload.get("global_step") if payload is not None else 0
+                    ),
+                    "config_hash": (
+                        payload.get("config_hash") if payload is not None else chash
+                    ),
+                    "git_sha": (
+                        payload.get("git_sha") if payload is not None else None
+                    ),
+                    "world_size": (
+                        payload.get("world_size") if payload is not None else world
+                    ),
+                    "fresh_lineage": (
+                        payload.get("fresh_lineage")
+                        if payload is not None else lineage_receipt
+                    ),
                 }
-                result = _reconcile_direct_formal_metrics(
-                    run_dir,
-                    checkpoint_step=state.global_step,
+                reconcile = (
+                    _reconcile_direct_formal_metrics
+                    if direct_formal else _reconcile_fresh_metrics
+                )
+                result = reconcile(
+                    run_dir, checkpoint_step=state.global_step,
                     checkpoint_identity=checkpoint_identity,
                 )
                 reconciliation_packet = {"result": result}
@@ -2159,13 +2542,15 @@ def main(argv=None) -> int:
             reconciliation_packet = reconciliation_box[0]
         assert reconciliation_packet is not None
         if "error" in reconciliation_packet:
+            contract = "direct-formal" if direct_formal else "fresh-ledger"
             raise RuntimeError(
-                "direct-formal metrics resume reconciliation failed: "
+                f"{contract} metrics resume reconciliation failed: "
                 f"{reconciliation_packet['error']}"
             )
         if rank == 0 and reconciliation_packet["result"]["action"] == "ROLLBACK":
+            contract = "direct-formal" if direct_formal else "fresh-lineage"
             print(
-                "[rank0] direct-formal metrics crash tail quarantined and "
+                f"[rank0] {contract} metrics crash tail quarantined and "
                 f"rolled back to step {state.global_step}",
                 flush=True,
             )
@@ -2186,6 +2571,12 @@ def main(argv=None) -> int:
     probe_every = int(ocfg.get("grad_probe_every", GRAD_PROBE_EVERY))
     t0, last_delta, last_sel = time.time(), float("nan"), float("nan")
     direct_terminal_status: str | None = None
+    suite_metric_keys = (
+        "loss", "act/decode_deploy", "proposal/sparse_ce",
+        "dyn/effect", "dyn/contrastive",
+    )
+    suite_accumulator: dict[str, dict[str, float]] = {}
+    prefix_accumulator: dict[int, int] = {}
 
     def _save(step: int, stop_reason: str = "") -> None:
         # stop_reason rides in the payload so a chain of 38 links can be triaged
@@ -2193,10 +2584,10 @@ def main(argv=None) -> int:
         # "budget" is the link running out of its own clock, "sentinel" is a
         # human, "" is a periodic save. A run that keeps stopping for "budget"
         # near step 0 is a startup that got slower, not a preemption problem.
-        # For a formal run the metrics prefix is part of the checkpoint's
-        # decision evidence. Make it durable before LATEST can advance; a rank-0
-        # I/O error is broadcast before any rank enters the checkpoint barriers.
-        if direct_formal:
+        # In authenticated ledger modes the metrics prefix is durable evidence.
+        # Make it durable before LATEST can advance; a rank-0 I/O error is
+        # broadcast before any rank enters the checkpoint barriers.
+        if resume_integrity_required:
             durability_packet: dict[str, str] = {}
             if rank == 0:
                 try:
@@ -2212,8 +2603,9 @@ def main(argv=None) -> int:
                 dist.broadcast_object_list(durability_box, src=0)
                 durability_packet = durability_box[0]
             if "error" in durability_packet:
+                contract = "direct-formal" if direct_formal else "fresh-ledger"
                 raise RuntimeError(
-                    "direct-formal metrics durability failed before checkpoint: "
+                    f"{contract} metrics durability failed before checkpoint: "
                     f"{durability_packet['error']}"
                 )
 
@@ -2307,6 +2699,11 @@ def main(argv=None) -> int:
                 gparts = module_grad_norms(model, sync=sync,
                                            module_names=MODULE_NAMES)
             gnorm = clip_grad(model, grad_clip, sync=sync)
+            if not state.guard.enabled and not math.isfinite(gnorm):
+                raise FloatingPointError(
+                    "non-finite global gradient norm with magnitude guard "
+                    "disabled; refusing to count or apply this update"
+                )
             # `gnorm` is the globally reduced pre-clip norm, so every rank feeds
             # the guard the identical number and reaches the identical verdict
             # without another collective. It must stay that way: a guard that
@@ -2320,6 +2717,20 @@ def main(argv=None) -> int:
         state.samples_seen += batch * world
         last_delta = metrics.get("delta_op", last_delta)
         last_sel = metrics.get("delta_sel", last_sel)
+        sampling_suite = window.get("sampling_suite")
+        burn_in_steps = int(window.get("burn_in_steps", 0))
+
+        if rank == 0 and sampling_suite is not None:
+            bucket = suite_accumulator.setdefault(
+                str(sampling_suite), {"count": 0.0},
+            )
+            bucket["count"] += 1.0
+            for key in suite_metric_keys:
+                if key in metrics:
+                    bucket[key] = bucket.get(key, 0.0) + float(metrics[key])
+            prefix_accumulator[burn_in_steps] = (
+                prefix_accumulator.get(burn_in_steps, 0) + 1
+            )
 
         if rank == 0 and metrics_fp is not None:
             metrics_fp.write(json.dumps({
@@ -2333,7 +2744,10 @@ def main(argv=None) -> int:
                 "grad_thresh": (state.guard.threshold
                                 if math.isfinite(state.guard.threshold) else None),
                 **{f"gnorm/{k}": v for k, v in gparts.items()},
-                "embodiment": window["embodiment"], **metrics}) + "\n")
+                "embodiment": window["embodiment"],
+                "sampling_suite": sampling_suite,
+                "burn_in_steps": burn_in_steps,
+                **metrics}) + "\n")
 
         if state.global_step % log_every == 0:
             write_heartbeat(run_dir, state.global_step, rank, last_delta)
@@ -2347,14 +2761,69 @@ def main(argv=None) -> int:
                       f"emb={window['embodiment']} "
                       f"{state.global_step / max(1e-6, time.time() - t0):.2f} it/s",
                       flush=True)
-            wandb_util.log(run, {
-                **metrics, "grad_norm": gnorm, "samples_seen": state.samples_seen,
-                "frozen": float(is_frozen),
-                "grad_skipped": float(skipped),
-                **{f"gnorm/{k}": v for k, v in gparts.items()},
-                "seconds_to_budget": guard.seconds_left,
-                **{f"lr/{k}": v for k, v in lrs.items()},
-            }, state.global_step)
+            stratified_metrics: dict[str, float] = {}
+            if rank == 0:
+                for suite, values in suite_accumulator.items():
+                    count = values["count"]
+                    for key, value in values.items():
+                        if key != "count":
+                            stratified_metrics[
+                                f"suite/{suite}/{key.replace('/', '_')}"
+                            ] = value / count
+                total_prefix = max(1, sum(prefix_accumulator.values()))
+                for prefix, count in prefix_accumulator.items():
+                    stratified_metrics[f"data/prefix_{prefix}_fraction"] = (
+                        count / total_prefix
+                    )
+            try:
+                wandb_util.log(run, {
+                    **metrics, "grad_norm": gnorm,
+                    "samples_seen": state.samples_seen,
+                    "frozen": float(is_frozen),
+                    "grad_skipped": float(skipped),
+                    **{f"gnorm/{k}": v for k, v in gparts.items()},
+                    "seconds_to_budget": guard.seconds_left,
+                    **{f"lr/{k}": v for k, v in lrs.items()},
+                    **stratified_metrics,
+                }, state.global_step)
+            except Exception:
+                # Strict entry-local logging broadcasts one fatal outcome to
+                # every rank. Publish a terminal marker before advancing LATEST;
+                # this remains authoritative even if persistence of the W&B
+                # health event itself was the failure.
+                marker_packet: dict[str, Any] = {}
+                if reconcile_metrics_on_resume:
+                    if rank == 0:
+                        try:
+                            marker_packet = {
+                                "marker": _publish_execution_failure(
+                                    run_dir, config_hash_value=chash,
+                                    global_step=state.global_step,
+                                    reason="logging_failure",
+                                ),
+                            }
+                        except Exception as marker_error:  # noqa: BLE001
+                            marker_packet = {
+                                "error": (
+                                    f"{type(marker_error).__name__}: {marker_error}"
+                                ),
+                            }
+                    if world > 1:
+                        marker_box = [marker_packet]
+                        dist.broadcast_object_list(marker_box, src=0)
+                        marker_packet = marker_box[0]
+                    if "error" in marker_packet:
+                        raise RuntimeError(
+                            "could not durably publish terminal logging failure: "
+                            f"{marker_packet['error']}"
+                        )
+                # Save only after marker publication succeeds. A marker write
+                # failure therefore cannot create an apparently valid endpoint.
+                _save(state.global_step, "logging_failure")
+                raise
+            if rank == 0:
+                suite_accumulator.clear()
+                prefix_accumulator.clear()
 
         # EVERY rank, EVERY step. One rank saving while the others train hangs
         # the next collective until SLURM kills the job.

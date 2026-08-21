@@ -349,10 +349,10 @@ class SpikeGuard:
         poisons every subsequent update for the rest of the run regardless of
         what the data does, and ``log(nan)`` would destroy the reference too.
         """
-        if not self.enabled:
-            return False
         if not math.isfinite(gnorm):
             return True
+        if not self.enabled:
+            return False
         thr = self.threshold
         skip = gnorm > thr
         # Bounded influence: a rejected step still moves the reference, but only

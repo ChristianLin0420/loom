@@ -35,13 +35,17 @@ phase clock into q_a. See the function docstring for the measurements.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from contracts import H_OP
 
-__all__ = ["zero_loss", "act_loss", "q_action_regression_loss"]
+__all__ = [
+    "zero_loss", "act_loss", "sparse_target_ce", "q_action_regression_loss",
+]
 
 
 def zero_loss(*ref: Tensor) -> Tensor:
@@ -57,6 +61,49 @@ def zero_loss(*ref: Tensor) -> Tensor:
         if isinstance(t, Tensor):
             return torch.zeros((), device=t.device, dtype=t.dtype)
     return torch.zeros(())
+
+
+def sparse_target_ce(
+    student_logits: Tensor,
+    target_c: Tensor,
+    *,
+    temperature: float = 1.0,
+    reduction: str = "mean",
+) -> Tensor:
+    """Cross-entropy from a sparse coefficient target to dense logits.
+
+    ``target_c`` is a (usually top-k sparse) probability vector with exactly the
+    same shape as ``student_logits``.  It is always stop-gradded: this loss is
+    for moving the student into an already-defined operator space, never for
+    pulling the target encoder toward the student.  Probability math is done in
+    float32 even during bf16 training so small off-support probabilities and
+    their gradients are not rounded away.
+
+    ``reduction`` follows PyTorch's ``"none" | "sum" | "mean"`` convention;
+    the unreduced result has ``student_logits.shape[:-1]``.
+    """
+    if student_logits.ndim < 1:
+        raise ValueError("student_logits and target_c need a coefficient axis")
+    if student_logits.shape != target_c.shape:
+        raise ValueError(
+            "student_logits and target_c must have the same shape, got "
+            f"{tuple(student_logits.shape)} and {tuple(target_c.shape)}"
+        )
+    temperature = float(temperature)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError(f"temperature must be finite and > 0, got {temperature}")
+    if reduction not in ("none", "sum", "mean"):
+        raise ValueError(
+            f"reduction must be 'none', 'sum', or 'mean', got {reduction!r}"
+        )
+
+    log_prob = F.log_softmax(student_logits.float() / temperature, dim=-1)
+    per_item = -(target_c.detach().float() * log_prob).sum(dim=-1)
+    if reduction == "none":
+        return per_item
+    if reduction == "sum":
+        return per_item.sum()
+    return per_item.mean()
 
 
 def _flatten_segments(p: Tensor, c: Tensor, a: Tensor) -> tuple[Tensor, Tensor, Tensor]:

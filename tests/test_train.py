@@ -2430,10 +2430,12 @@ def test_module_grad_norms_decompose_the_global_norm():
 
 
 def test_spike_guard_is_off_by_default_and_at_mult_zero():
-    """A chain already in flight must not silently acquire a guard."""
+    """Finite steps are unguarded, while NaN can never enter the optimizer."""
     assert SpikeGuard(mult=0.0).enabled is False
     g = SpikeGuard(mult=0.0)
-    assert g.check(1e9) is False        # nothing is ever skipped when disabled
+    assert g.check(1e9) is False        # no finite magnitude threshold when disabled
+    assert g.check(float("nan")) is True
+    assert g.check(float("inf")) is True
 
 
 def test_spike_guard_rejects_a_spike_but_not_the_ordinary_step():
