@@ -192,3 +192,37 @@ rewritten after a run is submitted.
 - next: monitor every link through terminal execution, record material training
   and evaluation transitions as new diary events, and publish the exact
   end-to-end success rate without applying an outcome threshold.
+
+### TRAINING_TERMINAL — 2026-08-21T19:10:20Z
+
+- status: completed exact update 32,000; consolidation running
+- why: execute the prospectively fixed operator-repair endpoint without metric
+  selection. Four links performed updates; links five and six authenticated the
+  completed endpoint as zero-update no-ops. No convergence or health value
+  controlled stopping or evaluation eligibility.
+- method_delta: none. The submitted config/source/data receipts remained exact
+  across every link, and the optimizer/scheduler/sampler/W&B lineage resumed
+  continuously at steps 10,663, 21,186, and 31,790.
+- fixed_protocol: 32,000 optimizer updates, 32,000 contiguous metrics rows,
+  world size 16, and the single predeclared step-32,000 checkpoint. All six
+  training jobs completed `0:0`; no update was skipped and no numeric value was
+  nonfinite.
+- authority: fixed-endpoint receipt SHA-256
+  `435838dec946835adbec33585dc75eef3c14607234a5f1c725af9df18e9ef597`;
+  metrics SHA-256
+  `3ceed51a2fe68e204e83363727f156e50922c86a719807ef9b20791dc1e46b79`;
+  16 authenticated endpoint shards; W&B run `eb4b90e6d4c14e22` in project
+  `loom-r0-operator-repair`.
+- result: execution integrity PASS with zero skipped/nonfinite updates and zero
+  W&B logging failures. Last-500 medians were q_delta/q_action live operators
+  45/12, contrastive loss 3.83181, effect gap 0.39930, delta-op 0.01684,
+  aggregate selection delta 0.02779, teacher/deployed decode about 0.04792,
+  proposal CE 0.64073, and alignment/proposal top-k overlap 0.39844/0.43750.
+  Training therefore formed real effect/selectivity signals and a broader
+  transition codebook, but retained a narrower action codebook and imperfect
+  semantic bridge. Large finite pre-clip estimator gradients remained a method
+  caveat; clipping kept every update finite and applied.
+- next: verify consolidation, evaluate seeds 0/1/2 for exactly 400 episodes each
+  regardless of the training observations above, merge exactly 1,200 episodes,
+  and report the raw end-to-end success rate plus descriptive per-suite/seed
+  breakdowns without a threshold.
