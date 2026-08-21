@@ -2241,7 +2241,7 @@ def _read_fixed_endpoint(
     receipt = _read_receipt(path, kind="r0_e2e_operator_repair_fixed_endpoint")
     shards = receipt.get("checkpoint_shards")
     expected_names = {
-        f"ckpt_{FIXED_STEP:09d}_rank{rank:05d}.pt" for rank in range(WORLD_SIZE)
+        f"ckpt_{FIXED_STEP:09d}_rank{rank}.pt" for rank in range(WORLD_SIZE)
     }
     if not (
         receipt.get("plan_sha256") == _plan_sha()

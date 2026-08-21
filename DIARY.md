@@ -226,3 +226,29 @@ rewritten after a run is submitted.
   regardless of the training observations above, merge exactly 1,200 episodes,
   and report the raw end-to-end success rate plus descriptive per-suite/seed
   breakdowns without a threshold.
+
+### AMENDMENT — 2026-08-21T19:12:00Z
+
+- status: evaluation orchestration interrupted; training endpoint unchanged
+- why: consolidation job `32651394` reconstructed and verified the endpoint
+  checkpoint successfully, then the wrapper rejected its own receipt because it
+  expected zero-padded shard suffixes (`rank00000`) while the authoritative
+  checkpoint receipt uses real filenames (`rank0`). This is a validator-format
+  defect, not a checkpoint/model failure.
+- method_delta: none; zero optimizer or environment steps occurred after the
+  fixed training endpoint.
+- fixed_protocol: the canceled seed jobs and merge produced no episodes and no
+  success-rate result. The recovery must remain exactly checkpoint verification
+  followed by three 400-episode seeds and a 1,200-episode merge, with no smoke,
+  training continuation, checkpoint change, or metric threshold.
+- authority: failed consolidation job `32651394` exit `2:0`; its verification
+  report passed all 923 keys, 3,920 replicated tensors, 10,808 sharded pieces,
+  and real-policy loading with zero mismatches. The existing consolidated
+  checkpoint is 1,760,597,436 bytes and will be rehashed and verified by a
+  separately versioned recovery plan. Original eval jobs `32651395`–`32651397`
+  and merge `32651398` were dependency-canceled before starting.
+- result: no end-to-end SR yet. The source validator is corrected to use the
+  real unpadded shard names and gains an executable regression for all 16 ranks.
+- next: freeze and independently review an isolated zero-training recovery DAG,
+  authenticate both the historical training closure and corrected runtime
+  closure, verify/adopt the existing checkpoint, then evaluate unconditionally.

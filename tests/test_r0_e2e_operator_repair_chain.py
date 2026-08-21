@@ -457,6 +457,79 @@ def test_fixed_endpoint_rejects_any_direct_formal_receipt(tmp_path, monkeypatch)
         chain._fixed_endpoint_payload(plan)
 
 
+def test_fixed_endpoint_reader_accepts_real_unpadded_rank_shard_names(
+    tmp_path, monkeypatch,
+):
+    run_dir = tmp_path / "run"
+    control_dir = tmp_path / "control"
+    run_dir.mkdir()
+    control_dir.mkdir()
+    endpoint = control_dir / "fixed_endpoint_32000.json"
+    asset_dir = control_dir / "training_asset_verification"
+    asset_dir.mkdir()
+    plan_sha = "a" * 64
+    wandb_id = "b" * 16
+    plan = {
+        "lineage": {"run_dir": str(run_dir)},
+        "paths": {
+            "fixed_endpoint": str(endpoint),
+            "training_asset_verification_dir": str(asset_dir),
+        },
+        "wandb": {"training_run_id": wandb_id},
+    }
+    receipt = {
+        "format_version": chain.FORMAT_VERSION,
+        "kind": "r0_e2e_operator_repair_fixed_endpoint",
+        "plan_sha256": plan_sha,
+        "step": chain.FIXED_STEP,
+        "selection": "predeclared_fixed_step_no_metric_or_eval_selection",
+        "optimizer_updates": chain.FIXED_STEP,
+        "run_config": {
+            "path": str((run_dir / "config.json").resolve()),
+            "bytes": 1,
+            "sha256": "c" * 64,
+        },
+        "metrics": {
+            "path": str((run_dir / "metrics.jsonl").resolve()),
+            "sha256": "d" * 64,
+            "rows": chain.FIXED_STEP,
+            "role": "observational_only_never_a_dependency_decision",
+        },
+        "checkpoint_shards": {
+            f"ckpt_{chain.FIXED_STEP:09d}_rank{rank}.pt": {
+                "bytes": rank + 1,
+                "sha256": f"{rank + 1:064x}",
+            }
+            for rank in range(chain.WORLD_SIZE)
+        },
+        "training_asset_verification": {
+            "stage": f"train_{chain.TRAIN_LINKS:02d}",
+            "phase": "post",
+            "path": str(asset_dir / f"train_{chain.TRAIN_LINKS:02d}_post.json"),
+            "sha256": "e" * 64,
+        },
+        "training_wandb_run_id": wandb_id,
+        "direct_formal_receipts": [],
+        "health_metrics_used_as_gate": False,
+        "evaluation_required_after_integrity": True,
+    }
+    endpoint.write_text(json.dumps(receipt) + "\n")
+    monkeypatch.setattr(chain, "_plan_sha", lambda: plan_sha)
+
+    parsed, endpoint_sha = chain._read_fixed_endpoint(plan)
+    assert parsed == receipt
+    assert endpoint_sha == chain.sha256_file(endpoint)
+
+    padded = copy.deepcopy(receipt)
+    padded["checkpoint_shards"] = {
+        f"ckpt_{chain.FIXED_STEP:09d}_rank{rank:05d}.pt": row
+        for rank, row in enumerate(receipt["checkpoint_shards"].values())
+    }
+    endpoint.write_text(json.dumps(padded) + "\n")
+    with pytest.raises(chain.OperatorRepairError, match="immutable shape"):
+        chain._read_fixed_endpoint(plan)
+
+
 def test_complete_seed_result_recovers_missing_or_corrupt_table_idempotently(
     roots, monkeypatch,
 ):
