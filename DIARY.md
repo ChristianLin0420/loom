@@ -252,3 +252,29 @@ rewritten after a run is submitted.
 - next: freeze and independently review an isolated zero-training recovery DAG,
   authenticate both the historical training closure and corrected runtime
   closure, verify/adopt the existing checkpoint, then evaluate unconditionally.
+
+### SUBMITTED — 2026-08-21T20:17:58Z (evaluation recovery v2)
+
+- status: running; checkpoint-adoption job started and four descendants are
+  dependency-held
+- why: resume only the evaluation work canceled by the rank-suffix validator
+  defect. Independent review confirmed the recovery cannot call training,
+  reconstruct a checkpoint, choose a checkpoint, or apply a scientific gate.
+- method_delta: none. Commit `d153199` changes the validator from padded to the
+  real unpadded shard suffix and adds a versioned evaluation-only wrapper. The
+  source step-32,000 checkpoint remains byte-identical.
+- fixed_protocol: one verify-only checkpoint adoption, three parallel exact-400
+  seed evaluations, then one exact-1,200 merge; zero training jobs, zero
+  consolidation/reconstruction jobs, and zero decision-gate jobs.
+- authority: recovery plan SHA-256
+  `c29f386efddf1bbd1987934eb075e7414b86c608badc7d55cd1999bbd618448c`;
+  current 57-file runtime closure
+  `614aafaac5fb48004a11ce5879ff590354921a91c1ff43b688cdbf5b2076eaf3`;
+  source checkpoint SHA-256
+  `ee8d3d583624be8c87cf6222c2d1716905d0ea21a4e1af5db094ef5d8273b36c`.
+  Jobs: adopt `32687797`, eval seeds 0/1/2
+  `32687798`/`32687799`/`32687800`, merge `32687801`.
+- result: submission released successfully; no episodes had started at this
+  event.
+- next: monitor checkpoint adoption, every singleton evaluation, and the merge;
+  report the exact raw end-to-end success rate with no outcome threshold.
