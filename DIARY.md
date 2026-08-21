@@ -163,3 +163,32 @@ rewritten after a run is submitted.
 - next: focused orchestration regression, shell syntax checks, authenticated
   no-write dry-run, independent review, then commit/push and submit under the
   user's existing explicit authorization.
+
+### SUBMITTED — 2026-08-21T07:44:15Z
+
+- status: running; `train_01` began on two 8-GPU nodes and every descendant is
+  held behind an exact `afterok` dependency.
+- why: the frozen operator-repair implementation passed independent exact-byte
+  review, 49 focused tests, 239 relevant checks (two expected skips), and a
+  full authenticated no-write preflight. The user explicitly requested direct
+  formal training followed by evaluation without a scientific gate or smoke
+  run.
+- method_delta: no change from this round's prospective PLAN. The submitted
+  bytes are commit `5138a52` on branch `r0a-rerun-three-fixes`, pushed to
+  `origin/r0a-rerun-three-fixes` before submission.
+- fixed_protocol: six sequential resumable training jobs, one consolidation,
+  three parallel exact-400 singleton evaluations, and one exact-1,200 merge.
+  There are no decision-gate jobs; update 32,000 is the only checkpoint eligible
+  for evaluation.
+- authority: immutable plan SHA-256
+  `a409ce347fe1c56fdf4bf01558d03111f3fb22a2e0c98b9219b923dfd452be8a`;
+  jobs receipt SHA-256
+  `d0ec335f9763446015533ac04b4ef725fd30d93a43cbe697b0595f97dade4ddc`;
+  train jobs `32651388`–`32651393`; consolidate `32651394`; eval seeds 0/1/2
+  `32651395`/`32651396`/`32651397`; merge `32651398`.
+- result: submission released successfully. At this event, `32651388` was
+  RUNNING and all ten descendants were dependency-pending; no training result
+  or success rate existed yet.
+- next: monitor every link through terminal execution, record material training
+  and evaluation transitions as new diary events, and publish the exact
+  end-to-end success rate without applying an outcome threshold.
