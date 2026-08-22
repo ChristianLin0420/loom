@@ -1,0 +1,68 @@
+# Common protocol for the three fresh protected-operator arms.
+#
+# The external action-policy anchor is the exact step-32k dual-code model that
+# scored 550/1,200 = 45.8333%.  These arms intentionally start fresh instead of
+# warm-starting it: H reproduces its objective under the same history/suite
+# schedule as P and I, leaving each adjacent comparison with one method delta.
+# The anchor remains an evaluated fallback; it is never overwritten or resumed.
+
+extends: r0a_dual_code.yaml
+
+run:
+  project: loom-r0-protected-arms
+  seed: 0
+  steps: 32000
+  boundary_policy: fixed_max_updates
+  fresh_start_required: true
+  reconcile_metrics_on_resume: true
+  require_online_wandb: true
+  log_every: 20
+  ckpt_every: 500
+  keep_last: 4
+
+model:
+  use_stubs: false
+
+optim:
+  # Every arm takes exactly 32k optimizer updates. Nonfinite execution remains
+  # a hard error; no scientific metric can suppress an update or evaluation.
+  spike_mult: 0
+
+data:
+  data_root: /lustre/fsw/portfolios/edgeai/users/chrislin/datasets/loom/libero
+  sampling: weighted_suite_task
+  suite_weights:
+    libero_spatial: 0.20
+    libero_object: 0.20
+    libero_goal: 0.20
+    libero_10: 0.40
+  suite_block: 20
+  recurrent_burn_in: 0
+  recurrent_prefix_choices: [0, 4, 8, 12]
+
+reference_action_policy:
+  kind: r0a_dualcode_formal_s0_20260820_v2_step32000
+  source_config: configs/r0a_dual_code_formal.yaml
+  source_config_hash: d030206d56a71718
+  checkpoint_step: 32000
+  checkpoint_sha256: eddcc36d94dc48b9031acbcdaea116b2a1693c8b9e357f96e2573da36c9039b6
+  checkpoint_receipt_sha256: 354dd8c1ce0339555c7794e20cb1229e4a3bb4602284012ca395381020ab3e84
+  successes: 550
+  episodes: 1200
+  success_rate: 0.4583333333333333
+
+protected_protocol:
+  format: loom-r0a-protected-operator-arms-v1
+  initialization: fresh_seed0
+  fixed_endpoint_update: 32000
+  checkpoint_selection: fixed_update_only
+  evaluation_is_unconditional: true
+  evaluation_seeds: [0, 1, 2]
+  evaluation_episodes: 1200
+  health_thresholds_control_execution: false
+  outcome_threshold_applied: false
+
+slurm:
+  nodes: 2
+  gpus_per_node: 8
+  n_links: 6

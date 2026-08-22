@@ -1,0 +1,55 @@
+# Arm P (protected operator): keep H's deployed action path, but form q_delta in
+# q_action's detached action-semantic space before activating repaired dynamics.
+# L_dyn is driven by q_delta, never q_action; the action teacher therefore sees
+# no state/effect/contrastive gradient.
+
+extends: r0a_protected_common.yaml
+
+run:
+  name: r0a_protected_p_fresh_s0_20260822
+
+losses:
+  dyn:
+    enabled: true
+    weight: 1.0
+    start_update: 2001
+    ramp_updates: 500
+    coeff_source: q_delta
+    isolate_estimator_gradients: false
+    state_weight: 1.0
+    effect_weight: 1.0
+    contrastive_weight: 0.25
+    contrastive_temperature: 0.10
+    contrastive_negatives: 4
+    negatives: within_trajectory
+    min_gap: 2
+    neg_weight: 0.0
+    neg_margin: 0.1
+    cosine: per_slot
+    weights: [1.0, 0.75, 0.5, 0.5]
+  act:
+    enabled: true
+    weight: 1.0
+    align_to: q_a
+    decode_from: dual_q_action_proposal
+    align_mode: sparse_ce
+    align_temperature: 1.0
+    align_weight: 0.10
+  proposal:
+    enabled: true
+    weight: 1.0
+    mode: sparse_ce
+    temperature: 1.0
+    detach_belief: true
+  balance:
+    enabled: true
+    weight: 0.02
+    mode: per_head
+    head_weights: {q_delta: 0.75, q_action: 0.25}
+
+train_modules: [estimator, bank, q_delta, q_action, decoder, proposal]
+
+protected_arm:
+  id: P
+  parent: H
+  method_delta: q_delta_semantic_formation_plus_effect_contrastive_dynamics

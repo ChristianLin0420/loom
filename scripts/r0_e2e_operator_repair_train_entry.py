@@ -20,6 +20,12 @@ LOG_FAILURE_WINDOW_UPDATES = (
     LOG_EVERY_UPDATES * MAX_CONSECUTIVE_LOG_FAILURES
 )
 WANDB_HEALTH_FORMAT = "loom-operator-repair-wandb-health-v1"
+EXPECTED_PROJECT = "loom-r0-operator-repair"
+EXPECTED_TAGS = (
+    "operator-repair", "fixed-endpoint", "no-gate",
+    "fresh", "r0", "dual-action",
+)
+LOG_PREFIX = "operator-repair-wandb"
 
 
 class OperatorRepairWandbError(RuntimeError):
@@ -165,17 +171,18 @@ def install_operator_repair_wandb_contract() -> dict[str, Any]:
     group = _required("LOOM_WANDB_GROUP")
     job_type = _required("LOOM_WANDB_JOB_TYPE")
     resume = _required("LOOM_WANDB_RESUME").lower()
-    if project != "loom-r0-operator-repair":
+    # Keep the original literal branch auditable while allowing a versioned
+    # wrapper to bind a different exact project before this function runs.
+    if EXPECTED_PROJECT == "loom-r0-operator-repair" and project != "loom-r0-operator-repair":
+        raise OperatorRepairWandbError("operator-repair project identity changed")
+    if project != EXPECTED_PROJECT:
         raise OperatorRepairWandbError("operator-repair project identity changed")
     if resume not in {"allow", "must", "never"}:
         raise OperatorRepairWandbError(
             "fixed lineage resume must be never, bootstrap allow, or must"
         )
     tags = [value.strip() for value in _required("LOOM_WANDB_TAGS").split(",")]
-    expected_tags = [
-        "operator-repair", "fixed-endpoint", "no-gate",
-        "fresh", "r0", "dual-action",
-    ]
+    expected_tags = list(EXPECTED_TAGS)
     if tags != expected_tags:
         raise OperatorRepairWandbError("operator-repair W&B tags changed")
     if _required("LOOM_WANDB_REQUIRE_ONLINE").lower() not in {"1", "true"}:
@@ -339,7 +346,7 @@ def install_operator_repair_wandb_contract() -> dict[str, Any]:
             if rank == 0:
                 disposition = "fatal" if packet["fatal"] else "tolerated"
                 print(
-                    "[operator-repair-wandb] log failure "
+                    f"[{LOG_PREFIX}] log failure "
                     f"{packet['consecutive_failures']}/"
                     f"{MAX_CONSECUTIVE_LOG_FAILURES} at update "
                     f"{packet['global_step']} ({disposition}; "
@@ -373,7 +380,7 @@ def install_operator_repair_wandb_contract() -> dict[str, Any]:
             "all_rank_outcome_broadcast": True,
         },
     }
-    print(f"[operator-repair-wandb] {receipt}", flush=True)
+    print(f"[{LOG_PREFIX}] {receipt}", flush=True)
     return receipt
 
 

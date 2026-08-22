@@ -1087,6 +1087,25 @@ class LoomModel(nn.Module):
         # live explicitly; the default remains detached so old recipes and active
         # runs retain byte-for-byte gradient routing.
         self.dyn_detach_coeff = detach_coeff
+        isolate_estimator = dcfg.get("isolate_estimator_gradients", False)
+        if not isinstance(isolate_estimator, bool):
+            raise ValueError(
+                "losses.dyn.isolate_estimator_gradients must be a boolean, got "
+                f"{isolate_estimator!r}"
+            )
+        if isolate_estimator and self.dyn_coeff_source != "q_delta":
+            raise ValueError(
+                "losses.dyn.isolate_estimator_gradients requires "
+                "coeff_source='q_delta'; q_action coefficients would retain an "
+                "online-estimator gradient edge"
+            )
+        # The isolated protected arm holds the estimator out of the complete
+        # operator objective: q_delta/alignment/balance see detached online
+        # beliefs, and L_dyn detaches its online rollout/context states below.
+        # q_action and the proposal/decoder action paths still receive the live
+        # beliefs, so E remains trainable by action realization. Default false
+        # preserves every historical recipe byte-semantically.
+        self.dyn_isolate_estimator = isolate_estimator
         #: which side of ``L_act``'s align term carries the gradient.
         #: ``"q_delta"`` (the original) -- ``q_a`` regresses onto ``sg(q_Delta)``.
         #: ``"q_a"``     (ALIGN-FLIP)   -- ``q_Delta`` regresses onto ``sg(q_a)``,
@@ -1295,7 +1314,10 @@ class LoomModel(nn.Module):
         )
         if need_delta_coeff:
             for h in range(C.DEPTH):
-                c_h, lg_h = _coeff_and_logits(self.q_delta, zs[h], zts[h + 1])
+                z_delta = zs[h].detach() if self.dyn_isolate_estimator else zs[h]
+                c_h, lg_h = _coeff_and_logits(
+                    self.q_delta, z_delta, zts[h + 1],
+                )
                 c_delta.append(c_h)
                 self._qd_logits.append(lg_h)
         # A head-only refinement can freeze q_delta while retaining the probe
@@ -1362,8 +1384,12 @@ class LoomModel(nn.Module):
             c_seq = torch.stack(c_dyn, dim=1)                         # (B,DEPTH,M)
             z_tgt = torch.stack([zts[h + 1] for h in range(C.DEPTH)], dim=1)
             cosine = str(dcfg.get("cosine", "per_slot"))
+            z_dyn0 = zs[0].detach() if self.dyn_isolate_estimator else zs[0]
+            z_dyn_contexts = torch.stack(zs[:C.DEPTH], dim=1)
+            if self.dyn_isolate_estimator:
+                z_dyn_contexts = z_dyn_contexts.detach()
             out = dyn_loss(
-                self.bank, zs[0], c_seq, z_tgt,
+                self.bank, z_dyn0, c_seq, z_tgt,
                 negatives=self.negatives,
                 min_gap=int(dcfg.get("min_gap", 2)),
                 neg_weight=float(dcfg.get("neg_weight", 1.0)),
@@ -1376,7 +1402,7 @@ class LoomModel(nn.Module):
                 # draw both happen where it lives and the indices move to the
                 # coefficients' device. See `losses.dyn._draw`.
                 generator=torch_generator(seed, step, rank, tag="dyn"),
-                z_contexts=torch.stack(zs[:C.DEPTH], dim=1),
+                z_contexts=z_dyn_contexts,
                 z_target_prev=torch.stack(zts[:C.DEPTH], dim=1),
                 state_weight=float(dcfg.get("state_weight", 1.0)),
                 effect_weight=float(dcfg.get("effect_weight", 0.0)),
@@ -1407,6 +1433,9 @@ class LoomModel(nn.Module):
             )
             metrics["dyn/contrastive_top1"] = float(
                 out.get("contrastive_top1", zero.detach())
+            )
+            metrics["dyn/estimator_isolated"] = float(
+                self.dyn_isolate_estimator
             )
             # The build assert, unchanged, so the number stays comparable with
             # every prior run. Delta_op says the BANK is alive; it is not the
@@ -1665,12 +1694,33 @@ class LoomModel(nn.Module):
                     torch.stack(c_delta, 0).flatten(0, -2), qd_lg,
                 )
                 if c_act is not None:
+                    balance_c_act = c_act
+                    balance_c_act_lg = c_act_lg
+                    if (
+                        self.dyn_isolate_estimator
+                        and self.balance_head_weights.get("q_action", 0.0) > 0.0
+                    ):
+                        # Arm I protects E from the complete operator objective,
+                        # including q_action's anti-collapse regularizer.  Re-run
+                        # this small head on a detached belief instead of detaching
+                        # its output: balance must still train q_action's own
+                        # parameters while contributing exactly zero gradient to E.
+                        # The action decode/proposal forwards above keep the live
+                        # belief and therefore retain their intended E gradient.
+                        qa = self.q_action[emb]
+                        balance_c_act, balance_c_act_lg = [], []
+                        for h in range(C.DEPTH):
+                            c_bal, lg_bal = _coeff_and_logits(
+                                qa, actions[:, h], zs[h].detach(),
+                            )
+                            balance_c_act.append(c_bal)
+                            balance_c_act_lg.append(lg_bal)
                     qa_lg = (
-                        torch.stack(c_act_lg, 0).flatten(0, -2)
-                        if all(item is not None for item in c_act_lg) else None
+                        torch.stack(balance_c_act_lg, 0).flatten(0, -2)
+                        if all(item is not None for item in balance_c_act_lg) else None
                     )
                     head_terms["q_action"] = _switch_balance(
-                        torch.stack(c_act, 0).flatten(0, -2), qa_lg,
+                        torch.stack(balance_c_act, 0).flatten(0, -2), qa_lg,
                     )
                 weights = {
                     name: self.balance_head_weights.get(name, 0.0)

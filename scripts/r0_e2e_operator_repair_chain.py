@@ -61,6 +61,44 @@ EXPECTED_TRAIN_TAGS = (
     "operator-repair", "fixed-endpoint", "no-gate", "fresh", "r0", "dual-action",
 )
 EXPECTED_STAGE_TAGS = list(EXPECTED_TRAIN_TAGS)
+REQUIRED_GROUP_TOKENS = ("operator-repair", "fixed32k")
+EXPECTED_GROUP: str | None = None
+TRAINING_JOB_TYPE = "operator-repair-train"
+TRAIN_ENTRY_SCRIPT = "scripts/r0_e2e_operator_repair_train_entry.py"
+STAGE_SBATCH_FILES = {
+    "train": "scripts/r0_e2e_operator_repair_train.sbatch",
+    "consolidate": "scripts/r0_e2e_operator_repair_consolidate.sbatch",
+    "eval": "scripts/r0_e2e_operator_repair_eval_seed.sbatch",
+    "control": "scripts/r0_e2e_operator_repair_control.sbatch",
+}
+TRAIN_EXTRA_ENV: dict[str, str] = {}
+EVAL_ROW_LABEL = "**LOOM · R0 operator repair**"
+EVAL_MARKDOWN_TITLE = "# R0 operator-repair fixed-step evaluation"
+EXPECTED_CONFIG_FIELDS: dict[str, Any] = {
+    "method_receipt": {
+        "kind": "loom_r0a_operator_repair_v1",
+        "fixed_endpoint_update": FIXED_STEP,
+        "evaluation_is_unconditional": True,
+        "evaluation_episodes": 1_200,
+        "evaluation_seeds": [0, 1, 2],
+        "checkpoint_selection": "fixed_update_only",
+        "health_thresholds_control_execution": False,
+    },
+}
+EXPECTED_METHOD_CONTRACT: dict[str, Any] = {
+    "fresh_loom_modules": True,
+    "frozen_siglip_cached_tower": True,
+    "dual_action_mode": "dual_q_action_proposal",
+    "fixed_endpoint": FIXED_STEP,
+    "endpoint_predeclared_before_training": True,
+    "health_metrics_role": "observational_only",
+    "metrics_ledger": {
+        "format": "loom-fresh-metrics-rollback-v1",
+        "reconcile_crash_tail_to_latest_checkpoint": True,
+        "checkpoint_boundary_fsync": True,
+        "direct_formal_decisions": False,
+    },
+}
 LIBERO_EVAL_PYTHON = common.LIBERO_EVAL_PYTHON
 DEFAULT_CACHE_ROOT = Path(
     "/lustre/fsw/portfolios/edgeai/users/chrislin/datasets/loom/libero_cache"
@@ -636,15 +674,9 @@ def _validate_training_config(cfg: Mapping[str, Any], digest: str) -> None:
         == DEFAULT_RAW_DATA_ROOT,
         "no_skipped_updates": float(cfg.get("optim", {}).get("spike_mult")) == 0.0,
         "fixed_boundary": run.get("boundary_policy") == "fixed_max_updates",
-        "method_receipt": cfg.get("method_receipt") == {
-            "kind": "loom_r0a_operator_repair_v1",
-            "fixed_endpoint_update": FIXED_STEP,
-            "evaluation_is_unconditional": True,
-            "evaluation_episodes": 1_200,
-            "evaluation_seeds": [0, 1, 2],
-            "checkpoint_selection": "fixed_update_only",
-            "health_thresholds_control_execution": False,
-        },
+        "method_receipt": all(
+            cfg.get(key) == value for key, value in EXPECTED_CONFIG_FIELDS.items()
+        ),
         "modules": cfg.get("train_modules") == [
             "estimator", "bank", "q_delta", "q_action", "decoder", "proposal",
         ],
@@ -1139,8 +1171,13 @@ def build_plan(
         raise OperatorRepairError(f"W&B project must be exact {PROJECT}")
     if not group or re.fullmatch(r"[A-Za-z0-9_.-]+", group) is None:
         raise OperatorRepairError("W&B group must be a non-empty scheduler-safe token")
-    if "operator-repair" not in group or "fixed32k" not in group:
-        raise OperatorRepairError("W&B group must explicitly say operator-repair and fixed32k")
+    if EXPECTED_GROUP is not None and group != EXPECTED_GROUP:
+        raise OperatorRepairError(f"W&B group must be exact {EXPECTED_GROUP}")
+    if any(token not in group for token in REQUIRED_GROUP_TOKENS):
+        raise OperatorRepairError(
+            "W&B group must explicitly say the required tokens: "
+            f"{list(REQUIRED_GROUP_TOKENS)}"
+        )
     run_dir = _require_clean_absolute(run_dir, field="run-dir")
     control_dir = _require_clean_absolute(control_dir, field="control-dir")
     artifact_root = _require_clean_absolute(artifact_root, field="artifact-root")
@@ -1160,20 +1197,7 @@ def build_plan(
             "evaluation_unconditional_after_integrity": True,
             "promotion_authority": False,
         },
-        "method": {
-            "fresh_loom_modules": True,
-            "frozen_siglip_cached_tower": True,
-            "dual_action_mode": "dual_q_action_proposal",
-            "fixed_endpoint": FIXED_STEP,
-            "endpoint_predeclared_before_training": True,
-            "health_metrics_role": "observational_only",
-            "metrics_ledger": {
-                "format": "loom-fresh-metrics-rollback-v1",
-                "reconcile_crash_tail_to_latest_checkpoint": True,
-                "checkpoint_boundary_fsync": True,
-                "direct_formal_decisions": False,
-            },
-        },
+        "method": copy.deepcopy(EXPECTED_METHOD_CONTRACT),
         "source_closure": _source_closure(),
         "assets": _asset_receipt(),
         "config": {
@@ -1231,7 +1255,7 @@ def build_plan(
             "group": group,
             "require_online": True,
             "tags": list(EXPECTED_TRAIN_TAGS),
-            "training_job_type": "operator-repair-train",
+            "training_job_type": TRAINING_JOB_TYPE,
             "training_resume_policy": {
                 "fresh_initial": "never",
                 "no_latest_bootstrap_requeue": "allow",
@@ -1366,20 +1390,7 @@ def _assert_plan(plan: Mapping[str, Any]) -> None:
         "promotion_authority": False,
     }:
         raise OperatorRepairError("no-gate/no-promotion contract changed")
-    if plan.get("method") != {
-        "fresh_loom_modules": True,
-        "frozen_siglip_cached_tower": True,
-        "dual_action_mode": "dual_q_action_proposal",
-        "fixed_endpoint": FIXED_STEP,
-        "endpoint_predeclared_before_training": True,
-        "health_metrics_role": "observational_only",
-        "metrics_ledger": {
-            "format": "loom-fresh-metrics-rollback-v1",
-            "reconcile_crash_tail_to_latest_checkpoint": True,
-            "checkpoint_boundary_fsync": True,
-            "direct_formal_decisions": False,
-        },
-    }:
+    if plan.get("method") != EXPECTED_METHOD_CONTRACT:
         raise OperatorRepairError("operator-repair method contract changed")
     if plan.get("failure_policy") != {
         "only_integrity_or_execution_failure_blocks_afterok": True,
@@ -1413,10 +1424,11 @@ def _assert_plan(plan: Mapping[str, Any]) -> None:
         wandb.get("project") == PROJECT
         and isinstance(wandb.get("group"), str)
         and re.fullmatch(r"[A-Za-z0-9_.-]+", wandb["group"]) is not None
-        and "operator-repair" in wandb["group"] and "fixed32k" in wandb["group"]
+        and (EXPECTED_GROUP is None or wandb["group"] == EXPECTED_GROUP)
+        and all(token in wandb["group"] for token in REQUIRED_GROUP_TOKENS)
         and wandb.get("require_online") is True
         and wandb.get("tags") == EXPECTED_STAGE_TAGS
-        and wandb.get("training_job_type") == "operator-repair-train"
+        and wandb.get("training_job_type") == TRAINING_JOB_TYPE
         and wandb.get("training_resume_policy") == {
             "fresh_initial": "never",
             "no_latest_bootstrap_requeue": "allow",
@@ -1495,23 +1507,23 @@ def _stage_specs() -> list[dict[str, Any]]:
         name = f"train_{index:02d}"
         specs.append({
             "name": name,
-            "sbatch": "scripts/r0_e2e_operator_repair_train.sbatch",
+            "sbatch": STAGE_SBATCH_FILES["train"],
             "depends_on": list(previous),
         })
         previous = [name]
     specs.append({
         "name": "consolidate",
-        "sbatch": "scripts/r0_e2e_operator_repair_consolidate.sbatch",
+        "sbatch": STAGE_SBATCH_FILES["consolidate"],
         "depends_on": list(previous),
     })
     specs.extend({
         "name": f"eval_seed{seed}",
-        "sbatch": "scripts/r0_e2e_operator_repair_eval_seed.sbatch",
+        "sbatch": STAGE_SBATCH_FILES["eval"],
         "depends_on": ["consolidate"],
     } for seed in SEEDS)
     specs.append({
         "name": "merge",
-        "sbatch": "scripts/r0_e2e_operator_repair_control.sbatch",
+        "sbatch": STAGE_SBATCH_FILES["control"],
         "depends_on": [f"eval_seed{seed}" for seed in SEEDS],
     })
     return specs
@@ -2430,8 +2442,9 @@ def _stage_train(plan: Mapping[str, Any], stage: str, plan_path: Path) -> int:
         "PYTHONUNBUFFERED": "1",
         "OMP_NUM_THREADS": "8",
     })
+    env.update(TRAIN_EXTRA_ENV)
     train_command = [
-        "python3", "scripts/r0_e2e_operator_repair_train_entry.py",
+        "python3", TRAIN_ENTRY_SCRIPT,
         *_training_argv(run_dir, include_link=True),
     ]
     inner = (
@@ -2727,7 +2740,7 @@ def _eval_command(
         "--seeds", str(seed), "--workers", str(evaluation["workers"]),
         "--gripper-dwell", str(evaluation["gripper_dwell"]),
         "--decoder-samples", str(evaluation["decoder_samples"]),
-        "--row-label", "**LOOM · R0 operator repair**",
+        "--row-label", EVAL_ROW_LABEL,
         "--out", str(out_dir / "results.json"),
         "--md", str(out_dir / "table.md"),
     ]
@@ -3594,7 +3607,7 @@ def merge_seed_results(plan: Mapping[str, Any]) -> dict[str, Any]:
 def _merged_markdown(merged: Mapping[str, Any]) -> str:
     comparison = merged["descriptive_baseline_comparison"]
     rows = [
-        "# R0 operator-repair fixed-step evaluation",
+        EVAL_MARKDOWN_TITLE,
         "",
         "Endpoint: exact predeclared step 32,000. No metric or evaluation selected this checkpoint.",
         "The historical baseline delta and paired confidence interval, when available, are descriptive only.",

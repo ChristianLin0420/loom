@@ -421,3 +421,113 @@ rewritten after a run is submitted.
   its strong operator diagnostics as a proxy for SR. Archive 5.50% as the exact
   end-to-end result and use the decoupled staged recipe for the next prospective
   round.
+
+## Round: protected-action parallel arms
+
+### PLAN — 2026-08-22T03:13:53Z
+
+- status: prospective design; implementation and immutable receipts pending
+- why: the prior dual-code run achieved 550/1,200 = 45.83% because its deployed
+  `q_action -> proposal -> decoder` route retained about 50.6 effective action
+  atoms. The operator-repair run let dynamics gradients rewrite that route,
+  reduced it to about four effective atoms, and scored 66/1,200 = 5.50% even
+  though bank-effect diagnostics improved. The next comparison must protect the
+  executable action vocabulary while testing whether LOOM dynamics can learn in
+  a separate route.
+- shared_protocol: three fresh seed-0 lineages from identical random
+  initialization and identical step-indexed samples; real modules; frozen
+  cached SigLIP tower; dual teacher/deployed decoder; 20/20/20/40
+  Spatial/Object/Goal/Long sampling; recurrent-prefix choices 0/4/8/12; exact
+  update 32,000; online W&B project `loom-r0-protected-arms`; fixed checkpoint
+  only; exact seeds 0/1/2 x 400 episodes; raw exact-1,200 merge. Training
+  diagnostics cannot stop, extend, select, or suppress evaluation. There is no
+  SR threshold, convergence gate, smoke-training run, or promotion decision.
+- arm_H_history_anchor: preserve the successful dual-code loss semantics:
+  action-free `q_delta` state/hinge dynamics, MSE
+  `q_delta <- stopgrad(q_action)`, pooled Switch balance, sparse proposal CE,
+  and paired teacher/deployed CFM. Its only method package relative to the
+  45.83% external anchor is the shared Long-aware sampler and real recurrent
+  prefixes. This determines whether those data changes preserve the strong
+  direct policy before attributing differences to operator repair.
+- arm_P_protected_operator: keep H's data and direct action path, but replace
+  the operator package with dense sparse-target CE
+  `q_delta <- stopgrad(q_action)`, per-head balance, and residual-effect plus
+  contrastive dynamics. Dynamics consumes attached `q_delta`, never
+  `q_action`; therefore it can train the transition vocabulary but cannot
+  directly overwrite the executable action teacher. It uses the fixed
+  updates-1..2,000 formation phase and updates-2,001..2,500 dynamics ramp.
+- arm_I_isolated_operator: exactly P plus one gradient-routing change:
+  operator-side beliefs are detached before `q_delta`/bank/dynamics, including
+  alignment and balance. Estimator gradients remain live through the direct
+  `q_action`/proposal/dual-decoder route. This tests whether the P arm's
+  remaining shared-estimator edge recreates the prior 99.88%-dominated global
+  clipping failure.
+- comparison_logic: H versus the frozen 45.83% checkpoint measures the shared
+  data/history package; P-H measures protected operator learning; I-P measures
+  estimator isolation. All three results will be published, not merely the
+  best arm. Warm-starting from the 45.83% checkpoint is excluded because it
+  would change optimizer/LR/global-step history and obscure these causal
+  comparisons.
+- inference_scope: the exact scored endpoint remains the deployed R0
+  estimator -> proposal -> decoder policy for comparability. Existing code has
+  no trained goal-conditioned potential for bank rollout selection, so this
+  round will not fabricate an arbitrary bank-reranking score. A genuine
+  bank-assisted endpoint requires a separately frozen scorer method after the
+  protected representation is established.
+- authority: exact config/source/plan hashes, run paths, W&B IDs, and Slurm job
+  IDs will be appended only after tests, authenticated no-write dry-runs,
+  independent review, commit, and push. This PLAN is not launch authority.
+- next: implement the three configurations and the single versioned parallel
+  orchestrator, verify gradient routing and exact resume/evaluation behavior,
+  then freeze, commit, push, and submit all arms without consulting training
+  metrics.
+
+### IMPLEMENTED_AND_REVIEWED — 2026-08-22T03:48:52Z
+
+- status: launch candidate frozen; no training or evaluation job has yet been
+  submitted. The implementation uses one authenticated profile wrapper and
+  the previously exercised fixed-endpoint resume/consolidate/evaluation
+  machinery, rather than three divergent orchestration copies.
+- method: H retains the prior dual-code loss and gradient semantics. P routes
+  state/effect/contrastive dynamics through attached `q_delta` and uses
+  `q_action` only as a stop-gradient semantic target. I adds estimator
+  isolation for every operator-side path. A pre-launch cross-review found that
+  I's per-head `q_action` balance term still reached the estimator; the final
+  implementation recomputes that small balance forward from a detached belief,
+  so balance continues to train `q_action` parameters while contributing
+  exactly zero estimator gradient. The live action decoder/proposal forwards
+  remain attached and continue training the estimator.
+- exact_configs: H raw SHA-256
+  `39befbbdc2bfacf62aef4dd9c890bf2747ff3142fcc63ea9769641328defdcce`,
+  resolved hash `7c79c09af56ccf16`; P raw
+  `145e41e0201dd80dc95b0beb4325f26ae3795a39ded0270ff1cb9aa2a1e45948`,
+  resolved `08ca78d71dc0321b`; I raw
+  `71ac5d48b6b7b2f6f15ab098c3ec2063402c544bec4ae12deaad023985a0a73a`,
+  resolved `3cb3dea37bcb9aaf`. The common config SHA-256 is
+  `a8b386bb4645e1e5f14bb357d96c6b5932bb791686129bc76432a4d74cff1f3e`.
+- exact_code: protected wrapper SHA-256
+  `644a8b1fcad82b0133423156c75772a954a87ea13aa4b76a02826d54a53da775`;
+  training-loop SHA-256
+  `ff4e8995e146ee4913dcd9cdd07c42dc5b5d58249efd94d3b3fe08bcbc57fa29`;
+  protected profile-table SHA-256
+  `a438d1c709108441532230238d2d092bfc9f8fd53c9f0d0a0eb7e055403047b7`;
+  ordered 59-file execution-closure SHA-256
+  `b7fe3f91452a4c39cb3bea9fd5e92eccef2461a9ad22a0f63f0800e0b24e70d3`.
+- verification: independent method and orchestration reviews both returned
+  PASS. The final focused protected/legacy suite passed 71/71; the broader
+  protected/operator/full-train compatibility run exited zero; Python compile,
+  all four protected Slurm shell syntax checks, and `git diff --check` passed.
+  Full authenticated H/P/I no-submit dry-runs each exited zero and created no
+  run/control/artifact directories. The evaluator package identity remains the
+  pre-existing pinned 118-line receipt; repository source is authenticated by
+  the separate 59-file closure.
+- execution_contract: each arm has six sequential resumable 2-node/16-GPU
+  training links, then checkpoint consolidation, three parallel 400-episode
+  seeds, and an exact 1,200-row merge: 11 jobs per arm, 33 total. All stages
+  use the new online W&B project `loom-r0-protected-arms` with exact arm-specific
+  group/tags. There is no convergence, health, SR, checkpoint-selection, or
+  cross-arm selection gate; finite integrity/execution failures alone may stop
+  descendants.
+- next: commit and push these exact design/code bytes, submit H/P/I to fresh
+  isolated roots, record plan/job/W&B identities, and monitor all three through
+  their unconditional evaluations.

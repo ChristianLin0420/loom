@@ -1,0 +1,17 @@
+# Arm I (isolated operator): exactly P, plus stop-gradient at every online-belief
+# input to q_delta/bank dynamics. E still learns through q_action and the dual
+# proposal/decoder action objective; only operator-loss gradients are isolated.
+
+extends: r0a_protected_p.yaml
+
+run:
+  name: r0a_protected_i_fresh_s0_20260822
+
+losses:
+  dyn:
+    isolate_estimator_gradients: true
+
+protected_arm:
+  id: I
+  parent: P
+  method_delta: isolate_operator_objective_from_online_estimator

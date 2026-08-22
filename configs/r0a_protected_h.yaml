@@ -1,0 +1,44 @@
+# Arm H (history anchor): the exact successful dual-code objective, with only
+# the common suite weighting and recurrent-prefix exposure changed. Dynamics
+# still uses q_delta, so it has no gradient edge into q_action.
+
+extends: r0a_protected_common.yaml
+
+run:
+  name: r0a_protected_h_fresh_s0_20260822
+
+losses:
+  dyn:
+    enabled: true
+    weight: 1.0
+    negatives: within_trajectory
+    min_gap: 2
+    neg_weight: 1.0
+    neg_margin: 0.1
+    cosine: per_slot
+    coeff_source: q_delta
+    isolate_estimator_gradients: false
+  act:
+    enabled: true
+    weight: 1.0
+    align_to: q_a
+    decode_from: dual_q_action_proposal
+    align_mode: mse
+    align_weight: 1.0
+  proposal:
+    enabled: true
+    weight: 1.0
+    mode: sparse_ce
+    temperature: 1.0
+    detach_belief: true
+  balance:
+    enabled: true
+    weight: 0.01
+    mode: pooled
+
+train_modules: [estimator, bank, q_delta, q_action, decoder, proposal]
+
+protected_arm:
+  id: H
+  parent: dual_code_45p83_objective
+  method_delta: history_and_suite_exposure_only
