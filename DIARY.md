@@ -531,3 +531,82 @@ rewritten after a run is submitted.
 - next: commit and push these exact design/code bytes, submit H/P/I to fresh
   isolated roots, record plan/job/W&B identities, and monitor all three through
   their unconditional evaluations.
+
+### SUBMITTED — 2026-08-22T03:57:24Z
+
+- code: commit `0123b90` (`Add protected-action parallel training arms`) was
+  pushed to `origin/r0a-rerun-three-fixes` before any plan was materialized.
+  The pre-existing generated `MUJOCO_LOG.TXT` modification was deliberately
+  excluded from that commit. No code/source commit is permitted while these
+  authenticated plans are active.
+- arm_H: plan SHA-256
+  `a98722c35628d80b80bba8b5e46959d387e1f44c7ab32f4045c2709bdbde29a6`;
+  jobs `32710174` through `32710184` (train 01..06, consolidate, eval seeds
+  0/1/2, merge); jobs-receipt SHA-256
+  `0e72a11a1af142d3af2bd0fe0d12bab3644a67503a73786c167d8b2fda93bd56`;
+  release SHA-256
+  `68fab1410f4c779715da0f9c05b9b9a5abc55a7398b843b26b30c1cbd01f9bc1`;
+  W&B training ID `ab2676cc60934731`, group
+  `r0a-protected-fixed32k-s0-20260822-arm-h-v1`.
+- arm_P: plan SHA-256
+  `7110196b2169e971032cbdfd8cf5642fcd1d8a5705c2b1c6f274eec28ceb9fb7`;
+  jobs `32710273` through `32710283`; jobs-receipt SHA-256
+  `5a72bbd9ecbec48f9d9ff2db90d362ab04bdecdfeac314801649bf4f066324a5`;
+  release SHA-256
+  `2b84905e08198e8016ccd078cf7bd951bda5882851dd769df7c7c6100a50d498`;
+  W&B training ID `149fb4c5bbba4a4d`, group
+  `r0a-protected-fixed32k-s0-20260822-arm-p-v1`.
+- arm_I: plan SHA-256
+  `764f331fb3eda9ddece404f4c312ad21094c0ec272e7ede0398534e67dd878f6`;
+  jobs `32710313` through `32710323`; jobs-receipt SHA-256
+  `414d4aefaf1f9695f0548bf4cdd97bc62e1314932118158b28b84483627f20ad`;
+  release SHA-256
+  `18b165867d4d7639ad4749dd7617a6c1b7f01de0c7ba33a7d689e6a761216f45`;
+  W&B training ID `d148c34b0b1741f7`, group
+  `r0a-protected-fixed32k-s0-20260822-arm-i-v1`.
+- launch_state: all three 11-job DAGs were released with empty
+  `decision_gate_jobs`. H train-01 began on two 8-GPU nodes at
+  2026-08-22T03:56:40Z; P and I train-01 were scheduler-pending for Priority at
+  this observation. Their dependency chains are held behind exact `afterok`
+  edges, not a scientific threshold.
+- next: monitor all three lineages, record operational/method observations as
+  descriptive evidence only, and allow every integrity-valid arm to reach the
+  fixed 32k endpoint and exact 1,200-episode evaluation.
+
+### EXECUTION_FAILURE_AND_FIX — 2026-08-22T04:00:31Z
+
+- result: v1 produced no scientific training or evaluation result. H train-01
+  job `32710174` failed after 82 seconds, before model initialization, because
+  every distributed rank executing `scripts/r0_e2e_protected_train_entry.py`
+  as a file raised `ModuleNotFoundError: No module named 'scripts'`. The entry
+  worked in import-based tests because the repository root was already on
+  `sys.path`; the real `python scripts/...` invocation sets `sys.path[0]` to
+  the `scripts` directory. This was an orchestration import defect, not a model,
+  data, optimizer, or W&B failure.
+- containment: the exact 33 v1 job IDs were canceled once the shared failure
+  mode was confirmed. H had one FAILED job and ten dependency-canceled jobs; P
+  train-01 was allocated for 27 seconds and user-canceled before reaching an
+  update, with ten dependency-canceled descendants; all eleven I jobs were
+  canceled without starting. Across H/P/I there is no `metrics.jsonl`,
+  `LATEST`, model checkpoint, evaluation result, or optimizer update. The v1
+  roots and receipts remain untouched as the failure record and will not be
+  reused.
+- fix: the protected training entry now inserts its resolved repository root
+  into `sys.path` before importing the shared strict-W&B entry. A new
+  subprocess regression executes the entry exactly as Slurm does with
+  `PYTHONPATH` absent; it proves import succeeds and reaches the expected
+  protected-arm environment validation instead of `ModuleNotFoundError`.
+  Entry SHA-256 is
+  `953cefc87c260ebf0c91263f80a90cabd5b6830eb2dd46a0a28c9a6573d42dd4`;
+  test SHA-256 is
+  `82b1642be2b37b5c3b456094c5983d5f8c700d442a17a7eaafed387ebdaedd4f`;
+  the updated 59-file closure is
+  `690e018045a964790507307ee8125181324c0f3b6d6a717ca304aa6cb0a76836`.
+- verification: the direct sanitized executable check reaches
+  `LOOM_PROTECTED_ARM must be exactly one of H/P/I`, and the protected,
+  legacy-operator, and method test slice passes 72/72. Independent narrow
+  review, commit/push, full asset-authenticated v2 dry-runs, and fresh v2 roots
+  are required before resubmission.
+- why_relaunch: no update was taken, so there is no partial lineage or method
+  result to salvage. Fresh v2 plans preserve the predeclared H/P/I comparison
+  without contaminating optimizer or sample history.

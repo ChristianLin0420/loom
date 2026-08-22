@@ -3,8 +3,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import shutil
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 
@@ -184,6 +186,20 @@ def test_training_subprocess_contract_is_arm_specific(arm, monkeypatch):
     profile = protected.PROFILES[arm]
     assert protected_entry.ARM_TAGS[arm] == profile.tags
     assert protected_entry.PROJECT == protected.PROJECT
+
+
+def test_train_entry_executes_as_a_file_without_pythonpath() -> None:
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop("LOOM_PROTECTED_ARM", None)
+    completed = subprocess.run(
+        [sys.executable, str(base.ROOT / "scripts/r0_e2e_protected_train_entry.py")],
+        cwd=base.ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, check=False,
+    )
+    assert completed.returncode != 0
+    assert "ModuleNotFoundError" not in completed.stderr
+    assert "LOOM_PROTECTED_ARM must be exactly one of H/P/I" in completed.stderr
 
 
 def _publish_selector_plan(plan: dict, control: Path, monkeypatch) -> Path:
